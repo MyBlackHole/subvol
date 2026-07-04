@@ -1,0 +1,8 @@
+flowchart TD
+  IDX[元数据中的 dev_idx] --> LOOKUP[bch2_dev_rcu_noerror]
+  LOOKUP --> REF[enumerated_ref_tryget(io_ref)]
+  REF --> STATE{写请求？}
+  STATE -- no --> READOK[返回读设备]
+  STATE -- yes --> RWSTATE{mi.state == BCH_MEMBER_STATE_rw?}
+  RWSTATE -- yes --> WRITEOK[返回写设备]
+  RWSTATE -- no --> DROP[释放引用 + 拒绝]

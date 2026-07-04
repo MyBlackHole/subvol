@@ -1,0 +1,29 @@
+flowchart TB
+  U[用户态 / VFS] --> F[bcachefs 文件系统核心]
+
+  F --> SB[超级块 / 成员]
+  F --> REG[设备注册表]
+  F --> ALLOC[分配器 / 桶]
+  F --> BTREE[B树 子系统]
+  F --> JOURNAL[日志]
+  F --> REC[恢复]
+  F --> SNAP[快照 / 子卷]
+  F --> DATA[数据路径]
+  F --> RECON[重建 / GC]
+
+  SB --> REG
+  REG --> DEV[设备 / 成员设备]
+  DEV --> BIO[块 I/O 层]
+  BIO --> BLK[(物理块设备)]
+
+  BTREE --> BTIO[B树 读 / 写]
+  BTREE --> KEY[Key / Extent / Ptr 编码]
+  JOURNAL --> JSET[Jset / Pin / 刷新]
+  REC --> PASS[恢复阶段调度器]
+  SNAP --> ROOTS[快照树 / 子卷根]
+  ALLOC --> REPL[副本 / 目标 / 持久性]
+  RECON --> ALLOC
+  RECON --> BTREE
+  DATA --> BTREE
+  DATA --> ALLOC
+  DATA --> BIO

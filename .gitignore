@@ -1,0 +1,27 @@
+/target
+**/*.rs.bk
+.env
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.old
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+
+# subvol runtime
+btree.subvolmount
+btree.subvolmount.tmp
+btree.subvolmount.old
+wal.*.log
+run/
+*.snap
+*.pid
+*.sock
+.sisyphus/
+black-unknown-design*.md
+.gitnexus

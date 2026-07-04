@@ -1,0 +1,16 @@
+flowchart TD
+  W0[写入 extent / 节点] --> W1[计算 target_rw_devs]
+  W1 --> W2[应用目标掩码]
+  W2 --> W3[遍历指针集合]
+  W3 --> W4{指针有效？}
+  W4 -- no --> W3
+  W4 -- yes --> W5{最后一个有效指针？}
+  W5 -- no --> W6[从 replica_set 克隆 bio]
+  W5 -- yes --> W7[复用原始 bio]
+  W6 --> W8[按指针.dev解析设备]
+  W7 --> W8
+  W8 --> W9{bch2_dev_get_ioref WRITE/READ？}
+  W9 -- fail --> W3
+  W9 -- ok --> W10[设置扇区 + 设备 + 提交时间]
+  W10 --> W11[提交 bio / endio]
+  W11 --> W3

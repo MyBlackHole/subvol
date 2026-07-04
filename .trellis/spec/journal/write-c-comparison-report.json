@@ -1,0 +1,111 @@
+{
+  "overall_assessment": "write.c 对齐质量存在严重高估。5 个 ✅ 状态函数中仅 1 个（bch2_journal_do_writes）的加锁包装基本等价，其余 4 个均存在不同程度的逻辑简化或语义偏差。覆盖地图对 '逻辑等价' 的判定偏乐观，尤其是 bch2_journal_do_writes_locked（存根）和 bch2_journal_write（仅覆盖 submit 阶段）的 ✅ 标记与实际差距不符。",
+  "findings": [
+    {
+      "subvol_func": "bch2_journal_do_writes_locked",
+      "subvol_location": "types.rs:3936-3943",
+      "bcachefs_func": "bch2_journal_do_writes_locked",
+      "bcachefs_location": "write.c:1087-1162",
+      "severity": "CRITICAL",
+      "description": "subvol 版本是一个存根（stub），仅设置 needs_flush_write 标志并唤醒等待者。bcachefs 版本包含完整的 flush/noflush 决策树（should_flush）、wait list splicing（将 flush 等待者级联到下个 entry）、flushes_outstanding 并发控制（defer flush 直到前序 entry 完成）、auto-commit timer 管理（mod_delayed_work/cancel_delayed_work）、rewind_seq 推进和 rewind_limit entry 添加。subvolmount 完全跳过这些逻辑，实际写入由独立的 bch2_journal_flush async 函数完成，调用链不同。",
+      "suggestion": "将 should_flush 决策逻辑移植到 subvolmount，至少实现 flush/noflush 标记决策和 flushes_outstanding 阈值检查。当前标记为 ✅ 但实为存根，应降级为 ⚠️ 并补充决策逻辑。"
+    },
+    {
+      "subvol_func": "bch2_journal_write",
+      "subvol_location": "types.rs:2067-2130",
+      "bcachefs_func": "bch2_journal_write",
+      "bcachefs_location": "write.c:819-946",
+      "severity": "HIGH",
+      "description": "作用域严重不对齐。bcachefs 的 bch2_journal_write 是整个写入流水线：realloc + prep（压缩/btree_root/write_buffer/datetime） → error check → alloc（多设备 extent 分配器） → checksum（加密+CRC） → submit（bio 提交） → 完整错误处理（emergency_read_only）。subvol 的 bch2_journal_write 仅覆盖 submit 阶段（Phase 4：旋转 bucket + write_block 循环 + flush）。prep、alloc、checksum、错误路径分布在其他函数中。",
+      "suggestion": "renam subvol 的 bch2_journal_write 为 journal_write_submit 以消除命名误导，或在 crate 公开接口保持同名但内部文档注明仅覆盖 submit 阶段。"
+    },
+    {
+      "subvol_func": "write_bufs_to_bucket (Phase 1: Prep)",
+      "subvol_location": "types.rs:2144-2167",
+      "bcachefs_func": "bch2_journal_write_prep",
+      "bcachefs_location": "write.c:621-733",
+      "severity": "HIGH",
+      "description": "覆盖地图标注 'prep 逻辑等价（数据截断 + 回调触发 + 状态转换）'，但实际不等价。bcachefs 的 prep 执行：(1) 压缩空 jset_entries 和合并可合并 entry；(2) 传播 btree_root entry 到 c->btree_roots 并补全缺失根；(3) 刷新 write_buffer_keys 到 write buffer；(4) 添加 datetime entry 和 super entries；(5) 检查空间溢出。subvol 仅做数据截断 + 回调触发 + 状态转换，完全跳过压缩、btree_root 传播、write_buffer 刷新、datetime/super entries 添加。",
+      "suggestion": "评估是否需要 btree_root 传播和 datetime entry 添加。如果 subvolmount 架构中这些操作在其他时机处理（如 append_btree_root），则应更新覆盖地图说明为 '结构不等价但功能分散在其他路径'，而非声称 '逻辑等价'。"
+    },
+    {
+      "subvol_func": "bch2_journal_flush (post-write cleanup)",
+      "subvol_location": "types.rs:2258-2294",
+      "bcachefs_func": "journal_write_done",
+      "bcachefs_location": "write.c:234-466",
+      "severity": "HIGH",
+      "description": "覆盖地图标注 'cleanup 逻辑等价（bucket_seq 更新 + pin_put + reclaim kick）'，但差异显著。bcachefs 的 journal_write_done：(1) 处理两态 write_done 语义（防止并发 completion 竞争）；(2) replicas 引用管理（put 旧 devs，get 新 replicas entry）；(3) 驱动 in_flight FIFO front 推进（通过 last_uncompleted_write_seq 循环批处理多个 seq 完成）；(4) 在 lock-drop 窗口安全地 put replicas refs；(5) 触发 discards（bch2_do_discards_async）；(6) 调用 journal_reclaim_kick + bch2_journal_update_last_seq + journal_wake。subvol 仅更新 bucket_seq、flushed_seq_marker、last_seq，缺少 FIFO 推进、replicas 管理、discard 触发、并发安全。",
+      "suggestion": "如果 subvolmount 单设备架构不需要 replicas 管理，应明确标注此差异。FIFO 推进和并发安全在当前 async/await 顺序模型中不关键（无并发 completion callback），但 discard 触发和 reclaim kick 的缺失可能影响空间回收。"
+    },
+    {
+      "subvol_func": "bch2_journal_do_writes_locked",
+      "subvol_location": "types.rs:3936-3943",
+      "bcachefs_func": "should_flush / __should_flush",
+      "bcachefs_location": "write.c:999-1085",
+      "severity": "HIGH",
+      "description": "subvol 的 do_writes_locked 完全缺失 should_flush 决策树。bcachefs 的 __should_flush(write.c:999) 实现：(1) 错误状态检查（journal error 时返回 noflush）；(2) 首次写入标记（JOURNAL_need_flush_write）；(3) must_not_flush 检查（allocator 承诺）；(4) reclaim 空间需求检查（flush_would_free_space）；(5) must_flush 标志检查；(6) 超时阈值检查（journal_flush_delay）。should_flush 外层 (write.c:1079) 再包装 journal_buf_try_noflush。subvol 没有此决策逻辑，所有 flush 决策由调用者（如 bch2_journal_flush 中的 has_must_flush || force_flush_next）独立于 do_writes_locked 完成。",
+      "suggestion": "将 should_flush 决策逻辑从 bch2_journal_flush 和 journal_res_get 路径中提取，整合到 bch2_journal_do_writes_locked 中，或明确标注此函数仅用于 '标记可写 buf'，flush/noflush 决策在其他路径完成。"
+    },
+    {
+      "subvol_func": "bch2_journal_write",
+      "subvol_location": "types.rs:2086-2128",
+      "bcachefs_func": "journal_write_submit",
+      "bcachefs_location": "write.c:513-583",
+      "severity": "MEDIUM",
+      "description": "submit 阶段的 IO 模型不同。bcachefs 使用 extent_for_each_ptr 遍历多设备 extent bkey 中的每个 ptr，对每个设备创建 bio 并设置 REQ_FUA/REQ_PREFLUSH 标志位，在 bio endio 中调用 closure_put 驱动 completion 链。subvol 使用单设备 write_block 循环按 JSET_BLOCK_SIZE 分块写入，后端通过 backend.flush() 保证持久化。bio 链的乱序完成 vs async/await 的同步写入是架构差异，功能等价但语义不同。",
+      "suggestion": "标注 IO 模型差异为已知架构差异（单设备 vs 多设备、bio vs write_block），当前 ✅ 可保留但需澄清不等价细节。"
+    },
+    {
+      "subvol_func": "bch2_journal_write",
+      "subvol_location": "types.rs:2090-2119",
+      "bcachefs_func": "journal_write_alloc",
+      "bcachefs_location": "write.c:112-159",
+      "severity": "MEDIUM",
+      "description": "空间分配差异。bcachefs 的 journal_write_alloc 是多设备 extent 分配器：通过 target_rw_devs 选择目标设备、bch2_dev_alloc_list 排序、__journal_write_alloc 为每个设备分配 space+创建 extent ptr+处理 replicas，支持 retry 逻辑。subvol 仅检查 sp.remaining_bytes < JSET_BLOCK_SIZE 并在不足时旋转 bucket，完全跳过多设备管理和 replicas。",
+      "suggestion": "标注为单设备简化版，添加注释说明 retry 逻辑缺失不影响正确性（单设备无设备选择）。"
+    },
+    {
+      "subvol_func": "Jset::serialize_padded",
+      "subvol_location": "jset.rs:242",
+      "bcachefs_func": "bch2_journal_write_checksum",
+      "bcachefs_location": "write.c:736-777",
+      "severity": "MEDIUM",
+      "description": "checksum 计算时机不同。bcachefs 在写入时（bch2_journal_write 内部）计算：设置 magic/version/csum_type → 可选加密 → 计算 CRC → memset 填充零。subvol 在序列化时（Jset::serialize_padded）完成 CRC。功能等价但时机不同：bcachefs 的 checksum 基于压缩后的最终数据，subvol 基于序列化的原始数据。数据内容相同所以 CRC 结果一致，但错误路径影响不同（bcachefs 写前可返回错误，subvolmount 序列化阶段已不可撤销）。",
+      "suggestion": "标注 checksum 时机差异，确保序列化后不再修改 jset 内容（当前设计满足此前提）。"
+    },
+    {
+      "subvol_func": "bch2_journal_do_writes_locked",
+      "subvol_location": "types.rs:3936-3943",
+      "bcachefs_func": "journal_write_preflush",
+      "bcachefs_location": "write.c:585-619",
+      "severity": "LOW",
+      "description": "分离预 flush 处理。bcachefs 的 journal_write_preflush 在 nr_rw_members > 1 时发送独立 PREFLUSH bio 到每个设备，然后 continue_at 到 journal_write_submit。subvol 的 backend.flush() 统一处理，无分离式 preflush。这是单/多设备架构的自然差异。",
+      "suggestion": "标注为架构差异，无需修复。"
+    },
+    {
+      "subvol_func": "bch2_journal_write",
+      "subvol_location": "types.rs:2067-2130",
+      "bcachefs_func": "bch2_journal_write (separate_flush handling)",
+      "bcachefs_location": "write.c:878-879",
+      "severity": "LOW",
+      "description": "bcachefs 在写入过程中检测 nr_rw_members > 1 并设置 w->separate_flush = true，改变 IO 提交路径（先 preflush 再 submit）。subvolmount 不追踪此概念。",
+      "suggestion": "无需修复，单设备架构无 separate_flush 需求。"
+    }
+  ],
+  "total_checked": 5,
+  "total_findings": 10,
+  "no_issue_functions": [
+    "bch2_journal_do_writes（加锁包装等价，slowpath_lock 替代 spinlock，语义一致）"
+  ],
+  "async_vs_closure_assessment": {
+    "summary": "async/await 替代 closure 回调链导致控制流从 '事件驱动 + 乱序完成 + 批处理推进' 变为 '顺序同步 + 串行完成'。bcachefs 的 closure 链（journal_write_submit → journal_write_preflush → journal_write_done_flush → journal_write_done）允许 bio 乱序完成后逐级回调，journal_write_done 的 last_uncompleted_write_seq 循环可在一次回调中批处理推进多个 seq。subvol 的 async/await 将整个 flush 路径扁平化为一个同步 async 函数，bio 完成和 completion 处理不可分割。",
+    "equivalence_verdict": "功能上不等价于 '逻辑等价' 描述。状态机等价（Free→Accepting→Closing→WriteSubmitted→WriteDone），但并发模型和推进时机不同。bcachefs 允许多个 in-flight write 交错完成，subvolmount 串行 flush。在 subvolmount 后台 flush 模型中此差异不影响正确性，但若引入并发 flush 路径，则需要重新审视两态 write_done 语义。",
+    "risk": "MEDIUM",
+    "details": [
+      "批处理推进：bcachefs journal_write_done 可一次 completion 推进多个 seq → subvolmount 一次 flush 完成所有 seq",
+      "锁持有模式：bcachefs 在 lock-drop 窗口中间歇释放 j->lock 实现 replicas_refs_put → subvolmount 同步路径无此需求",
+      "两态 write_done：bcachefs 防止并发 completion 竞争 → subvol 无并发 callback，无需两态语义",
+      "closure_put 引用计数生命周期管理 → subvol 无等价机制（Arc 替代）"
+    ]
+  }
+}

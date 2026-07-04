@@ -1,0 +1,13 @@
+flowchart TD
+  MOUNT[挂载 / 打开] --> SB[读取超级块]
+  SB --> DEV[构建设备成员注册表]
+  DEV --> PASS[恢复阶段调度器]
+  PASS --> CLEAN{干净关闭？}
+  CLEAN -- yes --> ROOTS[加载根 + 分配器状态]
+  CLEAN -- no --> JREAD[读取日志]
+  JREAD --> JREPLAY[回放日志条目]
+  JREPLAY --> ROOTS
+  ROOTS --> SCAN[bch2_scan_for_btree_nodes]
+  SCAN --> MERGE[合并副本节点]
+  MERGE --> CHECK[验证重叠 / 指针]
+  CHECK --> READY[文件系统就绪]

@@ -1,0 +1,25 @@
+graph TD
+  VOL[文件系统卷]
+  SB[超级块]
+  REG[设备注册表]
+  BT[B树]
+  JT[日志]
+  AL[分配器]
+  RC[恢复]
+  ST[存储服务]
+
+  VOL --> SB
+  VOL --> REG
+  VOL --> BT
+  VOL --> JT
+  VOL --> AL
+  VOL --> RC
+  VOL --> ST
+
+  ST --> SB
+  ST --> REG
+  BT --> JT
+  BT --> AL
+  RC --> JT
+  RC --> AL
+  RC --> BT
