@@ -1,28 +1,43 @@
-[workspace]
-members = ["crates/*"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "subvol"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-authors = ["subvol contributors"]
+rust-version = "1.85.0"
 
-[workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+[[bin]]
+name = "bcachefs"
+path = "src/main.rs"
+
+[dependencies]
+log = { version = "0.4", features = ["std"] }
+clap = { version = "4.0.32", features = ["derive", "wrap_help", "color", "error-context", "suggestions"] }
+clap_complete = "4.3.2"
+anyhow = "1.0"
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
-crc = "3"
-parking_lot = "0.12"
-tracing = "0.1"
-thiserror = "1"
-async-trait = "0.1"
-clap = { version = "4", features = ["derive"] }
 serde_json = "1"
-tracing-subscriber = "0.3"
-bytes = "1"
-futures = "0.3"
-dirs-next = "2"
-axum = "0.7"
-tower-http = { version = "0.5", features = ["cors"] }
-ureq = { version = "2.9", features = ["json"] }
+libc = "0.2"
+uuid = { version = "1.2.2", features = ["v4"] }
+errno = "0.3"
+either = "1.5"
+strum = { version = "0.26", features = ["derive"] }
+strum_macros = "0.26"
+zeroize = { version = "1", features = ["std", "zeroize_derive"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process", "stdio", "system", "termios", "try_close"] }
+owo-colors = "4"
+chrono = { version = "0.4.43", default-features = false, features = ["clock"] }
+bitfield = "0.14"
+bitflags = "2.0"
+paste = "1.0"
+
+[dependencies.env_logger]
+version = "0.10"
+default-features = false
+
+[profile.release]
+debug = 2
+panic = "abort"
+
+[features]
+default = []
+
+[workspace]

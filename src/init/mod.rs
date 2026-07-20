@@ -1,0 +1,26 @@
+pub mod fs;
+
+pub const BCH_FS_INIT_PASSES: &[&str] = &[
+    "read_super",
+    "read_btree_roots",
+    "read_journal",
+    "replay_journal",
+    "read_alloc",
+    "check_alloc",
+    "read_stripes",
+    "check_stripes",
+    "read_btree_nodes",
+    "check_btree_nodes",
+    "check_extents",
+    "check_indirect_extents",
+    "check_inodes",
+    "check_dirents",
+    "check_xattrs",
+    "check_subvols",
+    "check_snapshots",
+    "check_quota",
+    "check_replicas",
+    "check_ec",
+    "check_gc",
+    "rebalance",
+];

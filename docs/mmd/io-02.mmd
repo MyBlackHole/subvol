@@ -1,8 +1,0 @@
-flowchart LR
-  N[B树节点] --> ENC[序列化 / 紧凑化 / 打包]
-  ENC --> PTR[B树指针 V2]
-  PTR --> DEV[dev_idx + block_addr + level + generation]
-  DEV --> I/O[异步块写 / 读]
-  I/O --> VAL[验证头部 / crc / 边界]
-  VAL --> NODE[重建 B树节点]
-  NODE --> IDX[更新 key cache / root / 当前磁盘信息]
