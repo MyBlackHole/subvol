@@ -241,6 +241,10 @@ pub struct journal {
     pub cur_entry_sectors: AtomicU32,
     pub cur_entry_error: AtomicI32,
     pub reclaim_kicked: AtomicBool,
+    /* Test-only write failure point.  It is consumed before a record is
+     * materialized or durable state is advanced, matching write.c's rule
+     * that a failed write cannot publish its sequence. */
+    pub fault_inject_write_error: AtomicU32,
 }
 
 impl Default for journal {
@@ -285,6 +289,7 @@ impl Default for journal {
             cur_entry_sectors: AtomicU32::new(0),
             cur_entry_error: AtomicI32::new(0),
             reclaim_kicked: AtomicBool::new(false),
+            fault_inject_write_error: AtomicU32::new(0),
         }
     }
 }
@@ -948,6 +953,15 @@ pub fn bch2_journal_flush(j: &journal) -> i32 {
     let old_buf = &j.ring[old_idx as usize];
     assert_eq!(old_buf.seq.load(Ordering::Acquire), old_seq);
 
+    if j.fault_inject_write_error
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            count.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return -5;
+    }
+
     let data = unsafe { &*old_buf.data.get() };
     let mut record = vec![0u64; JSET_HEADER_U64S + used];
     record[2] = JSET_MAGIC;
@@ -1049,6 +1063,7 @@ pub fn bch2_journal_flush(j: &journal) -> i32 {
                         if sector * 512 + write_bytes as u64
                             > file.metadata().map(|m| m.len()).unwrap_or(0)
                             || file.write_at(bytes, sector * 512).ok() != Some(write_bytes)
+                            || file.sync_data().is_err()
                         {
                             -5
                         } else {
@@ -1413,6 +1428,85 @@ pub unsafe fn bch2_journal_read(
     0
 }
 
+/*
+ * Reconstruct the in-memory journal state used by replay from an already
+ * durable, contiguous record sequence.  This is the state-reconstruction
+ * tail of bch2_journal_read(): the on-disk scanner above has already done
+ * the same validation and then installs the current ring slot, pin lists and
+ * sequence boundaries.  The storage-engine API uses this path for a
+ * crash-image snapshot, where the records have already been captured from a
+ * successful bch2_journal_flush().
+ */
+pub(crate) fn bch2_journal_restore_for_replay(
+    j: &journal,
+    records: Vec<Vec<u64>>,
+    cur_seq: u64,
+) -> i32 {
+    if cur_seq == 0 || cur_seq > JOURNAL_SEQ_MAX {
+        return -1;
+    }
+
+    let mut first_seq = cur_seq;
+    let mut previous = 0u64;
+    for record in &records {
+        if record.len() < JSET_HEADER_U64S
+            || record[2] != JSET_MAGIC
+            || record[3] == 0
+            || record[3] >= cur_seq
+            || record[5] as u32 as usize > record.len() - JSET_HEADER_U64S
+        {
+            return -1;
+        }
+
+        let seq = record[3];
+        if previous != 0 && seq != previous.saturating_add(1) {
+            return -8;
+        }
+        if previous == 0 {
+            first_seq = seq;
+        }
+        previous = seq;
+    }
+
+    if previous != 0 && previous.checked_add(1) != Some(cur_seq) {
+        return -8;
+    }
+
+    for buf in &j.ring {
+        unsafe { (&mut *buf.data.get()).fill(0) };
+        buf.seq.store(0, Ordering::Release);
+        buf.has_overwrites.store(false, Ordering::Release);
+    }
+    let idx = cur_seq & JOURNAL_STATE_BUF_MASK;
+    j.ring[idx as usize].seq.store(cur_seq, Ordering::Release);
+    let state = idx << 22 | 1u64 << (24 + idx * 10);
+    j.seq.store(cur_seq, Ordering::Release);
+    j.reservations.store(state, Ordering::Release);
+
+    *j.closed.lock().unwrap() = records;
+
+    let mut pin = VecDeque::new();
+    for _ in first_seq..cur_seq {
+        pin.push_back(journal_entry_pin_list {
+            count: 1,
+            unreplayed: true,
+            ..Default::default()
+        });
+    }
+    pin.push_back(journal_entry_pin_list {
+        count: 1,
+        ..Default::default()
+    });
+    *j.pin.lock().unwrap() = (first_seq, pin);
+
+    j.seq_ondisk.store(cur_seq - 1, Ordering::Release);
+    j.last_seq.store(first_seq, Ordering::Release);
+    j.last_seq_ondisk.store(first_seq, Ordering::Release);
+    j.flags
+        .fetch_and(!(1usize << JOURNAL_replay_done), Ordering::AcqRel);
+    0
+}
+
 pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
     (*c).journal
         .flags
@@ -1478,6 +1572,7 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
      * This mirrors recovery.c's early replay pass: root records must become
      * visible before a later btree-key replay can traverse that root.
      */
+    let mut roots_seen = 0usize;
     for (_, record) in selected.iter_mut() {
         let mut offset = JSET_HEADER_U64S;
         let end = JSET_HEADER_U64S + record[5] as u32 as usize;
@@ -1494,9 +1589,33 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
                 }
                 if (*entry).u64s != 0 {
                     crate::btree::interior::bch2_journal_entry_to_btree_root(c, entry);
+                    roots_seen |= 1usize << (*entry).btree_id;
                 }
             }
             offset += actual;
+        }
+    }
+
+    /* recovery.c runs read_btree_roots() immediately after its early replay
+     * pass.  The port combines the early pass with normal replay, therefore
+     * load only roots that came from a journal record and have not already
+     * been supplied by an in-memory recovery bootstrap. */
+    if roots_seen != 0 && !(*c).disk_sb.s_bdev_file.is_null() {
+        for id in 0..crate::btree::types::BTREE_ID_NR {
+            if roots_seen & (1usize << id) == 0
+                || !crate::btree::types::bch2_btree_id_root_b(c, id).is_null()
+            {
+                continue;
+            }
+            let root = crate::btree::types::bch2_btree_id_root(c, id);
+            if root.is_null() || (*root).alive == 0 {
+                continue;
+            }
+            let key = core::ptr::addr_of!((*root).key);
+            let ret = crate::btree::io::bch2_btree_root_read(c, id as u8, key, (*root).level);
+            if ret != 0 {
+                return ret;
+            }
         }
     }
 

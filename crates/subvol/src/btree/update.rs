@@ -1879,6 +1879,13 @@ unsafe fn run_one_mem_trigger(
 }
 
 pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
+    /* commit.c invokes trans_maybe_inject_restart() before checking whether
+     * the transaction has updates, so a retry always follows the same
+     * bch2_trans_begin() lifecycle as a naturally restarted transaction. */
+    let ret = super::iter::bch2_trans_maybe_inject_restart(trans);
+    if ret != 0 {
+        return ret;
+    }
     if !super::iter::bch2_trans_has_updates(trans) {
         return 0;
     }
@@ -1975,6 +1982,12 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
                 return ret;
             }
             crate::rewrite_log_debug!("transaction requested restart after split");
+            /* The local commit error path returns this through
+             * btree_trans_restart(), which records the restart reason before
+             * the caller re-enters bch2_trans_begin().  Preserve that
+             * transaction state here so the iterator/update paths follow the
+             * same reset lifecycle. */
+            (*trans).restarted = 4;
             return -4;
         }
     }

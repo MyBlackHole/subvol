@@ -2,7 +2,7 @@ use super::bkey::{bkey_format, bkey_i, bkey_packed, BKEY_NR_FIELDS};
 use super::bset::{bset as disk_bset, btree_node as disk_btree_node};
 use crate::lock::six::six_lock;
 use crate::util::rhashtable::rhashtable;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 
 pub const MAX_BSETS: usize = 3;
 pub const BCH_BKEY_PTRS_MAX: usize = 16;
@@ -494,6 +494,13 @@ impl Default for btree_evicted_size {
 #[derive(Default)]
 pub struct bch_fs {
     pub flags: usize,
+    /*
+     * Test-only counterpart of iter.h's
+     * CONFIG_BCACHEFS_INJECT_TRANSACTION_RESTARTS path.  Keeping the
+     * countdown in the filesystem state makes the injection point obey the
+     * same transaction-local restart protocol as the normal commit path.
+     */
+    pub fault_inject_transaction_restarts: AtomicU32,
     pub devs_online: crate::btree::bset::bch_devs_mask,
     pub disk_sb: crate::sb::bch_sb_handle,
     pub btree: bch_fs_btree,

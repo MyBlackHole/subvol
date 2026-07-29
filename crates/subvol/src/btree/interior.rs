@@ -428,6 +428,12 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
     let allocate_node = |level: u8| {
         let node = super::cache::bch2_btree_node_mem_alloc(trans, level != 0);
         assert!(!node.is_null());
+        /* bch2_btree_node_mem_alloc() returns a preallocated node with
+         * intent + write held in fs/btree/cache.c.  The Rust cache allocator
+         * intentionally remains usable by the read path too, so establish
+         * those update-owned references at this matching split call site. */
+        assert_eq!(crate::lock::six::six_lock_intent(&(*node).c.lock), 0);
+        assert_eq!(crate::lock::six::six_lock_write(&(*node).c.lock), 0);
         (*node).c.level = level;
         (*node).c.btree_id = (*src).c.btree_id;
         (*node).version_ondisk = crate::sb::bcachefs_metadata_version_current;
@@ -442,6 +448,7 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             return;
         }
         if cache_initialized {
+            super::types::clear_btree_node_dirty(node);
             let _ = super::cache::bch2_btree_node_transition_state(
                 cache_ptr,
                 node,
@@ -449,6 +456,10 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             );
         } else {
             super::cache::bch2_btree_node_data_free(node);
+        }
+        crate::lock::six::six_unlock_write(&(*node).c.lock);
+        crate::lock::six::six_unlock_intent(&(*node).c.lock);
+        if !cache_initialized {
             super::cache::bch2_btree_node_mem_free(c, node);
         }
     };
@@ -469,6 +480,12 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         super::types::clear_btree_node_permanent(node);
         super::types::clear_btree_node_noevict(node);
         if cache_initialized {
+            /* bcachefs leaves the superseded root hashed until its normal
+             * btree write completes.  This engine persists this mutation
+             * through the transaction journal instead of a node-write
+             * pipeline, so the replaced in-memory node has no remaining
+             * durable work before it becomes freeable. */
+            super::types::clear_btree_node_dirty(node);
             let _ = super::cache::bch2_btree_node_transition_state(
                 cache_ptr,
                 node,
@@ -503,7 +520,6 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         (*nodes[side]).nr_key_bits = super::bkey::bkey_format_key_bits(&formats[side]) as u8;
         super::bkey::bch2_compute_bkey_unpack_consts(nodes[side]);
         (*(*nodes[side]).data).format = formats[side];
-        (*(*nodes[side]).data).keys.seq = (*(*src).data).keys.seq.wrapping_add(1);
     }
 
     super::node_iter::bch2_btree_node_iter_init_from_start(&mut iter, src);
@@ -563,7 +579,6 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
     };
 
     for side in 0..2 {
-        (*(*nodes[side]).data).keys.seq = (*(*src).data).keys.seq.wrapping_add(side as u64 + 1);
         let ptr = child_ptr(nodes[side]);
         super::bkey::bkey_copy(
             &mut (*nodes[side]).key,
@@ -582,6 +597,27 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         }
     }
 
+    let mut replacement_paths = [0; 2];
+    for side in 0..2 {
+        let node = nodes[side];
+        let path_idx = super::iter::bch2_path_get_unlocked_mut(
+            trans,
+            (*node).c.btree_id,
+            (*node).c.level,
+            (*node).key.k.p,
+            false,
+        );
+        super::iter::btree_path_take_new_node(trans, (*trans).paths.add(path_idx as usize), node);
+        replacement_paths[side] = path_idx;
+    }
+    let release_paths = |paths: &[super::iter::btree_path_idx_t]| {
+        for path_idx in paths.iter().rev() {
+            if *path_idx != 0 {
+                super::iter::bch2_path_put(trans, *path_idx, true);
+            }
+        }
+    };
+
     let mut old_node = src;
     let mut replacement = [left, right];
     loop {
@@ -595,8 +631,10 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
 
         if parent.is_null() {
             if parent_level >= super::bset::BTREE_MAX_DEPTH as usize {
-                release_node(left);
-                release_node(right);
+                release_paths(&replacement_paths);
+                for node in replacement {
+                    release_node(node);
+                }
                 return -12;
             }
             let root = allocate_node(parent_level as u8);
@@ -606,6 +644,10 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             (*(*root).data).format = (*root).format;
             btree_set_min(root, super::bkey::POS_MIN);
             btree_set_max(root, super::bkey::SPOS_MAX);
+            let root_path = (*trans).paths.add(replacement_paths[1] as usize);
+            (*root_path).locks_want += 1;
+            assert!((*root_path).l[parent_level].b.is_null());
+            super::iter::btree_path_take_new_node(trans, root_path, root);
             for child in replacement {
                 let mut ptr = child_ptr(child);
                 let last = super::types::bset_tree_last(root);
@@ -633,7 +675,6 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             }
             btree_node_reset_sib_u64s(root);
             super::bset_build::bch2_btree_build_aux_trees(root);
-            (*(*root).data).keys.seq = (*(*old_node).data).keys.seq.wrapping_add(3);
             let root_ptr = child_ptr(root);
             super::bkey::bkey_copy(
                 &mut (*root).key,
@@ -652,6 +693,22 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             bch2_btree_set_root_for_read(c, root);
 
             retire_node(old_node);
+            super::iter::bch2_trans_node_add(trans, root);
+            for node in replacement.iter().rev() {
+                super::iter::bch2_trans_node_add(trans, *node);
+            }
+            super::iter::bch2_trans_node_verify_not_in_iters(trans, old_node);
+
+            release_paths(&replacement_paths);
+            /* The temporary paths drop their recursive references first;
+             * consume the allocator-owned primary references afterwards, as
+             * btree_update_done() does after interior.c's out: cleanup. */
+            crate::lock::six::six_unlock_write(&(*root).c.lock);
+            crate::lock::six::six_unlock_intent(&(*root).c.lock);
+            for node in replacement {
+                crate::lock::six::six_unlock_write(&(*node).c.lock);
+                crate::lock::six::six_unlock_intent(&(*node).c.lock);
+            }
 
             return 0;
         }
@@ -662,6 +719,7 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         if old.is_null()
             || !super::bkey::bpos_eq(super::node_iter::bkey_unpack_pos(parent, old), old_pos)
         {
+            release_paths(&replacement_paths);
             for node in replacement {
                 release_node(node);
             }
@@ -674,6 +732,7 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
 
         if bch2_btree_node_insert_fits(parent, required) {
             if crate::lock::six::six_lock_write(&(*old_node).c.lock) != 0 {
+                release_paths(&replacement_paths);
                 for node in replacement {
                     release_node(node);
                 }
@@ -681,6 +740,7 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             }
             if crate::lock::six::six_lock_write(&(*parent).c.lock) != 0 {
                 crate::lock::six::six_unlock_write(&(*old_node).c.lock);
+                release_paths(&replacement_paths);
                 for node in replacement {
                     release_node(node);
                 }
@@ -723,6 +783,21 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             }
             super::cache::bch2_btree_node_set_dirty(c, parent);
             retire_node(old_node);
+            /* The source node's write reference is an update-local lock;
+             * the iterator still owns its intent reference.  Drop the
+             * former before bch2_trans_node_add() transfers and releases the
+             * latter, matching the write-path handoff in
+             * fs/btree/locking.h. */
+            crate::lock::six::six_unlock_write(&(*old_node).c.lock);
+            for node in replacement.iter().rev() {
+                super::iter::bch2_trans_node_add(trans, *node);
+            }
+            super::iter::bch2_trans_node_verify_not_in_iters(trans, old_node);
+            release_paths(&replacement_paths);
+            for node in replacement {
+                crate::lock::six::six_unlock_write(&(*node).c.lock);
+                crate::lock::six::six_unlock_intent(&(*node).c.lock);
+            }
             crate::lock::six::six_unlock_write(&(*parent).c.lock);
             return 0;
         }
@@ -776,6 +851,7 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             super::node_iter::bch2_btree_node_iter_advance(&mut scan, parent);
         }
         if nr_keys[0] == 0 || nr_keys[1] == 0 {
+            release_paths(&replacement_paths);
             for node in replacement {
                 release_node(node);
             }
@@ -823,7 +899,6 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
                 super::bkey::bkey_format_key_bits(&formats[side]) as u8;
             super::bkey::bch2_compute_bkey_unpack_consts(parent_nodes[side]);
             (*(*parent_nodes[side]).data).format = formats[side];
-            (*(*parent_nodes[side]).data).keys.seq = (*(*parent).data).keys.seq.wrapping_add(1);
         }
 
         super::node_iter::bch2_btree_node_iter_init_from_start(&mut scan, parent);
@@ -871,8 +946,6 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             super::bset_build::bch2_btree_build_aux_trees(parent_nodes[side]);
         }
         for side in 0..2 {
-            (*(*parent_nodes[side]).data).keys.seq =
-                (*(*parent).data).keys.seq.wrapping_add(side as u64 + 1);
             let ptr = child_ptr(parent_nodes[side]);
             super::bkey::bkey_copy(
                 &mut (*parent_nodes[side]).key,
@@ -886,6 +959,24 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
                 );
                 super::cache::bch2_btree_node_set_dirty(c, parent_nodes[side]);
             }
+        }
+
+        let mut parent_paths = [0; 2];
+        for side in 0..2 {
+            let node = parent_nodes[side];
+            let path_idx = super::iter::bch2_path_get_unlocked_mut(
+                trans,
+                (*node).c.btree_id,
+                (*node).c.level,
+                (*node).key.k.p,
+                false,
+            );
+            super::iter::btree_path_take_new_node(
+                trans,
+                (*trans).paths.add(path_idx as usize),
+                node,
+            );
+            parent_paths[side] = path_idx;
         }
 
         let old_side = (super::bkey::bpos_cmp(old_pos, pivot) > 0) as usize;
@@ -904,6 +995,8 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
                 old_pos,
             )
         {
+            release_paths(&parent_paths);
+            release_paths(&replacement_paths);
             for node in replacement {
                 release_node(node);
             }
@@ -953,9 +1046,19 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         }
 
         retire_node(old_node);
+        for node in replacement.iter().rev() {
+            super::iter::bch2_trans_node_add(trans, *node);
+        }
+        super::iter::bch2_trans_node_verify_not_in_iters(trans, old_node);
+        release_paths(&replacement_paths);
+        for node in replacement {
+            crate::lock::six::six_unlock_write(&(*node).c.lock);
+            crate::lock::six::six_unlock_intent(&(*node).c.lock);
+        }
 
         old_node = parent;
         replacement = [left_parent, right_parent];
+        replacement_paths = parent_paths;
     }
 }
 
@@ -1015,8 +1118,8 @@ mod tests {
             POS_MIN, SPOS, SPOS_MAX,
         };
         use crate::btree::iter::{
-            bch2_btree_iter_next, bch2_btree_iter_peek, bch2_trans_init, bch2_trans_iter_exit,
-            bch2_trans_iter_init, btree_iter, btree_trans, BTREE_ITER_intent,
+            bch2_btree_iter_next, bch2_btree_iter_peek, bch2_trans_begin, bch2_trans_init,
+            bch2_trans_iter_exit, bch2_trans_iter_init, btree_iter, btree_trans, BTREE_ITER_intent,
         };
         use crate::btree::types::{bch2_btree_id_root_set, bch_fs};
         use crate::btree::update::{bch2_trans_commit, bch2_trans_update};
@@ -1078,6 +1181,10 @@ mod tests {
                 0
             );
             assert_eq!(bch2_trans_commit(&mut trans), -4);
+            /* A split is a transaction restart boundary: reset the old
+             * transaction before another transaction attempts traversal, as
+             * bch2_trans_begin() does in the local retry macros. */
+            bch2_trans_begin(&mut trans);
             bch2_trans_iter_exit(&mut iter);
             assert_eq!(
                 (*crate::btree::types::bch2_btree_id_root_b(&c, 0)).c.level,
@@ -1139,6 +1246,7 @@ mod tests {
                 let ret = bch2_trans_commit(&mut grow_trans);
                 bch2_trans_iter_exit(&mut grow);
                 if ret == -4 {
+                    bch2_trans_begin(&mut grow_trans);
                     restart_offsets.push(offset);
                     let mut split_retry_trans = btree_trans::default();
                     bch2_trans_init(&mut split_retry_trans, &mut c);
@@ -1215,6 +1323,7 @@ mod tests {
                         break;
                     }
                     assert_eq!(ret, -4, "delete split retry offset={offset}");
+                    bch2_trans_begin(&mut delete_trans);
                 }
             }
 

@@ -1,10 +1,9 @@
 use super::bkey::{
-    bch2_key_resize, bkey, bkey_deleted, bkey_eq, bkey_ge, bkey_init, bkey_lt, bkey_packed, bkey_s_c,
-    bkey_start_pos, bkeyp_key_u64s,
-    bkeyp_val_u64s, bpos, bpos_cmp, bpos_eq,
-    bpos_gt, bpos_lt, bpos_max, bpos_nosnap_predecessor, bpos_nosnap_successor, bpos_predecessor,
-    bpos_successor,
-    bpos_with_snapshot, KEY_INODE_MAX, KEY_OFFSET_MAX, KEY_SIZE_MAX, POS_MAX, SPOS_MAX, POS_MIN,
+    bch2_key_resize, bkey, bkey_deleted, bkey_eq, bkey_ge, bkey_init, bkey_lt, bkey_packed,
+    bkey_s_c, bkey_start_pos, bkeyp_key_u64s, bkeyp_val_u64s, bpos, bpos_cmp, bpos_eq, bpos_gt,
+    bpos_lt, bpos_max, bpos_nosnap_predecessor, bpos_nosnap_successor, bpos_predecessor,
+    bpos_successor, bpos_with_snapshot, KEY_INODE_MAX, KEY_OFFSET_MAX, KEY_SIZE_MAX, POS_MAX,
+    POS_MIN, SPOS_MAX,
 };
 use super::bset::{bkey_i_btree_ptr_v2, btree_node_mem_ptr, BTREE_MAX_DEPTH};
 use super::node_iter::{
@@ -17,11 +16,11 @@ use super::types::{
     btree, btree_node_iter,
 };
 use crate::lock::six::{
-    six_lock_counts, six_lock_downgrade, six_lock_increment, six_lock_intent, six_lock_read, six_lock_seq,
-    six_relock_type,
-    six_lock_tryupgrade, six_lock_type, six_lock_write, six_unlock_intent, six_unlock_read,
-    six_unlock_write,
+    six_lock_counts, six_lock_downgrade, six_lock_increment, six_lock_intent, six_lock_read,
+    six_lock_seq, six_lock_tryupgrade, six_lock_type, six_lock_write, six_relock_type,
+    six_unlock_intent, six_unlock_read, six_unlock_write,
 };
+use core::sync::atomic::Ordering;
 
 pub const BTREE_ITER_INITIAL: usize = 64;
 pub type btree_path_idx_t = u16;
@@ -89,9 +88,7 @@ pub unsafe fn bch2_btree_iter_flags(
     if flags & BTREE_ITER_snapshot_field == 0 && !btree_type_has_snapshot_field(btree_id) {
         flags &= !BTREE_ITER_all_snapshots;
     }
-    if flags & BTREE_ITER_all_snapshots == 0
-        && super::types::btree_type_has_snapshots(btree_id)
-    {
+    if flags & BTREE_ITER_all_snapshots == 0 && super::types::btree_type_has_snapshots(btree_id) {
         flags |= BTREE_ITER_filter_snapshots;
     }
     if !trans.is_null() && (*trans).journal_replay_not_finished {
@@ -180,10 +177,7 @@ pub unsafe fn btree_path_advance_to_pos(
     true
 }
 
-pub unsafe fn btree_path_set_should_be_locked(
-    _trans: *mut btree_trans,
-    path: *mut btree_path,
-) {
+pub unsafe fn btree_path_set_should_be_locked(_trans: *mut btree_trans, path: *mut btree_path) {
     if path.is_null() {
         return;
     }
@@ -292,12 +286,9 @@ pub unsafe fn bch2_btree_node_relock(
         BTREE_NODE_WRITE_LOCKED => six_lock_type::SIX_LOCK_write,
         _ => return false,
     };
-    if six_relock_type(
-        &(*b).c.lock,
-        six_type,
-        (*path).l[level].lock_seq,
-    ) || (btree_node_lock_seq_matches(path, b, level)
-        && btree_node_lock_increment(trans, &mut (*b).c, level, want))
+    if six_relock_type(&(*b).c.lock, six_type, (*path).l[level].lock_seq)
+        || (btree_node_lock_seq_matches(path, b, level)
+            && btree_node_lock_increment(trans, &mut (*b).c, level, want))
     {
         path_mark_locked(&mut *path, level, want);
         return true;
@@ -325,10 +316,7 @@ pub unsafe fn bch2_btree_path_relock_norestart(
     true
 }
 
-pub unsafe fn bch2_btree_path_relock(
-    trans: *mut btree_trans,
-    path: *mut btree_path,
-) -> i32 {
+pub unsafe fn bch2_btree_path_relock(trans: *mut btree_trans, path: *mut btree_path) -> i32 {
     if trans.is_null() || path.is_null() {
         return -22;
     }
@@ -545,7 +533,10 @@ pub unsafe fn bch2_trans_begin(trans: *mut btree_trans) -> u32 {
     (*trans).realloc_bytes_required = 0;
     if (*trans).journal_replay_not_finished
         && (*trans).c != core::ptr::null_mut()
-        && (*(*trans).c).journal.flags.load(core::sync::atomic::Ordering::Acquire)
+        && (*(*trans).c)
+            .journal
+            .flags
+            .load(core::sync::atomic::Ordering::Acquire)
             & (1usize << crate::journal::JOURNAL_replay_done)
             != 0
     {
@@ -575,6 +566,73 @@ pub unsafe fn bch2_trans_begin(trans: *mut btree_trans) -> u32 {
     }
     (*trans).restarted = 0;
     (*trans).restart_count
+}
+
+/*
+ * Stack-owned counterpart of the local bch2_trans_put().  The C version
+ * unlocks every path, releases outstanding update references and then frees
+ * per-transaction allocation before returning the transaction object to its
+ * pool.  This port keeps btree_trans on the caller's stack, so only the
+ * latter pool-return step is omitted.
+ */
+pub(crate) unsafe fn bch2_trans_put(trans: *mut btree_trans) {
+    if trans.is_null() {
+        return;
+    }
+
+    bch2_trans_unlock(trans);
+    if !(*trans).c.is_null() {
+        crate::journal::bch2_journal_res_put(&(*(*trans).c).journal, &mut (*trans).journal_res);
+    }
+    super::update::bch2_trans_reset_updates(trans);
+
+    for idx in 1..BTREE_ITER_INITIAL {
+        while (*trans).paths_allocated & (1u64 << idx) != 0 {
+            let path = (*trans).paths.add(idx);
+            let intent = (*path).intent_ref != 0;
+            bch2_path_put(trans, idx as btree_path_idx_t, intent);
+        }
+    }
+
+    if !(*trans).mem.is_null() && (*trans).mem_bytes != 0 {
+        if let Ok(layout) = std::alloc::Layout::from_size_align(
+            (*trans).mem_bytes as usize,
+            core::mem::align_of::<u64>(),
+        ) {
+            std::alloc::dealloc((*trans).mem, layout);
+        }
+    }
+    (*trans).mem = core::ptr::null_mut();
+    (*trans).mem_top = 0;
+    (*trans).mem_bytes = 0;
+    (*trans).realloc_bytes_required = 0;
+}
+
+/*
+ * Port of trans_maybe_inject_restart() in the local fs/btree/iter.h.  The
+ * source helper records the restart error in trans->restarted and returns its
+ * negative value; bch2_trans_begin() is responsible for resetting the
+ * transaction before the caller retraverses its iterator paths.
+ */
+pub(crate) unsafe fn bch2_trans_maybe_inject_restart(trans: *mut btree_trans) -> i32 {
+    if trans.is_null() || (*trans).c.is_null() {
+        return 0;
+    }
+
+    let restarts = &(*(*trans).c).fault_inject_transaction_restarts;
+    if restarts
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            count.checked_sub(1)
+        })
+        .is_ok()
+    {
+        /* BCH_ERR_transaction_restart_fault_inject in the port's error
+         * convention is represented by the restart return value -4. */
+        (*trans).restarted = 4;
+        return -4;
+    }
+
+    0
 }
 
 fn path_lock_type(path: &btree_path, level: usize) -> u8 {
@@ -719,7 +777,13 @@ unsafe fn btree_path_unlock(path: *mut btree_path) {
         match path_locked_type(&*path, level) {
             BTREE_NODE_READ_LOCKED => six_unlock_read(&(*b).c.lock),
             BTREE_NODE_INTENT_LOCKED => six_unlock_intent(&(*b).c.lock),
-            BTREE_NODE_WRITE_LOCKED => six_unlock_write(&(*b).c.lock),
+            /* A SIX write lock is held on top of its intent lock.  Keep
+             * this paired with btree_node_unlock(), as in
+             * fs/btree/locking.h's btree_node_unlock(). */
+            BTREE_NODE_WRITE_LOCKED => {
+                six_unlock_write(&(*b).c.lock);
+                six_unlock_intent(&(*b).c.lock);
+            }
             _ => {}
         }
         (*path).l[level].b = core::ptr::null_mut();
@@ -843,13 +907,20 @@ pub(crate) unsafe fn btree_node_unlock(path: *mut btree_path, level: usize) {
     match lock_type {
         BTREE_NODE_READ_LOCKED => six_unlock_read(&(*b).c.lock),
         BTREE_NODE_INTENT_LOCKED => six_unlock_intent(&(*b).c.lock),
-        BTREE_NODE_WRITE_LOCKED => six_unlock_write(&(*b).c.lock),
+        BTREE_NODE_WRITE_LOCKED => {
+            six_unlock_write(&(*b).c.lock);
+            if (*b)
+                .c
+                .lock
+                .write_lock_recurse
+                .load(core::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                (*path).l[level].lock_seq = six_lock_seq(&(*b).c.lock);
+            }
+            six_unlock_intent(&(*b).c.lock);
+        }
         _ => return,
-    }
-    if lock_type == BTREE_NODE_WRITE_LOCKED
-        && (*b).c.lock.write_lock_recurse.load(core::sync::atomic::Ordering::Relaxed) == 0
-    {
-        (*path).l[level].lock_seq = six_lock_seq(&(*b).c.lock);
     }
     path_mark_locked(&mut *path, level, BTREE_NODE_UNLOCKED);
 }
@@ -867,7 +938,9 @@ pub unsafe fn bch2_btree_path_downgrade(
     }
     (*path).locks_want = new_locks_want;
     loop {
-        let Some(level) = btree_path_highest_level_locked(path) else { break };
+        let Some(level) = btree_path_highest_level_locked(path) else {
+            break;
+        };
         if level < new_locks_want as usize {
             break;
         }
@@ -923,9 +996,8 @@ pub unsafe fn bch2_path_get_unlocked_mut(
     pos: bpos,
     cached: bool,
 ) -> btree_path_idx_t {
-    let flags = BTREE_ITER_nopreserve
-        | BTREE_ITER_intent
-        | if cached { BTREE_ITER_cached } else { 0 };
+    let flags =
+        BTREE_ITER_nopreserve | BTREE_ITER_intent | if cached { BTREE_ITER_cached } else { 0 };
     let path_idx = bch2_path_get(trans, btree_id, &pos, level + 1, level, flags);
     let path_idx = bch2_btree_path_make_mut(trans, path_idx, true, 0);
     let path = (*trans).paths.add(path_idx as usize);
@@ -933,6 +1005,29 @@ pub unsafe fn bch2_path_get_unlocked_mut(
     bch2_btree_path_downgrade(trans, path, new_locks_want);
     btree_path_unlock(path);
     path_idx
+}
+
+/*
+ * Port of fs/btree/interior.c's btree_path_take_new_node().  A consumed
+ * preallocated node arrives with the update owner's primary intent/write
+ * references; the temporary transaction path takes a matching recursive
+ * write reference so every construction and publication mutation remains
+ * represented in the iterator path graph.
+ */
+pub(crate) unsafe fn btree_path_take_new_node(
+    trans: *mut btree_trans,
+    path: *mut btree_path,
+    b: *mut btree,
+) {
+    assert!(!trans.is_null());
+    assert!(!path.is_null());
+    assert!(!b.is_null());
+
+    let level = (*b).c.level;
+    assert!((level as usize) < BTREE_MAX_DEPTH as usize);
+    six_lock_increment(&(*b).c.lock, six_lock_type::SIX_LOCK_write);
+    path_mark_locked(&mut *path, level as usize, BTREE_NODE_WRITE_LOCKED);
+    bch2_btree_path_level_init(trans, path, level, b);
 }
 
 pub unsafe fn bch2_btree_path_level_init(
@@ -958,10 +1053,7 @@ pub unsafe fn bch2_btree_path_level_init(
     }
 }
 
-pub unsafe fn bch2_trans_revalidate_updates_in_node(
-    trans: *mut btree_trans,
-    b: *mut btree,
-) {
+pub unsafe fn bch2_trans_revalidate_updates_in_node(trans: *mut btree_trans, b: *mut btree) {
     if trans.is_null() || b.is_null() {
         return;
     }
@@ -1003,10 +1095,7 @@ pub unsafe fn bch2_trans_node_add(trans: *mut btree_trans, b: *mut btree) {
             continue;
         }
         let path = (*trans).paths.add(idx);
-        if (*path).cached
-            || level < (*path).level as usize
-            || !btree_path_pos_in_node(path, b)
-        {
+        if (*path).cached || level < (*path).level as usize || !btree_path_pos_in_node(path, b) {
             continue;
         }
         let lock_type = if (*path).nodes_locked != 0 {
@@ -1040,9 +1129,7 @@ pub unsafe fn bch2_trans_node_verify_not_in_iters(trans: *mut btree_trans, b: *m
             continue;
         }
         let path = (*trans).paths.add(idx);
-        if (*path).l[level].b == b
-            && path_locked_type(&*path, level) != BTREE_NODE_UNLOCKED
-        {
+        if (*path).l[level].b == b && path_locked_type(&*path, level) != BTREE_NODE_UNLOCKED {
             panic!("btree node is still referenced by a locked transaction path");
         }
     }
@@ -1065,9 +1152,7 @@ pub unsafe fn bch2_btree_path_fix_key_modified(
             continue;
         }
         let path = (*trans).paths.add(idx);
-        if (*path).l[level].b != b
-            || (*path).l[level].lock_seq != six_lock_seq(&(*b).c.lock)
-        {
+        if (*path).l[level].b != b || (*path).l[level].lock_seq != six_lock_seq(&(*b).c.lock) {
             continue;
         }
         let peeked = bch2_btree_node_iter_peek_all(&mut (*path).l[level].iter, b);
@@ -1183,12 +1268,7 @@ pub unsafe fn bch2_btree_path_set_pos(
         {
             let cmp = bpos_cmp(*new_pos, old_pos);
             if cmp < 0 || !btree_path_advance_to_pos(path, level, 8) {
-                bch2_btree_node_iter_init(
-                    (*trans).c,
-                    b,
-                    &mut (*path).l[level].iter,
-                    &(*path).pos,
-                );
+                bch2_btree_node_iter_init((*trans).c, b, &mut (*path).l[level].iter, &(*path).pos);
             }
             if level != 0 {
                 bch2_btree_node_iter_peek(&mut (*path).l[level].iter, b);
@@ -1203,10 +1283,7 @@ pub unsafe fn bch2_btree_path_set_pos(
     path_idx
 }
 
-pub unsafe fn bch2_btree_path_can_relock(
-    _trans: *mut btree_trans,
-    path: *mut btree_path,
-) -> bool {
+pub unsafe fn bch2_btree_path_can_relock(_trans: *mut btree_trans, path: *mut btree_path) -> bool {
     if path.is_null() {
         return false;
     }
@@ -1230,11 +1307,7 @@ pub unsafe fn bch2_btree_path_can_relock(
     true
 }
 
-pub unsafe fn bch2_path_put(
-    trans: *mut btree_trans,
-    path_idx: btree_path_idx_t,
-    _intent: bool,
-) {
+pub unsafe fn bch2_path_put(trans: *mut btree_trans, path_idx: btree_path_idx_t, _intent: bool) {
     if trans.is_null()
         || path_idx == 0
         || path_idx as usize >= BTREE_ITER_INITIAL
@@ -1292,8 +1365,7 @@ pub unsafe fn bch2_btree_path_peek_slot(path: *mut btree_path, u: *mut bkey) -> 
             *u = *(packed as *const bkey);
         }
         if bpos_eq((*u).p, (*path).pos) {
-            let value =
-                (packed as *const u64).add(bkeyp_key_u64s(&(*b).format, &*packed) as usize);
+            let value = (packed as *const u64).add(bkeyp_key_u64s(&(*b).format, &*packed) as usize);
             return bkey_s_c {
                 k: u,
                 v: value.cast(),
@@ -1308,18 +1380,12 @@ pub unsafe fn bch2_btree_path_peek_slot(path: *mut btree_path, u: *mut bkey) -> 
     }
 }
 
-pub unsafe fn bch2_btree_path_peek_slot_exact(
-    path: *mut btree_path,
-    u: *mut bkey,
-) -> bkey_s_c {
+pub unsafe fn bch2_btree_path_peek_slot_exact(path: *mut btree_path, u: *mut bkey) -> bkey_s_c {
     if path.is_null() || u.is_null() {
         return bkey_s_c::default();
     }
     let k = bch2_btree_path_peek_slot(path, u);
-    if super::bkey::bkey_err(k) == 0
-        && !k.k.is_null()
-        && bpos_eq((*path).pos, (*k.k).p)
-    {
+    if super::bkey::bkey_err(k) == 0 && !k.k.is_null() && bpos_eq((*path).pos, (*k.k).p) {
         return k;
     }
     *u = bkey::default();
@@ -1391,8 +1457,7 @@ unsafe fn btree_path_traverse_cached_fast(
     if ret != 0 {
         return ret;
     }
-    if (*cached).key.btree_id != (*path).btree_id as u32
-        || !bpos_eq((*cached).key.pos, (*path).pos)
+    if (*cached).key.btree_id != (*path).btree_id as u32 || !bpos_eq((*cached).key.pos, (*path).pos)
     {
         match six_type {
             six_lock_type::SIX_LOCK_read => six_unlock_read(&(*cached).c.lock),
@@ -1503,10 +1568,7 @@ pub unsafe fn bch2_btree_path_traverse_one(
                             &mut (*path).l[level].iter,
                             parent,
                         );
-                        packed = bch2_btree_node_iter_peek(
-                            &mut (*path).l[level].iter,
-                            parent,
-                        );
+                        packed = bch2_btree_node_iter_peek(&mut (*path).l[level].iter, parent);
                     }
                     if bpos_eq((*journal_k).k.p, SPOS_MAX) {
                         break;
@@ -1516,8 +1578,10 @@ pub unsafe fn bch2_btree_path_traverse_one(
                 }
                 if (*journal_k).k.type_ == super::bset::KEY_TYPE_btree_ptr_v2
                     && (packed.is_null()
-                        || bpos_cmp((*journal_k).k.p, super::node_iter::bkey_unpack_pos(parent, packed))
-                            <= 0)
+                        || bpos_cmp(
+                            (*journal_k).k.p,
+                            super::node_iter::bkey_unpack_pos(parent, packed),
+                        ) <= 0)
                 {
                     *ptr = *(journal_k.cast::<bkey_i_btree_ptr_v2>());
                     from_journal = true;
@@ -1675,10 +1739,8 @@ pub unsafe fn bch2_trans_node_iter_init(
     flags: u16,
 ) {
     bch2_trans_iter_exit(iter);
-    let flags = flags
-        | BTREE_ITER_not_extents
-        | BTREE_ITER_snapshot_field
-        | BTREE_ITER_all_snapshots;
+    let flags =
+        flags | BTREE_ITER_not_extents | BTREE_ITER_snapshot_field | BTREE_ITER_all_snapshots;
     bch2_trans_iter_init_common(trans, iter, btree_id, pos, locks_want, depth, flags);
     (*iter).min_depth = depth;
 }
@@ -1776,10 +1838,7 @@ pub unsafe fn bch2_btree_iter_traverse(iter: *mut btree_iter) -> i32 {
         search_key = if (*iter).flags & BTREE_ITER_all_snapshots != 0 {
             super::bkey::bpos_successor(search_key)
         } else {
-            bpos_with_snapshot(
-                bpos_nosnap_successor(search_key),
-                (*iter).snapshot,
-            )
+            bpos_with_snapshot(bpos_nosnap_successor(search_key), (*iter).snapshot)
         };
     }
     (*iter).path = bch2_btree_path_set_pos(
@@ -1860,9 +1919,7 @@ pub unsafe fn bch2_btree_iter_peek_max_type(
     }
 }
 
-pub unsafe fn bch2_btree_iter_peek_and_restart_outlined(
-    iter: *mut btree_iter,
-) -> bkey_s_c {
+pub unsafe fn bch2_btree_iter_peek_and_restart_outlined(iter: *mut btree_iter) -> bkey_s_c {
     bch2_btree_iter_peek_type(iter, (*iter).flags)
 }
 
@@ -1901,7 +1958,7 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
     if (*iter).flags & BTREE_ITER_filter_snapshots != 0 {
         let trans = (*iter).trans;
         let saved_flags = (*iter).flags;
-            (*iter).flags &= !BTREE_ITER_filter_snapshots;
+        (*iter).flags &= !BTREE_ITER_filter_snapshots;
         loop {
             let ret = bch2_btree_iter_peek_max(iter, end);
             if super::bkey::bkey_err(ret) != 0 || ret.k.is_null() {
@@ -1937,12 +1994,8 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
                 && saved_flags & BTREE_ITER_is_extents == 0
                 && (*iter).update_path == 0
             {
-                (*iter).update_path = btree_path_clone(
-                    trans,
-                    (*iter).path,
-                    saved_flags & BTREE_ITER_intent != 0,
-                    0,
-                );
+                (*iter).update_path =
+                    btree_path_clone(trans, (*iter).path, saved_flags & BTREE_ITER_intent != 0, 0);
                 let with_snapshot = bpos_with_snapshot((*ret.k).p, (*iter).snapshot);
                 (*iter).update_path = bch2_btree_path_set_pos(
                     trans,
@@ -1951,11 +2004,7 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
                     saved_flags & BTREE_ITER_intent != 0,
                     0,
                 );
-                let ret = bch2_btree_path_traverse(
-                    trans,
-                    (*iter).update_path,
-                    saved_flags,
-                );
+                let ret = bch2_btree_path_traverse(trans, (*iter).update_path, saved_flags);
                 if ret != 0 {
                     (*iter).flags = saved_flags;
                     return super::bkey::bkey_s_c_err(ret);
@@ -1988,10 +2037,7 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
                     (*iter).pos = if saved_flags & BTREE_ITER_all_snapshots != 0 {
                         bpos_successor((*ret.k).p)
                     } else {
-                        bpos_with_snapshot(
-                            bpos_nosnap_successor((*ret.k).p),
-                            (*iter).snapshot,
-                        )
+                        bpos_with_snapshot(bpos_nosnap_successor((*ret.k).p), (*iter).snapshot)
                     };
                 }
                 continue;
@@ -2015,10 +2061,7 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
             search_key = if (*iter).flags & BTREE_ITER_all_snapshots != 0 {
                 super::bkey::bpos_successor(search_key)
             } else {
-                bpos_with_snapshot(
-                    bpos_nosnap_successor(search_key),
-                    (*iter).snapshot,
-                )
+                bpos_with_snapshot(bpos_nosnap_successor(search_key), (*iter).snapshot)
             };
         }
         (*iter).path = bch2_btree_path_set_pos(
@@ -2102,10 +2145,8 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
         };
         if ((*iter).flags & BTREE_ITER_all_snapshots != 0 && bpos_cmp(next_pos, *end) > 0)
             || ((*iter).flags & BTREE_ITER_all_snapshots == 0
-                && ((*iter).flags & BTREE_ITER_is_extents != 0
-                    && !bkey_lt(next_pos, *end)
-                    || (*iter).flags & BTREE_ITER_is_extents == 0
-                        && bkey_lt(*end, next_pos)))
+                && ((*iter).flags & BTREE_ITER_is_extents != 0 && !bkey_lt(next_pos, *end)
+                    || (*iter).flags & BTREE_ITER_is_extents == 0 && bkey_lt(*end, next_pos)))
         {
             btree_iter_set_pos(iter, *end);
             return bkey_s_c::default();
@@ -2134,8 +2175,7 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
                 &mut (*iter).journal_idx,
             );
             if !journal_k.is_null()
-                && (ret.k.is_null()
-                    || bpos_cmp((*journal_k).k.p, (*ret.k).p) <= 0)
+                && (ret.k.is_null() || bpos_cmp((*journal_k).k.p, (*ret.k).p) <= 0)
             {
                 if (*journal_k).k.type_ == super::bset::KEY_TYPE_deleted {
                     if bpos_eq((*journal_k).k.p, SPOS_MAX) {
@@ -2146,10 +2186,7 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
                 }
                 (*iter).k = (*journal_k).k;
                 let candidate = if (*iter).flags & BTREE_ITER_is_extents != 0 {
-                    super::bkey::bpos_max(
-                        (*iter).pos,
-                        super::bkey::bkey_start_pos(&(*iter).k),
-                    )
+                    super::bkey::bpos_max((*iter).pos, super::bkey::bkey_start_pos(&(*iter).k))
                 } else {
                     (*iter).k.p
                 };
@@ -2186,10 +2223,7 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
         }
         if !ret.k.is_null() {
             let candidate = if (*iter).flags & BTREE_ITER_is_extents != 0 {
-                super::bkey::bpos_max(
-                    (*iter).pos,
-                    super::bkey::bkey_start_pos(&*ret.k),
-                )
+                super::bkey::bpos_max((*iter).pos, super::bkey::bkey_start_pos(&*ret.k))
             } else {
                 (*ret.k).p
             };
@@ -2260,7 +2294,11 @@ unsafe fn bch2_btree_trans_peek_prev_updates(
             || bpos_cmp((*update.k).k.p, search_key) > 0
             || bpos_cmp(
                 (*update.k).k.p,
-                if current.k.is_null() { end } else { (*current.k).p },
+                if current.k.is_null() {
+                    end
+                } else {
+                    (*current.k).p
+                },
             ) < 0
         {
             continue;
@@ -2280,9 +2318,7 @@ unsafe fn btree_trans_peek_key_cache(iter: *mut btree_iter, current: &mut bkey_s
     {
         return 0;
     }
-    if (*iter).flags & BTREE_ITER_key_cache_fill != 0
-        && bpos_eq((*iter).pos, (*current.k).p)
-    {
+    if (*iter).flags & BTREE_ITER_key_cache_fill != 0 && bpos_eq((*iter).pos, (*current.k).p) {
         return 0;
     }
 
@@ -2310,10 +2346,8 @@ unsafe fn btree_trans_peek_key_cache(iter: *mut btree_iter, current: &mut bkey_s
     }
 
     let mut u = bkey::default();
-    let cached = bch2_btree_path_peek_slot(
-        (*trans).paths.add((*iter).key_cache_path as usize),
-        &mut u,
-    );
+    let cached =
+        bch2_btree_path_peek_slot((*trans).paths.add((*iter).key_cache_path as usize), &mut u);
     if cached.k.is_null()
         || ((*iter).flags & BTREE_ITER_all_snapshots != 0
             && !bpos_eq((*current.k).p, (*cached.k).p))
@@ -2322,10 +2356,7 @@ unsafe fn btree_trans_peek_key_cache(iter: *mut btree_iter, current: &mut bkey_s
     }
     (*iter).k = u;
     current.v = cached.v;
-    btree_path_set_should_be_locked(
-        trans,
-        (*trans).paths.add((*iter).key_cache_path as usize),
-    );
+    btree_path_set_should_be_locked(trans, (*trans).paths.add((*iter).key_cache_path as usize));
     0
 }
 
@@ -2346,10 +2377,7 @@ pub unsafe fn bch2_btree_iter_peek_slot(iter: *mut btree_iter) -> bkey_s_c {
         search_key = if (*iter).flags & BTREE_ITER_all_snapshots != 0 {
             bpos_successor(search_key)
         } else {
-            bpos_with_snapshot(
-                bpos_nosnap_successor(search_key),
-                (*iter).snapshot,
-            )
+            bpos_with_snapshot(bpos_nosnap_successor(search_key), (*iter).snapshot)
         };
     }
     (*iter).path = bch2_btree_path_set_pos(
@@ -2533,10 +2561,8 @@ pub unsafe fn bch2_btree_iter_peek_root(
 
     let c = (*trans).c;
     while level
-        == bch2_btree_root_unpack_level(
-            bch2_btree_id_root_packed(c, btree_id as usize),
-        )
-        .saturating_add(1)
+        == bch2_btree_root_unpack_level(bch2_btree_id_root_packed(c, btree_id as usize))
+            .saturating_add(1)
     {
         bch2_trans_node_iter_init(
             trans,
@@ -2609,10 +2635,7 @@ pub unsafe fn bch2_btree_iter_peek_prev(iter: *mut btree_iter) -> bkey_s_c {
     bch2_btree_iter_peek_prev_min(iter, POS_MIN)
 }
 
-pub unsafe fn bch2_btree_iter_peek_prev_min(
-    iter: *mut btree_iter,
-    end: bpos,
-) -> bkey_s_c {
+pub unsafe fn bch2_btree_iter_peek_prev_min(iter: *mut btree_iter, end: bpos) -> bkey_s_c {
     if (*iter).flags & BTREE_ITER_filter_snapshots != 0 {
         let trans = (*iter).trans;
         let saved_flags = (*iter).flags;
@@ -2651,10 +2674,7 @@ pub unsafe fn bch2_btree_iter_peek_prev_min(
                 (*iter).pos = if saved_flags & BTREE_ITER_all_snapshots != 0 {
                     bpos_predecessor((*k.k).p)
                 } else {
-                    bpos_with_snapshot(
-                        bpos_nosnap_predecessor((*k.k).p),
-                        saved_pos.snapshot,
-                    )
+                    bpos_with_snapshot(bpos_nosnap_predecessor((*k.k).p), saved_pos.snapshot)
                 };
                 continue;
             }
@@ -2678,10 +2698,7 @@ pub unsafe fn bch2_btree_iter_peek_prev_min(
                 (*iter).pos = if saved_flags & BTREE_ITER_all_snapshots != 0 {
                     bpos_predecessor((*k.k).p)
                 } else {
-                    bpos_with_snapshot(
-                        bpos_nosnap_predecessor((*k.k).p),
-                        saved_pos.snapshot,
-                    )
+                    bpos_with_snapshot(bpos_nosnap_predecessor((*k.k).p), saved_pos.snapshot)
                 };
                 continue;
             }
@@ -2723,8 +2740,7 @@ pub unsafe fn bch2_btree_iter_peek_prev_min(
     }
     if (*iter).flags & (BTREE_ITER_is_extents | BTREE_ITER_filter_snapshots) != 0
         && !bkey_eq((*iter).pos, POS_MAX)
-        && !((*iter).flags & BTREE_ITER_is_extents != 0
-            && (*iter).pos.offset == KEY_OFFSET_MAX)
+        && !((*iter).flags & BTREE_ITER_is_extents != 0 && (*iter).pos.offset == KEY_OFFSET_MAX)
     {
         let k = bch2_btree_iter_peek_slot(iter);
         if super::bkey::bkey_err(k) != 0 || k.k.is_null() {
@@ -2772,10 +2788,7 @@ pub unsafe fn bch2_btree_iter_peek_prev_min(
         }
         let mut packed = bch2_btree_node_iter_peek_all(&mut (*path).l[0].iter, leaf);
         if packed.is_null()
-            || bpos_cmp(
-                super::node_iter::bkey_unpack_pos(leaf, packed),
-                search_key,
-            ) > 0
+            || bpos_cmp(super::node_iter::bkey_unpack_pos(leaf, packed), search_key) > 0
         {
             packed = bch2_btree_node_iter_prev(&mut (*path).l[0].iter, leaf);
             if !packed.is_null() {
@@ -2784,11 +2797,7 @@ pub unsafe fn bch2_btree_iter_peek_prev_min(
         }
         if !packed.is_null() {
             if super::bkey::bkey_packed(&*packed) {
-                super::bkey::__bch2_bkey_unpack_key(
-                    &(*leaf).format,
-                    &mut (*iter).k,
-                    &*packed,
-                );
+                super::bkey::__bch2_bkey_unpack_key(&(*leaf).format, &mut (*iter).k, &*packed);
             } else {
                 (*iter).k = *(packed as *const bkey);
             }
@@ -2813,8 +2822,7 @@ pub unsafe fn bch2_btree_iter_peek_prev_min(
                     &mut (*iter).journal_idx,
                 );
                 if !journal_k.is_null()
-                    && (ret.k.is_null()
-                        || bpos_cmp((*journal_k).k.p, (*ret.k).p) >= 0)
+                    && (ret.k.is_null() || bpos_cmp((*journal_k).k.p, (*ret.k).p) >= 0)
                 {
                     (*iter).k = (*journal_k).k;
                     ret = bkey_s_c {
@@ -3161,14 +3169,7 @@ mod tests {
             let mut c = crate::btree::types::bch_fs::default();
             let mut trans = btree_trans::default();
             bch2_trans_init(&mut trans, &mut c);
-            let path = bch2_path_get(
-                &mut trans,
-                0,
-                &SPOS(1, 1, 0),
-                0,
-                0,
-                BTREE_ITER_nopreserve,
-            );
+            let path = bch2_path_get(&mut trans, 0, &SPOS(1, 1, 0), 0, 0, BTREE_ITER_nopreserve);
             let before = trans.paths_allocated;
             let got = bch2_btree_path_make_mut(&mut trans, path, false, 0);
             assert_eq!(got, path);
@@ -3193,7 +3194,10 @@ mod tests {
             path.l[1].b = &mut node;
             path.l[2].b = &mut node;
             assert!(core::ptr::eq(btree_path_node(&mut path, 1), &mut node));
-            assert!(core::ptr::eq(btree_node_parent(&mut path, &mut node), &mut node));
+            assert!(core::ptr::eq(
+                btree_node_parent(&mut path, &mut node),
+                &mut node
+            ));
             assert!(btree_path_node(&mut path, BTREE_MAX_DEPTH as usize).is_null());
         }
     }
@@ -3407,13 +3411,7 @@ mod tests {
             let mut trans = btree_trans::default();
             bch2_trans_init(&mut trans, &mut c);
             let mut src = btree_iter::default();
-            bch2_trans_iter_init(
-                &mut trans,
-                &mut src,
-                0,
-                SPOS(1, 1, 0),
-                BTREE_ITER_intent,
-            );
+            bch2_trans_iter_init(&mut trans, &mut src, 0, SPOS(1, 1, 0), BTREE_ITER_intent);
             let path = src.path;
             let refs_before = (*trans.paths.add(path as usize)).ref_;
             let mut dst = btree_iter::default();

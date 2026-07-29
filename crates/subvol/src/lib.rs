@@ -2,11 +2,17 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
-pub mod btree;
-pub mod checksum;
-pub mod data;
-pub mod journal;
-pub mod lock;
-pub mod sb;
-pub mod snapshot;
-pub mod util;
+mod btree;
+mod checksum;
+mod data;
+pub mod engine;
+mod journal;
+mod lock;
+mod sb;
+mod snapshot;
+mod util;
+
+pub use engine::{
+    BtreeId, BtreeKey, EngineError, FaultPoint, JournalSnapshot, KeyPosition, StorageEngine,
+    Transaction, STORAGE_FORMAT_VERSION,
+};
