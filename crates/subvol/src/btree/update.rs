@@ -2578,6 +2578,105 @@ mod tests {
     }
 
     #[test]
+    fn failing_commit_hook_leaves_leaf_unchanged_and_transaction_retryable() {
+        unsafe extern "C" fn fail_commit(
+            _trans: *mut btree_trans,
+            _hook: *mut btree_trans_commit_hook,
+        ) -> i32 {
+            -5
+        }
+
+        unsafe {
+            let mut words = vec![0u64; 128];
+            let mut b = Box::new(btree::default());
+            b.data = words.as_mut_ptr().cast::<disk_btree_node>();
+            b.format = BKEY_FORMAT_CURRENT;
+            b.nr_key_bits = crate::btree::bkey::bkey_format_key_bits(&b.format) as u8;
+            b.nsets = 1;
+            b.byte_order = 9;
+            b.c.level = 0;
+            (*b.data).min_key = POS_MIN;
+            (*b.data).max_key = SPOS_MAX;
+
+            let set = words.as_mut_ptr().add(17).cast::<disk_bset>();
+            (*set).u64s = BKEY_U64S as u16;
+            *words.as_mut_ptr().add(20).cast::<bkey>() = bkey {
+                u64s: BKEY_U64S,
+                format: KEY_FORMAT_CURRENT,
+                type_: 1,
+                p: SPOS(1, 1, 0),
+                ..Default::default()
+            };
+            b.set[0] = bset_tree {
+                size: 0,
+                extra: BSET_NO_AUX_TREE_VAL,
+                data_offset: 17,
+                aux_data_offset: u16::MAX,
+                end_offset: 25,
+            };
+            b.nr.live_u64s = BKEY_U64S as u16;
+            b.nr.bset_u64s[0] = BKEY_U64S as u16;
+            b.nr.unpacked_keys = 1;
+
+            let mut c = bch_fs::default();
+            assert_eq!(bch2_sb_realloc(&mut c.disk_sb, 0), 0);
+            (*c.disk_sb.sb).block_size = 1;
+            bch2_btree_id_root_set(&mut c, 0, &mut *b);
+
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut c);
+            let mut iter = btree_iter::default();
+            bch2_trans_iter_init(&mut trans, &mut iter, 0, SPOS(1, 2, 0), BTREE_ITER_intent);
+            assert!(bch2_btree_iter_peek(&mut iter).k.is_null());
+
+            let mut insertion = bkey_i {
+                k: bkey {
+                    u64s: BKEY_U64S,
+                    format: KEY_FORMAT_CURRENT,
+                    type_: 8,
+                    p: SPOS(1, 2, 0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(bch2_trans_update(&mut trans, &mut iter, &mut insertion, 0), 0);
+
+            let mut hook = btree_trans_commit_hook {
+                fn_: fail_commit,
+                next: core::ptr::null_mut(),
+            };
+            bch2_trans_commit_hook(&mut trans, &mut hook);
+            assert_eq!(bch2_trans_commit(&mut trans), -5);
+            assert!(!trans.write_locked);
+
+            let mut node_iter = btree_node_iter::default();
+            bch2_btree_node_iter_init_from_start(&mut node_iter, &mut *b);
+            let first = bch2_btree_node_iter_peek(&mut node_iter, &mut *b);
+            assert_eq!(bkey_unpack_pos(&*b, first), SPOS(1, 1, 0));
+            bch2_btree_node_iter_advance(&mut node_iter, &mut *b);
+            assert!(bch2_btree_node_iter_peek(&mut node_iter, &mut *b).is_null());
+
+            trans.hooks = core::ptr::null_mut();
+            assert_eq!(bch2_trans_commit(&mut trans), 0);
+            bch2_trans_iter_exit(&mut iter);
+
+            let mut node_iter = btree_node_iter::default();
+            bch2_btree_node_iter_init_from_start(&mut node_iter, &mut *b);
+            let mut seen = Vec::new();
+            loop {
+                let key = bch2_btree_node_iter_peek(&mut node_iter, &mut *b);
+                if key.is_null() {
+                    break;
+                }
+                seen.push((bkey_unpack_pos(&*b, key).offset, (*key).type_));
+                bch2_btree_node_iter_advance(&mut node_iter, &mut *b);
+            }
+            assert_eq!(seen, [(1, 1), (2, 8)]);
+            bch2_free_super(&mut c.disk_sb);
+        }
+    }
+
+    #[test]
     fn empty_slot_rejects_missing_transaction_or_iterator() {
         let mut iter = btree_iter::default();
         let pos = SPOS(1, 1, 0);
