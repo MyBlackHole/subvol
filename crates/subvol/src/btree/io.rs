@@ -1251,7 +1251,7 @@ mod tests {
 
         unsafe {
             let path = std::env::temp_dir().join(format!(
-                "subvol-core-rewrite-btree-io-{}",
+                "subvol-btree-io-{}",
                 std::process::id()
             ));
             let file = std::fs::OpenOptions::new()
@@ -1364,7 +1364,7 @@ mod tests {
 
         unsafe {
             let path = std::env::temp_dir().join(format!(
-                "subvol-core-rewrite-btree-root-{}",
+                "subvol-btree-root-{}",
                 std::process::id()
             ));
             let file = std::fs::OpenOptions::new()
@@ -1531,7 +1531,7 @@ mod tests {
 
         unsafe {
             let path = std::env::temp_dir().join(format!(
-                "subvol-core-rewrite-btree-multiset-{}",
+                "subvol-btree-multiset-{}",
                 std::process::id()
             ));
             let file = std::fs::OpenOptions::new()

@@ -1,5 +1,5 @@
 [package]
-name = "subvol-core-rewrite"
+name = "subvol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

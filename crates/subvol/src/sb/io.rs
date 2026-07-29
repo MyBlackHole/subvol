@@ -979,7 +979,7 @@ mod tests {
 
         unsafe {
             let path = std::env::temp_dir()
-                .join(format!("subvol-core-rewrite-super-{}", std::process::id()));
+                .join(format!("subvol-super-{}", std::process::id()));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -1052,7 +1052,7 @@ mod tests {
 
         unsafe {
             let path = std::env::temp_dir().join(format!(
-                "subvol-core-rewrite-backups-{}",
+                "subvol-backups-{}",
                 std::process::id()
             ));
             let file = std::fs::OpenOptions::new()

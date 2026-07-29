@@ -1984,7 +1984,7 @@ mod tests {
 
         unsafe {
             let path = std::env::temp_dir().join(format!(
-                "subvol-core-rewrite-journal-device-{}",
+                "subvol-journal-device-{}",
                 std::process::id()
             ));
             let file = std::fs::OpenOptions::new()

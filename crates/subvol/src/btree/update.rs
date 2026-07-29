@@ -2610,7 +2610,7 @@ mod tests {
     fn transaction_writes_large_middle_bset_before_compacting_all() {
         unsafe {
             let path = std::env::temp_dir().join(format!(
-                "subvol-core-rewrite-init-next-write-{}",
+                "subvol-init-next-write-{}",
                 std::process::id()
             ));
             let file = std::fs::OpenOptions::new()
