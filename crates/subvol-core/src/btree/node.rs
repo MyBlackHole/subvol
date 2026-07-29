@@ -581,7 +581,9 @@ impl BtreeNode {
     /// 2. 插入到最后一个 bset
     ///
     /// 当节点没有剩余空间时返回 `BtreeNodeFull`，调用者应 rewrite/split 并重试。
-    pub fn insert_key(&mut self, entry: BtreeEntry) -> Result<(), StorageError> {
+    ///
+    /// ⚠️ 禁止绕过事务直接调用。必须仅在 BtreeTrans::commit_once 写锁下或 split retry 路径中调用。
+    pub(crate) fn insert_key(&mut self, entry: BtreeEntry) -> Result<(), StorageError> {
         // A transaction update replaces the live key, even when the previous
         // version resides in an older on-disk bset. Remove older versions
         // first so replaying an already persisted key does not create a
@@ -607,7 +609,9 @@ impl BtreeNode {
     ///
     /// 对应 bcachefs `bch2_btree_delete_at` (update.h:166)
     /// 在最后一个 bset 中删除。
-    pub fn remove_key(&mut self, pos: &Bpos) -> Result<(), StorageError> {
+    ///
+    /// ⚠️ 禁止绕过事务直接调用。必须仅在 BtreeTrans::commit_once 写锁下或 split retry 路径中调用。
+    pub(crate) fn remove_key(&mut self, pos: &Bpos) -> Result<(), StorageError> {
         let mut removed = false;
         for idx in 0..self.nsets as usize {
             removed |= bch2_bset_delete(&mut self.set[idx], pos);
@@ -699,7 +703,9 @@ impl BtreeNode {
     }
 
     /// 按位置查找可变引用
-    pub fn lookup_mut(&mut self, pos: &Bpos) -> Option<&mut BtreeEntry> {
+    ///
+    /// ⚠️ 禁止绕过事务直接修改 entry 内容。仅用于事务提交路径的写锁下。
+    pub(crate) fn lookup_mut(&mut self, pos: &Bpos) -> Option<&mut BtreeEntry> {
         let nsets = self.nsets;
         for i in (0..nsets as usize).rev() {
             let (set_idx, entry_idx) = {

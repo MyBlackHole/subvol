@@ -4,7 +4,7 @@ use crate::block_device::superblock::BtreeRootEntry;
 use crate::block_device::BchDev;
 use crate::btree::key::{Bpos, BtreeEntry};
 use crate::btree::transaction::{BtreeProvider, BtreeTrans};
-use crate::btree::tree::{Btree, BtreeIter};
+use crate::btree::tree::Btree;
 use crate::btree::types::{BtreeId, BTREE_ID_ALLOC, BTREE_ID_DATA_INDEX, BTREE_ID_FREESPACE};
 use crate::journal::JsetOverlay;
 use crate::types::StorageError;
@@ -314,6 +314,7 @@ fn round_up(x: u64, align: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::btree::key::Bpos;
+    use crate::btree::tree::BtreeIter;
 
     #[test]
     fn replay_commit_does_not_append_to_journal() {
@@ -556,5 +557,418 @@ mod tests {
             .unwrap();
         assert_eq!(alloc.data_tree.total_key_count(), 0);
         assert!(BtreeIter::new(&alloc.data_tree, pos).peek().is_none());
+    }
+
+    // ── 测试帮助：通过事务填充数据 ──
+
+    fn insert_one(alloc: &mut Allocator, vol: &Arc<BchVol>, inode: u64, payload: Vec<u8>) {
+        let pos = Bpos { inode, offset: 0, snapshot: 0 };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut tx = BtreeTrans::new(vol);
+            let iter = tx.iter(alloc, BTREE_ID_DATA_INDEX, pos, true);
+            tx.update_from_iter(&iter, 0, payload);
+            tx.commit(alloc).await.unwrap();
+        });
+    }
+
+    fn insert_many(alloc: &mut Allocator, vol: &Arc<BchVol>, entries: &[(u64, Vec<u8>)]) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut tx = BtreeTrans::new(vol);
+            for (inode, payload) in entries {
+                let pos = Bpos { inode: *inode, offset: 0, snapshot: 0 };
+                let iter = tx.iter(alloc, BTREE_ID_DATA_INDEX, pos, true);
+                tx.update_from_iter(&iter, 0, payload.clone());
+            }
+            tx.commit(alloc).await.unwrap();
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Btree 迭代器测试（通过事务构建数据）
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_single_entry() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        insert_one(&mut alloc, &vol, 100, vec![42]);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 100, offset: 0, snapshot: 0 },
+        );
+        let entry = iter.next().expect("should find entry");
+        assert_eq!(entry.payload, vec![42]);
+
+        let mut iter_99 = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 99, offset: 0, snapshot: 0 },
+        );
+        assert_eq!(
+            iter_99.next(),
+            Some(BtreeEntry {
+                btree_type: BTREE_ID_DATA_INDEX.0,
+                level: 0,
+                entry_type: 0,
+                pos: Bpos { inode: 100, offset: 0, snapshot: 0 },
+                payload: vec![42],
+            })
+        );
+
+        let mut iter_101 = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 101, offset: 0, snapshot: 0 },
+        );
+        assert!(iter_101.next().is_none());
+    }
+
+    #[test]
+    fn test_forward_iteration() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..10).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 0, offset: 0, snapshot: 0 },
+        );
+        for i in 0..10 {
+            let entry = iter.next().expect("should have entry");
+            assert_eq!(entry.pos.inode, i * 100);
+            assert_eq!(entry.payload, vec![i as u8]);
+        }
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_iter_from_mid() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..10).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 250, offset: 0, snapshot: 0 },
+        );
+        let entry = iter.next().expect("should find >= 250");
+        assert_eq!(entry.pos.inode, 300);
+    }
+
+    #[test]
+    fn test_prev_iteration() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..5).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 400, offset: 0, snapshot: 0 },
+        );
+        let entry = iter.next().expect("should find >= 400");
+        assert_eq!(entry.pos.inode, 400);
+
+        let prev = iter.prev();
+        assert!(prev.is_some());
+        assert_eq!(prev.unwrap().pos.inode, 300);
+    }
+
+    #[test]
+    fn test_peek_no_advance() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        insert_one(&mut alloc, &vol, 100, vec![1]);
+
+        let iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 100, offset: 0, snapshot: 0 },
+        );
+        let p1 = iter.peek();
+        let p2 = iter.peek();
+        assert!(p1.is_some());
+        assert!(p2.is_some());
+    }
+
+    #[test]
+    fn test_seek_reset() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..10).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 0, offset: 0, snapshot: 0 },
+        );
+        iter.next();
+        iter.seek(Bpos { inode: 500, offset: 0, snapshot: 0 });
+        let entry = iter.next().expect("should find after seek");
+        assert_eq!(entry.pos.inode, 500);
+    }
+
+    #[test]
+    fn test_peek_upto() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..10).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 200, offset: 0, snapshot: 0 },
+        );
+        let entry = iter.peek_upto(Bpos { inode: 500, offset: 0, snapshot: 0 });
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().pos.inode, 200);
+
+        let entry = iter.peek_upto(Bpos { inode: 300, offset: 0, snapshot: 0 });
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().pos.inode, 200);
+
+        let entry = iter.peek_upto(Bpos { inode: 200, offset: 0, snapshot: 0 });
+        assert!(entry.is_none());
+
+        let entry = iter.peek_upto(Bpos { inode: 50, offset: 0, snapshot: 0 });
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn test_advance_between_entries() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..5).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 0, offset: 0, snapshot: 0 },
+        );
+        let entry = iter.next().unwrap();
+        assert_eq!(entry.pos.inode, 0);
+
+        assert!(iter.advance());
+        let entry = iter.next().unwrap();
+        assert_eq!(entry.pos.inode, 100);
+
+        assert!(iter.advance());
+        let entry = iter.next().unwrap();
+        assert_eq!(entry.pos.inode, 200);
+    }
+
+    #[test]
+    fn test_advance_then_rewind_cycle() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        insert_one(&mut alloc, &vol, 100, vec![1]);
+        insert_one(&mut alloc, &vol, 200, vec![2]);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 100, offset: 0, snapshot: 0 },
+        );
+        let entry = iter.next().unwrap();
+        assert_eq!(entry.pos.inode, 100);
+
+        assert!(iter.advance());
+        let entry = iter.peek_upto(Bpos { inode: 300, offset: 0, snapshot: 0 });
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().pos.inode, 200);
+
+        assert!(iter.rewind());
+        let entry = iter.peek_upto(Bpos { inode: 150, offset: 0, snapshot: 0 });
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().pos.inode, 100);
+    }
+
+    #[test]
+    fn test_traverse() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        insert_one(&mut alloc, &vol, 100, vec![1]);
+        insert_one(&mut alloc, &vol, 200, vec![2]);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 100, offset: 0, snapshot: 0 },
+        );
+        let entry = iter.next().unwrap();
+        assert_eq!(entry.pos.inode, 100);
+
+        iter.set_pos(Bpos { inode: 200, offset: 0, snapshot: 0 });
+        iter.traverse();
+        let entry = iter.next().unwrap();
+        assert_eq!(entry.pos.inode, 200);
+    }
+
+    #[test]
+    fn test_set_pos() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        insert_one(&mut alloc, &vol, 100, vec![1]);
+        insert_one(&mut alloc, &vol, 200, vec![2]);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 0, offset: 0, snapshot: 0 },
+        );
+        iter.next();
+        iter.set_pos(Bpos { inode: 200, offset: 0, snapshot: 0 });
+        let entry = iter.next().expect("should find entry at 200");
+        assert_eq!(entry.pos.inode, 200);
+    }
+
+    #[test]
+    fn test_advance_then_peek_upto() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..10).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let mut iter = BtreeIter::new(
+            &alloc.data_tree,
+            Bpos { inode: 100, offset: 0, snapshot: 0 },
+        );
+        let entry = iter.next().unwrap();
+        assert_eq!(entry.pos.inode, 100);
+
+        iter.advance();
+        let entry = iter.peek_upto(Bpos { inode: 500, offset: 0, snapshot: 0 });
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().pos.inode, 200);
+
+        let entry = iter.next().unwrap();
+        assert_eq!(entry.pos.inode, 200);
+    }
+
+    #[test]
+    fn test_from_impl() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..3).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let iter: BtreeIter = (&alloc.data_tree).into();
+        let count = iter.count();
+        assert_eq!(count, 3);
+    }
+
+    /// 与 persisted_internal_root_restores_levels_and_child_data 不同，
+    /// 此测试通过事务提交大量条目触发自动 split，验证多级树构造正确。
+    #[test]
+    fn test_split_creates_multi_level_tree() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 22));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut tx = BtreeTrans::new(&vol);
+            for inode in 0..3_000u64 {
+                let pos = Bpos { inode, offset: 0, snapshot: 0 };
+                let iter = tx.iter(&alloc, BTREE_ID_DATA_INDEX, pos, true);
+                tx.update_from_iter(&iter, 0, vec![(inode & 0xff) as u8]);
+            }
+            tx.commit(&mut alloc).await.unwrap();
+        });
+        assert_eq!(alloc.data_tree.root.level, 1);
+        for inode in [0, 1_500, 2_999] {
+            let mut iter = BtreeIter::new(
+                &alloc.data_tree,
+                Bpos { inode, offset: 0, snapshot: 0 },
+            );
+            assert_eq!(
+                iter.next().map(|entry| entry.pos.inode),
+                Some(inode)
+            );
+        }
+    }
+
+    /// 验证在事务中 delete (entry_type=1) 后的树状态
+    #[test]
+    fn test_delete_entry_removes_key() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let pos = Bpos { inode: 100, offset: 0, snapshot: 0 };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut insert = BtreeTrans::new(&vol);
+            let iter = insert.iter(&alloc, BTREE_ID_DATA_INDEX, pos, true);
+            insert.update_from_iter(&iter, 0, vec![42]);
+            insert.commit(&mut alloc).await.unwrap();
+
+            let mut delete = BtreeTrans::new(&vol);
+            let iter = delete.iter(&alloc, BTREE_ID_DATA_INDEX, pos, true);
+            delete.update_from_iter(&iter, 1, Vec::new());
+            delete.commit(&mut alloc).await.unwrap();
+        });
+        assert!(BtreeIter::new(&alloc.data_tree, pos).peek().is_none());
+    }
+
+    #[test]
+    fn test_next_entry_prev_entry() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..5).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let next = alloc.data_tree.root.next_entry(&Bpos { inode: 100, offset: 0, snapshot: 0 });
+        assert!(next.is_some());
+        assert_eq!(next.unwrap().pos.inode, 200);
+
+        let prev = alloc.data_tree.root.prev_entry(&Bpos { inode: 300, offset: 0, snapshot: 0 });
+        assert!(prev.is_some());
+        assert_eq!(prev.unwrap().pos.inode, 200);
+    }
+
+    #[test]
+    fn test_first_last_entry() {
+        let stub = Arc::new(BchVol::new());
+        let dev = Arc::new(BchDev::with_size(stub, 1 << 20));
+        let vol = BchVol::with_dev(dev.clone(), Vec::new());
+        let mut alloc = Allocator::new(&vol, &dev);
+        let entries: Vec<_> = (0..5).map(|i| (i * 100, vec![i as u8])).collect();
+        insert_many(&mut alloc, &vol, &entries);
+
+        let first = alloc.data_tree.root.first_entry();
+        assert!(first.is_some());
+        assert_eq!(first.unwrap().pos.inode, 0);
+
+        let last = alloc.data_tree.root.last_entry();
+        assert!(last.is_some());
+        assert_eq!(last.unwrap().pos.inode, 400);
     }
 }
