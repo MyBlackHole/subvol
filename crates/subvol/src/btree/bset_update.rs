@@ -150,7 +150,7 @@ pub unsafe fn __bch2_verify_btree_nr_keys(b: *mut btree) {
     assert_eq!(bch2_btree_node_count_keys(b), (*b).nr);
 }
 
-pub unsafe fn bch2_bset_insert(
+pub(crate) unsafe fn bch2_bset_insert(
     b: *mut btree,
     where_: *mut bkey_packed,
     insert: *mut bkey_i,
@@ -198,7 +198,7 @@ pub unsafe fn bch2_bset_insert(
     }
 }
 
-pub unsafe fn bch2_bset_delete(b: *mut btree, where_: *mut bkey_packed, clobber_u64s: u32) {
+pub(crate) unsafe fn bch2_bset_delete(b: *mut btree, where_: *mut bkey_packed, clobber_u64s: u32) {
     let t = bset_tree_last(b);
     let src_p = (where_ as *mut u64).add(clobber_u64s as usize);
     let dst_p = where_ as *mut u64;

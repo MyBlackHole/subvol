@@ -224,7 +224,10 @@ pub unsafe fn bch2_btree_set_root_for_read(c: *mut super::types::bch_fs, b: *mut
     if c.is_null() || b.is_null() {
         return;
     }
-    assert_ne!(super::types::bch2_btree_id_root_b(c, (*b).c.btree_id as usize), b);
+    assert_ne!(
+        super::types::bch2_btree_id_root_b(c, (*b).c.btree_id as usize),
+        b
+    );
     {
         let _cache_guard = (*c).btree.cache.lock.lock().unwrap();
         super::types::set_btree_node_permanent(b);
@@ -340,7 +343,7 @@ unsafe fn btree_node_reset_sib_u64s(b: *mut btree) {
     };
 }
 
-pub unsafe fn bch2_btree_split_leaf(
+pub(crate) unsafe fn bch2_btree_split_leaf(
     trans: *mut super::iter::btree_trans,
     path_idx: super::iter::btree_path_idx_t,
     _new_key_u64s: u32,
@@ -611,6 +614,8 @@ pub unsafe fn bch2_btree_split_leaf(
                 let where_ =
                     super::node_iter::bch2_btree_node_iter_bset_pos(&mut insert_iter, root, last);
                 if (*trans).journal_replay_not_finished {
+                    let journal_keys = core::ptr::addr_of!((*c).journal_keys);
+                    let _overwrite_lock = (&(*journal_keys).overwrite_lock).lock().unwrap();
                     crate::journal::bch2_journal_key_check_or_overwrite(
                         c,
                         (*root).c.btree_id,
@@ -699,6 +704,8 @@ pub unsafe fn bch2_btree_split_leaf(
                 let where_ =
                     super::node_iter::bch2_btree_node_iter_bset_pos(&mut insert_iter, parent, last);
                 if (*trans).journal_replay_not_finished {
+                    let journal_keys = core::ptr::addr_of!((*c).journal_keys);
+                    let _overwrite_lock = (&(*journal_keys).overwrite_lock).lock().unwrap();
                     crate::journal::bch2_journal_key_check_or_overwrite(
                         c,
                         (*parent).c.btree_id,
@@ -926,6 +933,8 @@ pub unsafe fn bch2_btree_split_leaf(
             let where_ =
                 super::node_iter::bch2_btree_node_iter_bset_pos(&mut insert_iter, node, last);
             if (*trans).journal_replay_not_finished {
+                let journal_keys = core::ptr::addr_of!((*c).journal_keys);
+                let _overwrite_lock = (&(*journal_keys).overwrite_lock).lock().unwrap();
                 crate::journal::bch2_journal_key_check_or_overwrite(
                     c,
                     (*node).c.btree_id,

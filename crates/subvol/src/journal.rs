@@ -215,7 +215,6 @@ impl Default for journal_buf {
             has_overwrites: AtomicBool::new(false),
         }
     }
-
 }
 
 pub struct journal {
@@ -1415,88 +1414,237 @@ pub unsafe fn bch2_journal_read(
 }
 
 pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
-    (*c).journal.flags.fetch_and(
-        !(1usize << JOURNAL_replay_done),
-        Ordering::AcqRel,
-    );
+    (*c).journal
+        .flags
+        .fetch_and(!(1usize << JOURNAL_replay_done), Ordering::AcqRel);
     bch2_journal_keys_clear(c);
-    let mut records = (*c).journal.closed.lock().unwrap().clone();
-    for record in &mut records {
+    let records = (*c).journal.closed.lock().unwrap().clone();
+    let mut ordered: Vec<(u64, Vec<u64>)> = Vec::with_capacity(records.len());
+    for record in records {
         if record.len() < JSET_HEADER_U64S
             || record[2] != JSET_MAGIC
-            || record[5] as usize > record.len() - JSET_HEADER_U64S
+            || record[3] == 0
+            || record[3] > JOURNAL_SEQ_MAX
+            || record[5] as u32 as usize > record.len() - JSET_HEADER_U64S
         {
             return -1;
         }
-        let seq = record[3];
+        ordered.push((record[3], record));
+    }
+    ordered.sort_by_key(|entry| entry.0);
+
+    let mut unique: Vec<(u64, Vec<u64>)> = Vec::with_capacity(ordered.len());
+    for (seq, record) in ordered {
+        if let Some((previous_seq, previous_record)) = unique.last() {
+            if *previous_seq == seq {
+                if previous_record.as_slice() != record.as_slice() {
+                    return -7;
+                }
+                continue;
+            }
+        }
+        unique.push((seq, record));
+    }
+
+    let Some((replay_start, replay_end)) = unique.iter().rev().find_map(|(seq, record)| {
+        let header = unsafe { &*(record.as_ptr().cast::<jset>()) };
+        (JSET_NO_FLUSH(header) == 0).then_some((header.last_seq.min(*seq), *seq))
+    }) else {
+        (*c).journal
+            .flags
+            .fetch_or(1usize << JOURNAL_replay_done, Ordering::AcqRel);
+        return 0;
+    };
+
+    let mut selected: Vec<(u64, Vec<u64>)> = unique
+        .into_iter()
+        .filter(|(seq, _)| *seq >= replay_start && *seq <= replay_end)
+        .collect();
+    let mut expected = replay_start;
+    for (seq, _) in &selected {
+        if *seq != expected {
+            return -8;
+        }
+        expected = match expected.checked_add(1) {
+            Some(next) => next,
+            None => return -8,
+        };
+    }
+    if expected != replay_end.saturating_add(1) {
+        return -8;
+    }
+
+    /*
+     * This mirrors recovery.c's early replay pass: root records must become
+     * visible before a later btree-key replay can traverse that root.
+     */
+    for (_, record) in selected.iter_mut() {
         let mut offset = JSET_HEADER_U64S;
-        let end = JSET_HEADER_U64S + record[5] as usize;
+        let end = JSET_HEADER_U64S + record[5] as u32 as usize;
         while offset < end {
-            let entry = &mut *(record.as_mut_ptr().add(offset).cast::<jset_entry>());
-            let actual = jset_u64s(entry.u64s as u32) as usize;
+            let entry = record.as_mut_ptr().add(offset).cast::<jset_entry>();
+            let actual = jset_u64s((*entry).u64s as u32) as usize;
             if actual == 0 || offset + actual > end {
                 return -2;
             }
-            if entry.type_ == BCH_JSET_ENTRY_btree_root {
+            if (*entry).type_ == BCH_JSET_ENTRY_btree_root {
                 let ret = journal_entry_btree_root_validate(entry);
                 if ret != 0 {
                     return ret;
                 }
-                if entry.u64s == 0 {
-                    offset += actual;
-                    continue;
-                }
-                crate::btree::interior::bch2_journal_entry_to_btree_root(c, entry);
-            } else if entry.type_ == BCH_JSET_ENTRY_btree_keys && entry.u64s != 0 {
-                let k = record.as_ptr().add(offset + 1) as *mut crate::btree::bkey::bkey_i;
-                if (*k).k.u64s as u16 != entry.u64s {
-                    return -3;
-                }
-                bch2_journal_key_insert(c, entry.btree_id, entry.level, k);
-                let mut trans = crate::btree::iter::btree_trans::default();
-                crate::btree::iter::bch2_trans_init(&mut trans, c);
-                trans.journal_replay_not_finished = true;
-                let mut iter = crate::btree::iter::btree_iter::default();
-                crate::btree::iter::bch2_trans_iter_init_common(
-                    &mut trans,
-                    &mut iter,
-                    entry.btree_id,
-                    (*k).k.p,
-                    0,
-                    entry.level,
-                    crate::btree::iter::BTREE_ITER_intent,
-                );
-                crate::btree::iter::bch2_btree_iter_peek(&mut iter);
-                let ret = crate::btree::update::bch2_trans_update(
-                    &mut trans,
-                    &mut iter,
-                    k,
-                    crate::btree::update::BTREE_UPDATE_nojournal,
-                );
-                if ret == 0 {
-                    trans.journal_res.seq = seq;
-                    let ret = crate::btree::update::bch2_trans_commit(&mut trans);
-                    crate::btree::iter::bch2_trans_iter_exit(&mut iter);
-                    if ret != 0 {
-                        return ret;
-                    }
-                } else {
-                    crate::btree::iter::bch2_trans_iter_exit(&mut iter);
-                    return ret;
+                if (*entry).u64s != 0 {
+                    crate::btree::interior::bch2_journal_entry_to_btree_root(c, entry);
                 }
             }
             offset += actual;
         }
     }
+
+    /* Build the journal overlay before replaying updates, as bcachefs does
+     * while normal btree lookups are still allowed to observe journal keys. */
+    for (_, record) in selected.iter_mut() {
+        let mut offset = JSET_HEADER_U64S;
+        let end = JSET_HEADER_U64S + record[5] as u32 as usize;
+        while offset < end {
+            let entry = record.as_mut_ptr().add(offset).cast::<jset_entry>();
+            let actual = jset_u64s((*entry).u64s as u32) as usize;
+            if actual == 0 || offset + actual > end {
+                return -2;
+            }
+            if (*entry).type_ == BCH_JSET_ENTRY_btree_keys {
+                let mut key_offset = 0usize;
+                while key_offset < (*entry).u64s as usize {
+                    let remaining = (*entry).u64s as usize - key_offset;
+                    if remaining < crate::btree::bkey::BKEY_U64S as usize {
+                        return -3;
+                    }
+                    let key = record
+                        .as_ptr()
+                        .add(offset + 1 + key_offset)
+                        .cast::<crate::btree::bkey::bkey_i>();
+                    let key_u64s = (*key).k.u64s as usize;
+                    if key_u64s < crate::btree::bkey::BKEY_U64S as usize || key_u64s > remaining {
+                        return -3;
+                    }
+                    let ret = bch2_journal_key_insert(c, (*entry).btree_id, (*entry).level, key);
+                    if ret != 0 {
+                        return ret;
+                    }
+                    key_offset += key_u64s;
+                }
+            }
+            offset += actual;
+        }
+    }
+
+    /* Replay the selected sequence in durable journal order.  This follows
+     * recovery.c's bch2_journal_replay_key(): every key gets a node iterator
+     * at its recorded level, is traversed before the update, and carries its
+     * durable journal sequence into commit. */
+    for (seq, record) in selected.iter_mut() {
+        let mut offset = JSET_HEADER_U64S;
+        let end = JSET_HEADER_U64S + record[5] as u32 as usize;
+        while offset < end {
+            let entry = record.as_mut_ptr().add(offset).cast::<jset_entry>();
+            let actual = jset_u64s((*entry).u64s as u32) as usize;
+            if actual == 0 || offset + actual > end {
+                return -2;
+            }
+            if (*entry).type_ == BCH_JSET_ENTRY_btree_keys {
+                let mut key_offset = 0usize;
+                while key_offset < (*entry).u64s as usize {
+                    let remaining = (*entry).u64s as usize - key_offset;
+                    if remaining < crate::btree::bkey::BKEY_U64S as usize {
+                        return -3;
+                    }
+                    let key = record
+                        .as_mut_ptr()
+                        .add(offset + 1 + key_offset)
+                        .cast::<crate::btree::bkey::bkey_i>();
+                    let key_u64s = (*key).k.u64s as usize;
+                    if key_u64s < crate::btree::bkey::BKEY_U64S as usize || key_u64s > remaining {
+                        return -3;
+                    }
+                    let ret =
+                        bch2_journal_replay_key(c, (*entry).btree_id, (*entry).level, key, *seq);
+                    if ret != 0 {
+                        return ret;
+                    }
+                    key_offset += key_u64s;
+                }
+            }
+            offset += actual;
+        }
+    }
+    /* replay_journal_seq_end in journal/init.c is cur_seq (the first unused
+     * sequence), not the last durable record.  journal.seq is that same
+     * boundary after bch2_journal_read() reconstructs the journal state. */
     bch2_journal_replay_pins_put(&(*c).journal, (*c).journal.seq.load(Ordering::Acquire));
-    (*c).journal.flags.fetch_or(
-        1usize << JOURNAL_replay_done,
-        Ordering::AcqRel,
-    );
+    (*c).journal
+        .flags
+        .fetch_or(1usize << JOURNAL_replay_done, Ordering::AcqRel);
     0
 }
 
-unsafe fn journal_key_ptr(key: &crate::btree::types::journal_key) -> *const crate::btree::bkey::bkey_i {
+/*
+ * The port equivalent of recovery.c's bch2_journal_replay_key(), invoked by
+ * the same unbounded transaction-restart loop as commit_do().  A split may
+ * have already changed tree topology when commit returns -4, so the next
+ * attempt must begin a fresh transaction, retraverse from the root, and only
+ * then stage the journal key again.
+ */
+unsafe fn bch2_journal_replay_key(
+    c: *mut crate::btree::types::bch_fs,
+    btree_id: u8,
+    level: u8,
+    key: *mut crate::btree::bkey::bkey_i,
+    seq: u64,
+) -> i32 {
+    let mut trans = crate::btree::iter::btree_trans::default();
+    crate::btree::iter::bch2_trans_init(&mut trans, c);
+
+    loop {
+        crate::btree::iter::bch2_trans_begin(&mut trans);
+        trans.journal_replay_not_finished = true;
+        trans.journal_res.seq = seq;
+
+        let mut iter = crate::btree::iter::btree_iter::default();
+        crate::btree::iter::bch2_trans_node_iter_init(
+            &mut trans,
+            &mut iter,
+            btree_id,
+            (*key).k.p,
+            crate::btree::bset::BTREE_MAX_DEPTH,
+            level,
+            crate::btree::iter::BTREE_ITER_intent | crate::btree::iter::BTREE_ITER_not_extents,
+        );
+        let mut ret = crate::btree::iter::bch2_btree_iter_traverse(&mut iter);
+        if ret == 0 {
+            ret = crate::btree::update::bch2_trans_update(
+                &mut trans,
+                &mut iter,
+                key,
+                crate::btree::update::BTREE_UPDATE_nojournal
+                    | crate::btree::update::BTREE_TRIGGER_norun,
+            );
+        }
+        if ret == 0 {
+            ret = crate::btree::update::bch2_trans_commit(&mut trans);
+        }
+        crate::btree::iter::bch2_trans_iter_exit(&mut iter);
+
+        /* BCH_ERR_transaction_restart is represented as -4 by this port's
+         * commit path.  As in commit_do(), retry it without a fixed limit. */
+        if ret == -4 {
+            continue;
+        }
+        return ret;
+    }
+}
+
+unsafe fn journal_key_ptr(
+    key: &crate::btree::types::journal_key,
+) -> *const crate::btree::bkey::bkey_i {
     key.allocated_k
 }
 
@@ -1507,7 +1655,7 @@ pub unsafe fn bch2_journal_keys_clear(c: *mut crate::btree::types::bch_fs) {
     let keys = &mut (*c).journal_keys;
     for key in keys.data.drain(..).chain(keys.pre_sort.drain(..)) {
         if key.allocated && !key.allocated_k.is_null() {
-            drop(Box::from_raw(key.allocated_k));
+            crate::btree::types::journal_key_free(key.allocated_k);
         }
     }
     keys.nr = 0;
@@ -1522,11 +1670,8 @@ unsafe fn __journal_keys_sort(keys: &mut crate::btree::types::journal_keys) {
             .cmp(&right.btree_id)
             .then(left.level.cmp(&right.level))
             .then_with(|| {
-                crate::btree::bkey::bpos_cmp(
-                    (*left.allocated_k).k.p,
-                    (*right.allocated_k).k.p,
-                )
-                .cmp(&0)
+                crate::btree::bkey::bpos_cmp((*left.allocated_k).k.p, (*right.allocated_k).k.p)
+                    .cmp(&0)
             })
     });
 
@@ -1550,14 +1695,12 @@ unsafe fn __journal_keys_sort(keys: &mut crate::btree::types::journal_keys) {
             idx += 1;
         }
         if keys.overwrites.is_empty() {
-            keys.overwrites.push(
-                crate::btree::types::journal_key_range_overwritten { start: 0, end: 0 },
-            );
+            keys.overwrites
+                .push(crate::btree::types::journal_key_range_overwritten { start: 0, end: 0 });
         }
         let range = keys.overwrites.len();
-        keys.overwrites.push(
-            crate::btree::types::journal_key_range_overwritten { start, end: idx },
-        );
+        keys.overwrites
+            .push(crate::btree::types::journal_key_range_overwritten { start, end: idx });
         for item in start..idx {
             keys.data[item].overwritten_range = range as u32;
         }
@@ -1569,11 +1712,23 @@ pub unsafe fn bch2_journal_key_insert(
     btree_id: u8,
     level: u8,
     key: *const crate::btree::bkey::bkey_i,
-) {
+) -> i32 {
     if c.is_null() || key.is_null() {
-        return;
+        return -22;
     }
-    let copied = Box::into_raw(Box::new(*key));
+    let bytes = crate::btree::bkey::bkey_bytes(&(*key).k);
+    if bytes < core::mem::size_of::<crate::btree::bkey::bkey_i>() {
+        return -22;
+    }
+    let layout = match std::alloc::Layout::from_size_align(bytes, core::mem::align_of::<u64>()) {
+        Ok(layout) => layout,
+        Err(_) => return -12,
+    };
+    let copied = std::alloc::alloc(layout).cast::<crate::btree::bkey::bkey_i>();
+    if copied.is_null() {
+        return -12;
+    }
+    core::ptr::copy_nonoverlapping(key.cast::<u8>(), copied.cast::<u8>(), bytes);
     let keys = &mut (*c).journal_keys;
     if let Some(existing) = keys.data.iter_mut().find(|entry| {
         entry.btree_id == btree_id
@@ -1582,14 +1737,14 @@ pub unsafe fn bch2_journal_key_insert(
             && (*entry.allocated_k).k.p == (*key).k.p
     }) {
         if existing.allocated && !existing.allocated_k.is_null() {
-            drop(Box::from_raw(existing.allocated_k));
+            crate::btree::types::journal_key_free(existing.allocated_k);
         }
         existing.allocated = true;
         existing.allocated_k = copied;
         existing.overwritten = false;
         existing.overwritten_range = 0;
         __journal_keys_sort(keys);
-        return;
+        return 0;
     }
     keys.data.push(crate::btree::types::journal_key {
         btree_id,
@@ -1601,6 +1756,7 @@ pub unsafe fn bch2_journal_key_insert(
     keys.nr = keys.data.len();
     keys.size = keys.nr;
     __journal_keys_sort(keys);
+    0
 }
 
 pub unsafe fn bch2_journal_keys_peek_max(
@@ -1715,24 +1871,29 @@ pub unsafe fn bch2_key_deleted_in_journal(
     !key.is_null() && (*key).k.type_ == crate::btree::bset::KEY_TYPE_deleted
 }
 
-unsafe fn __bch2_journal_key_overwritten(
-    keys: &mut crate::btree::types::journal_keys,
-    idx: usize,
-) {
+unsafe fn __bch2_journal_key_overwritten(keys: &mut crate::btree::types::journal_keys, idx: usize) {
     let btree_id = keys.data[idx].btree_id;
     let level = keys.data[idx].level;
     keys.data[idx].overwritten = true;
 
-    let prev_idx = (idx > 0
+    let prev_idx = if idx > 0
         && keys.data[idx - 1].btree_id == btree_id
         && keys.data[idx - 1].level == level
-        && keys.data[idx - 1].overwritten)
-        .then_some(idx - 1);
-    let next_idx = (idx + 1 < keys.data.len()
+        && keys.data[idx - 1].overwritten
+    {
+        Some(idx - 1)
+    } else {
+        None
+    };
+    let next_idx = if idx + 1 < keys.data.len()
         && keys.data[idx + 1].btree_id == btree_id
         && keys.data[idx + 1].level == level
-        && keys.data[idx + 1].overwritten)
-        .then_some(idx + 1);
+        && keys.data[idx + 1].overwritten
+    {
+        Some(idx + 1)
+    } else {
+        None
+    };
     let prev_range = prev_idx
         .and_then(|i| usize::try_from(keys.data[i].overwritten_range).ok())
         .filter(|&i| i != 0 && i < keys.overwrites.len());
@@ -1761,17 +1922,15 @@ unsafe fn __bch2_journal_key_overwritten(
         }
         (None, None) => {
             if keys.overwrites.is_empty() {
-                keys.overwrites.push(
-                    crate::btree::types::journal_key_range_overwritten { start: 0, end: 0 },
-                );
+                keys.overwrites
+                    .push(crate::btree::types::journal_key_range_overwritten { start: 0, end: 0 });
             }
             let range = keys.overwrites.len();
-            keys.overwrites.push(
-                crate::btree::types::journal_key_range_overwritten {
+            keys.overwrites
+                .push(crate::btree::types::journal_key_range_overwritten {
                     start: prev_idx.unwrap_or(idx),
                     end: next_idx.map_or(idx + 1, |i| i + 1),
-                },
-            );
+                });
             keys.data[idx].overwritten_range = range as u32;
             if let Some(i) = prev_idx {
                 keys.data[i].overwritten_range = range as u32;
@@ -1822,52 +1981,39 @@ mod journal_key_overlay_tests {
         unsafe {
             let mut c = crate::btree::types::bch_fs::default();
             let mut first = crate::btree::bkey::bkey_i::default();
+            first.k.u64s = crate::btree::bkey::BKEY_U64S;
             first.k.p = crate::btree::bkey::SPOS(2, 3, 0);
             first.k.type_ = crate::btree::bset::KEY_TYPE_btree_ptr_v2;
-            bch2_journal_key_insert(&mut c, 1, 0, &first);
+            assert_eq!(bch2_journal_key_insert(&mut c, 1, 0, &first), 0);
 
             let mut replacement = first;
             replacement.k.type_ = crate::btree::bset::KEY_TYPE_deleted;
-            bch2_journal_key_insert(&mut c, 1, 0, &replacement);
+            assert_eq!(bch2_journal_key_insert(&mut c, 1, 0, &replacement), 0);
 
             let got = bch2_journal_keys_peek_slot(&mut c, 1, 0, first.k.p);
             assert!(!got.is_null());
             assert_eq!((*got).k.type_, crate::btree::bset::KEY_TYPE_deleted);
-            assert_eq!(
-                c.journal_keys.data[0].overwritten_range,
-                0
-            );
+            assert_eq!(c.journal_keys.data[0].overwritten_range, 0);
             let mut idx = 0;
-            assert!(bch2_journal_keys_peek_max(
-                &mut c,
-                1,
-                0,
-                first.k.p,
-                first.k.p,
-                &mut idx,
-            ) == got);
+            assert!(
+                bch2_journal_keys_peek_max(&mut c, 1, 0, first.k.p, first.k.p, &mut idx,) == got
+            );
             let mut trans = crate::btree::iter::btree_trans::default();
             trans.c = &mut c;
             trans.journal_replay_not_finished = true;
-            assert!(bch2_key_deleted_in_journal(
-                &mut trans,
-                1,
-                0,
-                first.k.p,
-            ));
-            c.journal.flags.fetch_or(
-                1usize << JOURNAL_replay_done,
-                Ordering::AcqRel,
-            );
+            assert!(bch2_key_deleted_in_journal(&mut trans, 1, 0, first.k.p,));
+            c.journal
+                .flags
+                .fetch_or(1usize << JOURNAL_replay_done, Ordering::AcqRel);
             crate::btree::iter::bch2_trans_begin(&mut trans);
             assert!(!trans.journal_replay_not_finished);
             let mut later = first;
             later.k.p = crate::btree::bkey::SPOS(5, 1, 0);
             later.k.type_ = crate::btree::bset::KEY_TYPE_btree_ptr_v2;
-            bch2_journal_key_insert(&mut c, 1, 0, &later);
+            assert_eq!(bch2_journal_key_insert(&mut c, 1, 0, &later), 0);
             let mut following = later;
             following.k.p = crate::btree::bkey::SPOS(5, 2, 0);
-            bch2_journal_key_insert(&mut c, 1, 0, &following);
+            assert_eq!(bch2_journal_key_insert(&mut c, 1, 0, &following), 0);
             let mut prev_idx = 0;
             let previous = bch2_journal_keys_peek_prev_min(
                 &mut c,
@@ -1888,27 +2034,18 @@ mod journal_key_overlay_tests {
                 &mut prev_idx,
             );
             assert_eq!(previous_again, previous);
-            assert_eq!(bch2_journal_key_check_or_overwrite(
-                &mut c,
-                1,
-                0,
-                later.k.p,
-                true,
-            ), 0);
-            assert_eq!(bch2_journal_key_check_or_overwrite(
-                &mut c,
-                1,
-                0,
-                later.k.p,
-                false,
-            ), 0);
-            assert_eq!(bch2_journal_key_check_or_overwrite(
-                &mut c,
-                1,
-                0,
-                following.k.p,
-                false,
-            ), 0);
+            assert_eq!(
+                bch2_journal_key_check_or_overwrite(&mut c, 1, 0, later.k.p, true,),
+                0
+            );
+            assert_eq!(
+                bch2_journal_key_check_or_overwrite(&mut c, 1, 0, later.k.p, false,),
+                0
+            );
+            assert_eq!(
+                bch2_journal_key_check_or_overwrite(&mut c, 1, 0, following.k.p, false,),
+                0
+            );
             let later_entry = c
                 .journal_keys
                 .data
@@ -1938,7 +2075,7 @@ mod journal_key_overlay_tests {
             .is_null());
             let mut inserted_before = following;
             inserted_before.k.p = crate::btree::bkey::SPOS(4, 9, 0);
-            bch2_journal_key_insert(&mut c, 1, 0, &inserted_before);
+            assert_eq!(bch2_journal_key_insert(&mut c, 1, 0, &inserted_before), 0);
             let later_range = c
                 .journal_keys
                 .data
@@ -1955,15 +2092,48 @@ mod journal_key_overlay_tests {
                 .overwritten_range;
             assert_eq!(later_range, following_range);
             assert!(later_range != 0);
-            assert_eq!(bch2_journal_key_check_or_overwrite(
-                &mut c,
-                1,
-                0,
-                later.k.p,
-                true,
-            ), 0);
+            assert_eq!(
+                bch2_journal_key_check_or_overwrite(&mut c, 1, 0, later.k.p, true,),
+                0
+            );
             bch2_journal_keys_clear(&mut c);
             assert!(bch2_journal_keys_peek_slot(&mut c, 1, 0, first.k.p).is_null());
+        }
+    }
+
+    #[test]
+    fn copies_each_variable_length_journal_key() {
+        unsafe {
+            for u64s in crate::btree::bkey::BKEY_U64S..=crate::btree::bkey::BKEY_U64S + 16 {
+                let mut c = crate::btree::types::bch_fs::default();
+                let mut source = vec![0u64; u64s as usize];
+                let key = source.as_mut_ptr().cast::<crate::btree::bkey::bkey_i>();
+                (*key).k = crate::btree::bkey::bkey {
+                    u64s,
+                    format: crate::btree::bkey::KEY_FORMAT_CURRENT,
+                    type_: crate::btree::bset::KEY_TYPE_btree_ptr_v2,
+                    p: crate::btree::bkey::SPOS(7, u64::from(u64s), 0),
+                    ..Default::default()
+                };
+                for (offset, word) in source
+                    .iter_mut()
+                    .enumerate()
+                    .skip(crate::btree::bkey::BKEY_U64S as usize)
+                {
+                    *word = 0xa5a5_0000_0000_0000 | offset as u64;
+                }
+
+                assert_eq!(bch2_journal_key_insert(&mut c, 1, 0, key), 0);
+                let copied = c.journal_keys.data[0].allocated_k;
+                assert_ne!(copied, key);
+                assert_eq!(
+                    core::slice::from_raw_parts(copied.cast::<u64>(), u64s as usize),
+                    source.as_slice(),
+                );
+
+                bch2_journal_keys_clear(&mut c);
+                assert!(c.journal_keys.data.is_empty());
+            }
         }
     }
 }
@@ -1983,10 +2153,8 @@ mod tests {
         use std::os::unix::fs::FileExt;
 
         unsafe {
-            let path = std::env::temp_dir().join(format!(
-                "subvol-journal-device-{}",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("subvol-journal-device-{}", std::process::id()));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -2270,11 +2438,7 @@ mod tests {
 
             assert_eq!(bch2_journal_replay(&mut protected), 0);
             assert_ne!(
-                protected
-                    .journal
-                    .flags
-                    .load(Ordering::Acquire)
-                    & (1usize << JOURNAL_replay_done),
+                protected.journal.flags.load(Ordering::Acquire) & (1usize << JOURNAL_replay_done),
                 0
             );
             assert_eq!(protected.journal.last_seq.load(Ordering::Acquire), 7);
@@ -2525,6 +2689,182 @@ mod tests {
             let mut rejected = bch_fs::default();
             rejected.journal.closed.lock().unwrap().push(oversized);
             assert_eq!(bch2_journal_replay(&mut rejected), -8);
+        }
+    }
+
+    #[test]
+    fn replay_uses_the_newest_flushed_boundary_before_replaying_roots() {
+        use crate::btree::bkey::{bkey, BKEY_U64S, KEY_FORMAT_CURRENT, SPOS};
+        use crate::btree::bset::KEY_TYPE_btree_ptr_v2;
+        use crate::btree::types::bch_fs;
+
+        unsafe {
+            let root_u64s = BKEY_U64S + 5;
+            let make_root = |seq: u64, pos| {
+                let mut record =
+                    vec![0u64; JSET_HEADER_U64S + jset_u64s(root_u64s as u32) as usize];
+                record[2] = JSET_MAGIC;
+                record[3] = seq;
+                record[5] = jset_u64s(root_u64s as u32) as u64;
+                record[6] = 1;
+                let entry = record
+                    .as_mut_ptr()
+                    .add(JSET_HEADER_U64S)
+                    .cast::<jset_entry>();
+                journal_entry_init(entry, BCH_JSET_ENTRY_btree_root, 3, 2, root_u64s as u16);
+                let key = entry
+                    .cast::<u64>()
+                    .add(1)
+                    .cast::<crate::btree::bkey::bkey_i>();
+                (*key).k = bkey {
+                    u64s: root_u64s,
+                    format: KEY_FORMAT_CURRENT,
+                    type_: KEY_TYPE_btree_ptr_v2,
+                    p: pos,
+                    ..Default::default()
+                };
+                record
+            };
+
+            let durable = make_root(1, SPOS(7, 11, 0));
+            let mut unflushed_tail = make_root(2, SPOS(7, 99, 0));
+            SET_JSET_NO_FLUSH(&mut *unflushed_tail.as_mut_ptr().cast::<jset>(), 1);
+
+            let mut replay = bch_fs::default();
+            replay
+                .journal
+                .closed
+                .lock()
+                .unwrap()
+                .extend([unflushed_tail, durable]);
+            assert_eq!(bch2_journal_replay(&mut replay), 0);
+            let root = &replay.btree.cache.roots_known[3];
+            assert_eq!(root.alive, 1);
+            assert_eq!(root.key.k.p, SPOS(7, 11, 0));
+            assert_ne!(
+                replay.journal.flags.load(Ordering::Acquire) & (1usize << JOURNAL_replay_done),
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn replay_rejects_conflicting_duplicate_journal_records() {
+        unsafe {
+            let mut record = vec![0u64; JSET_HEADER_U64S];
+            record[2] = JSET_MAGIC;
+            record[3] = 1;
+            record[6] = 1;
+            let mut conflict = record.clone();
+            conflict[0] = 1;
+
+            let mut replay = crate::btree::types::bch_fs::default();
+            replay
+                .journal
+                .closed
+                .lock()
+                .unwrap()
+                .extend([record, conflict]);
+            assert_eq!(bch2_journal_replay(&mut replay), -7);
+        }
+    }
+
+    #[test]
+    fn replay_restarts_after_a_leaf_split() {
+        use crate::btree::bkey::{
+            bkey, bkey_format_key_bits, BKEY_FORMAT_CURRENT, BKEY_U64S, KEY_FORMAT_CURRENT,
+            POS_MIN, SPOS, SPOS_MAX,
+        };
+        use crate::btree::bset::{bset as disk_bset, btree_node as disk_btree_node};
+        use crate::btree::iter::{
+            bch2_btree_iter_next, bch2_btree_iter_peek, bch2_trans_init, bch2_trans_iter_exit,
+            bch2_trans_iter_init, btree_iter, btree_trans,
+        };
+        use crate::btree::types::{
+            bch2_btree_id_root_set, bch_fs, bset_tree, BSET_NO_AUX_TREE_VAL,
+        };
+        use crate::sb::io::{bch2_free_super, bch2_sb_realloc};
+
+        unsafe {
+            let mut words = vec![0u64; 64];
+            let mut leaf = Box::new(crate::btree::types::btree::default());
+            leaf.data = words.as_mut_ptr().cast::<disk_btree_node>();
+            leaf.byte_order = 9;
+            leaf.format = BKEY_FORMAT_CURRENT;
+            leaf.nr_key_bits = bkey_format_key_bits(&leaf.format) as u8;
+            leaf.nsets = 1;
+            (*leaf.data).min_key = POS_MIN;
+            (*leaf.data).max_key = SPOS_MAX;
+            let disk_set = words.as_mut_ptr().add(17).cast::<disk_bset>();
+            (*disk_set).u64s = 40;
+            for idx in 0..8 {
+                *words.as_mut_ptr().add(20 + idx * 5).cast::<bkey>() = bkey {
+                    u64s: BKEY_U64S,
+                    format: KEY_FORMAT_CURRENT,
+                    type_: 6,
+                    p: SPOS(1, idx as u64 + 1, 0),
+                    ..Default::default()
+                };
+            }
+            leaf.set[0] = bset_tree {
+                size: 0,
+                extra: BSET_NO_AUX_TREE_VAL,
+                data_offset: 17,
+                aux_data_offset: u16::MAX,
+                end_offset: 60,
+            };
+            leaf.nr.live_u64s = 40;
+            leaf.nr.bset_u64s[0] = 40;
+            leaf.nr.unpacked_keys = 8;
+
+            let mut replay = bch_fs::default();
+            assert_eq!(bch2_sb_realloc(&mut replay.disk_sb, 0), 0);
+            (*replay.disk_sb.sb).flags[0] = 1 << 12;
+            bch2_btree_id_root_set(&mut replay, 0, &mut *leaf);
+
+            let key_u64s = BKEY_U64S as u32;
+            let mut record = vec![0u64; JSET_HEADER_U64S + jset_u64s(key_u64s) as usize];
+            record[2] = JSET_MAGIC;
+            record[3] = 1;
+            record[5] = jset_u64s(key_u64s) as u64;
+            record[6] = 1;
+            let entry = record
+                .as_mut_ptr()
+                .add(JSET_HEADER_U64S)
+                .cast::<jset_entry>();
+            journal_entry_init(entry, BCH_JSET_ENTRY_btree_keys, 0, 0, key_u64s as u16);
+            let key = entry
+                .cast::<u64>()
+                .add(1)
+                .cast::<crate::btree::bkey::bkey_i>();
+            (*key).k = bkey {
+                u64s: key_u64s as u8,
+                format: KEY_FORMAT_CURRENT,
+                type_: 6,
+                p: SPOS(1, 9, 0),
+                ..Default::default()
+            };
+            replay.journal.closed.lock().unwrap().push(record);
+
+            assert_eq!(bch2_journal_replay(&mut replay), 0);
+            let root = crate::btree::types::bch2_btree_id_root_b(&replay, 0);
+            assert_eq!((*root).c.level, 1);
+            assert!(replay.journal_keys.data.iter().all(|key| key.overwritten));
+
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut replay);
+            let mut iter = btree_iter::default();
+            bch2_trans_iter_init(&mut trans, &mut iter, 0, SPOS(1, 0, 0), 0);
+            let mut seen = Vec::new();
+            let mut key = bch2_btree_iter_peek(&mut iter);
+            while !key.k.is_null() {
+                seen.push((*key.k).p.offset);
+                key = bch2_btree_iter_next(&mut iter);
+            }
+            bch2_trans_iter_exit(&mut iter);
+            assert_eq!(seen, (1..=9).collect::<Vec<_>>());
+
+            bch2_free_super(&mut replay.disk_sb);
         }
     }
 }

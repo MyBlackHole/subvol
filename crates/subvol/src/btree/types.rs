@@ -449,6 +449,7 @@ pub struct journal_keys {
     pub data: Vec<journal_key>,
     pub gap: usize,
     pub pre_sort: Vec<journal_key>,
+    pub overwrite_lock: std::sync::Mutex<()>,
     pub overwrites: Vec<journal_key_range_overwritten>,
 }
 
@@ -456,11 +457,28 @@ impl Drop for journal_keys {
     fn drop(&mut self) {
         for key in self.data.iter_mut().chain(self.pre_sort.iter_mut()) {
             if key.allocated && !key.allocated_k.is_null() {
-                unsafe { drop(Box::from_raw(key.allocated_k)) };
+                unsafe { journal_key_free(key.allocated_k) };
                 key.allocated_k = core::ptr::null_mut();
             }
         }
     }
+}
+
+/// Rust ownership counterpart of bcachefs' `kfree()` for a journal-overlay
+/// key allocated with exactly `bkey_bytes(&k->k)` bytes.
+pub unsafe fn journal_key_free(key: *mut bkey_i) {
+    if key.is_null() {
+        return;
+    }
+    let bytes = (*key).k.u64s as usize * core::mem::size_of::<u64>();
+    if bytes < core::mem::size_of::<bkey_i>() {
+        return;
+    }
+    let Ok(layout) = std::alloc::Layout::from_size_align(bytes, core::mem::align_of::<u64>())
+    else {
+        return;
+    };
+    std::alloc::dealloc(key.cast(), layout);
 }
 
 impl Default for btree_evicted_size {

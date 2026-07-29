@@ -1,34 +1,28 @@
 use core::cmp::Ordering;
 
 use super::bkey::{
-    bch2_key_resize, bch_val, bkey, bkey_and_val_eq, bkey_bytes, bkey_copy, bkey_deleted, bkey_fields_eq, bkey_i,
-    bkey_init, set_bkey_val_bytes,
-    bkey_packed, bkey_s, bkey_s_c, bkey_val_bytes, bpos_cmp, bpos_eq, bpos_gt, bpos_le, bpos_lt,
-    bpos_min,
-    SPOS_MAX,
+    bch2_key_resize, bch_val, bkey, bkey_and_val_eq, bkey_bytes, bkey_copy, bkey_deleted,
+    bkey_fields_eq, bkey_i, bkey_init, bkey_packed, bkey_s, bkey_s_c, bkey_val_bytes, bpos_cmp,
+    bpos_eq, bpos_gt, bpos_le, bpos_lt, bpos_min, set_bkey_val_bytes, SPOS_MAX,
 };
 use super::bset_update::{bch2_bset_delete, bch2_bset_insert, btree_keys_account_key};
 use super::iter::{
     bch2_btree_iter_advance, bch2_btree_iter_peek_max, bch2_btree_iter_peek_prev,
-    bch2_btree_iter_peek_slot, bch2_btree_iter_set_pos, bch2_trans_iter_exit,
-    bch2_trans_iter_init, btree_insert_entry, btree_iter, btree_path, btree_path_idx_t,
-    btree_trans, btree_trans_commit_hook,
-    btree_trans_subbuf,
-    BTREE_ITER_all_snapshots, BTREE_ITER_cached, BTREE_ITER_intent, BTREE_ITER_nopreserve,
-    BTREE_ITER_nofilter_whiteouts, BTREE_ITER_not_extents, BTREE_ITER_INITIAL,
-    BTREE_NODE_INTENT_LOCKED,
+    bch2_btree_iter_peek_slot, bch2_btree_iter_set_pos, bch2_trans_iter_exit, bch2_trans_iter_init,
+    btree_insert_entry, btree_iter, btree_path, btree_path_idx_t, btree_trans,
+    btree_trans_commit_hook, btree_trans_subbuf, BTREE_ITER_all_snapshots, BTREE_ITER_cached,
+    BTREE_ITER_intent, BTREE_ITER_nofilter_whiteouts, BTREE_ITER_nopreserve,
+    BTREE_ITER_not_extents, BTREE_ITER_INITIAL, BTREE_NODE_INTENT_LOCKED,
 };
 use super::node_iter::{
-    bch2_btree_node_iter_bset_pos, bch2_btree_node_iter_peek_all,
-    bkey_unpack_pos,
+    bch2_btree_node_iter_bset_pos, bch2_btree_node_iter_peek_all, bkey_unpack_pos,
 };
 use super::types::{
     bset_tree_last, btree, btree_bkey_first_offset, btree_current_write, btree_node_write_idx,
     journal_entry_pin,
 };
 use crate::lock::six::{
-    six_lock_read, six_lock_type, six_lock_write, six_unlock_read,
-    six_unlock_write,
+    six_lock_read, six_lock_type, six_lock_write, six_unlock_read, six_unlock_write,
 };
 
 const UPDATE_KEY_OWNED: usize = usize::MAX;
@@ -136,11 +130,7 @@ pub unsafe fn bch2_trans_kmalloc_nomemzero(trans: *mut btree_trans, size: usize)
     __bch2_trans_kmalloc(trans, size, false)
 }
 
-pub unsafe fn bch2_trans_kmalloc_ip(
-    trans: *mut btree_trans,
-    size: usize,
-    _ip: usize,
-) -> *mut u8 {
+pub unsafe fn bch2_trans_kmalloc_ip(trans: *mut btree_trans, size: usize, _ip: usize) -> *mut u8 {
     bch2_trans_kmalloc(trans, size)
 }
 
@@ -260,10 +250,7 @@ pub unsafe fn bch2_trans_jset_entry_alloc(
     bch2_trans_jset_entry_alloc_ip(trans, u64s, 0)
 }
 
-pub unsafe fn bch2_bkey_make_mut_noupdate(
-    trans: *mut btree_trans,
-    k: bkey_s_c,
-) -> *mut bkey_i {
+pub unsafe fn bch2_bkey_make_mut_noupdate(trans: *mut btree_trans, k: bkey_s_c) -> *mut bkey_i {
     __bch2_bkey_make_mut_noupdate(trans, k, 0)
 }
 
@@ -291,11 +278,7 @@ pub unsafe fn __bch2_bkey_make_mut_noupdate(
         );
     }
     if bytes > old_bytes {
-        core::ptr::write_bytes(
-            mut_.cast::<u8>().add(old_bytes),
-            0,
-            bytes - old_bytes,
-        );
+        core::ptr::write_bytes(mut_.cast::<u8>().add(old_bytes), 0, bytes - old_bytes);
         (*mut_).k.u64s = bytes.div_ceil(core::mem::size_of::<u64>()) as u8;
     }
     mut_
@@ -374,7 +357,8 @@ pub unsafe fn __bch2_bkey_get_mut(
         core::ptr::null_mut()
     } else {
         let current = super::iter::bch2_btree_iter_peek_slot(&mut iter);
-        let mut_ = if super::bkey::bkey_err(current) != 0 || current.k.is_null()
+        let mut_ = if super::bkey::bkey_err(current) != 0
+            || current.k.is_null()
             || (type_ != 0 && (*current.k).type_ != type_)
         {
             core::ptr::null_mut()
@@ -401,8 +385,7 @@ pub unsafe fn bch2_bkey_alloc(
     if trans.is_null() || iter.is_null() {
         return core::ptr::null_mut();
     }
-    let k = bch2_trans_kmalloc(trans, core::mem::size_of::<bkey_i>() + val_size)
-        as *mut bkey_i;
+    let k = bch2_trans_kmalloc(trans, core::mem::size_of::<bkey_i>() + val_size) as *mut bkey_i;
     if k.is_null() {
         return core::ptr::null_mut();
     }
@@ -613,8 +596,7 @@ pub unsafe fn __bch2_insert_snapshot_whiteouts(
             return err;
         }
         if (*k.k).type_ == super::bset::KEY_TYPE_deleted {
-            let update = bch2_trans_kmalloc(trans, core::mem::size_of::<bkey_i>())
-                as *mut bkey_i;
+            let update = bch2_trans_kmalloc(trans, core::mem::size_of::<bkey_i>()) as *mut bkey_i;
             if update.is_null() {
                 bch2_trans_iter_exit(&mut iter);
                 return -12;
@@ -668,19 +650,12 @@ unsafe fn extent_front_merge(
     ) {
         return 0;
     }
-    let first = crate::snapshot::__bch2_key_has_snapshot_overwrites(
-        trans,
-        (*iter).btree_id,
-        (*k.k).p,
-    );
+    let first =
+        crate::snapshot::__bch2_key_has_snapshot_overwrites(trans, (*iter).btree_id, (*k.k).p);
     let ret = if first != 0 {
         first
     } else {
-        crate::snapshot::__bch2_key_has_snapshot_overwrites(
-            trans,
-            (*iter).btree_id,
-            (**insert).k.p,
-        )
+        crate::snapshot::__bch2_key_has_snapshot_overwrites(trans, (*iter).btree_id, (**insert).k.p)
     };
     if ret < 0 {
         return ret;
@@ -706,11 +681,8 @@ unsafe fn extent_back_merge(
     if (*trans).journal_replay_not_finished {
         return 0;
     }
-    let first = crate::snapshot::__bch2_key_has_snapshot_overwrites(
-        trans,
-        (*iter).btree_id,
-        (*insert).k.p,
-    );
+    let first =
+        crate::snapshot::__bch2_key_has_snapshot_overwrites(trans, (*iter).btree_id, (*insert).k.p);
     let ret = if first != 0 {
         first
     } else {
@@ -768,14 +740,7 @@ unsafe fn bch2_trans_update_extent(
 
     if bpos_eq((*k.k).p, super::bkey::bkey_start_pos(&(*insert).k)) {
         if super::bkey::bch2_bkey_maybe_mergable(&*k.k, &(*insert).k) {
-            ret = extent_front_merge(
-                trans,
-                &mut iter,
-                k,
-                &mut insert,
-                &mut k_buf_u64s,
-                flags,
-            );
+            ret = extent_front_merge(trans, &mut iter, k, &mut insert, &mut k_buf_u64s, flags);
             if ret != 0 {
                 bch2_trans_iter_exit(&mut iter);
                 return ret;
@@ -790,14 +755,17 @@ unsafe fn bch2_trans_update_extent(
         }
     } else {
         loop {
-            assert!(!bpos_le((*k.k).p, super::bkey::bkey_start_pos(&(*insert).k)));
+            assert!(!bpos_le(
+                (*k.k).p,
+                super::bkey::bkey_start_pos(&(*insert).k)
+            ));
             if (*k.k).type_ != super::bset::KEY_TYPE_whiteout
                 && bpos_le((*insert).k.p, super::bkey::bkey_start_pos(&*k.k))
             {
                 break;
             }
-            let done = (*k.k).type_ != super::bset::KEY_TYPE_whiteout
-                && bpos_lt((*insert).k.p, (*k.k).p);
+            let done =
+                (*k.k).type_ != super::bset::KEY_TYPE_whiteout && bpos_lt((*insert).k.p, (*k.k).p);
             if super::bset::bkey_extent_whiteout(&*(k.k.cast::<bkey_packed>())) {
                 let whiteout_type = extent_whiteout_type((*trans).c, btree_id, &(*insert).k);
                 if bpos_le((*k.k).p, (*insert).k.p) && (*k.k).type_ != whiteout_type {
@@ -979,10 +947,8 @@ pub unsafe fn bch2_trigger_get_mutable_new(
     }
     assert!(!found.is_null());
 
-    let new_buf = bch2_trans_kmalloc(
-        trans,
-        (needed_u64s as usize) * core::mem::size_of::<u64>(),
-    ) as *mut bkey_i;
+    let new_buf = bch2_trans_kmalloc(trans, (needed_u64s as usize) * core::mem::size_of::<u64>())
+        as *mut bkey_i;
     if new_buf.is_null() {
         return -12;
     }
@@ -1017,7 +983,7 @@ pub unsafe fn bch2_btree_path_peek_slot_exact(path: *mut btree_path, u: *mut bke
     super::iter::bch2_btree_path_peek_slot_exact(path, u)
 }
 
-pub unsafe fn btree_trans_update_by_path(
+pub(crate) unsafe fn btree_trans_update_by_path(
     trans: *mut btree_trans,
     path_idx: btree_path_idx_t,
     k: *mut bkey_i,
@@ -1414,9 +1380,7 @@ pub unsafe fn bch2_trans_update_buffered(
     if trans.is_null() || k.is_null() {
         return -22;
     }
-    if (*trans).journal_replay_not_finished
-        && (*k).k.type_ != super::bset::KEY_TYPE_accounting
-    {
+    if (*trans).journal_replay_not_finished && (*k).k.type_ != super::bset::KEY_TYPE_accounting {
         return bch2_btree_insert_clone_trans(trans, btree_id, k.cast_mut());
     }
     let u64s = (*k).k.u64s as u16;
@@ -1431,11 +1395,7 @@ pub unsafe fn bch2_trans_update_buffered(
         0,
         u64s,
     );
-    core::ptr::copy_nonoverlapping(
-        k.cast::<u64>(),
-        entry.add(1).cast::<u64>(),
-        u64s as usize,
-    );
+    core::ptr::copy_nonoverlapping(k.cast::<u64>(), entry.add(1).cast::<u64>(), u64s as usize);
     0
 }
 
@@ -1570,10 +1530,7 @@ pub unsafe fn bch2_trans_update_buf(
     }
 }
 
-pub unsafe fn bch2_trans_commit_hook(
-    trans: *mut btree_trans,
-    hook: *mut btree_trans_commit_hook,
-) {
+pub unsafe fn bch2_trans_commit_hook(trans: *mut btree_trans, hook: *mut btree_trans_commit_hook) {
     (*hook).next = (*trans).hooks;
     (*trans).hooks = hook;
 }
@@ -1706,7 +1663,7 @@ unsafe fn bch2_btree_bset_insert_key_inlined(
     true
 }
 
-pub unsafe fn bch2_btree_insert_key_leaf(
+pub(crate) unsafe fn bch2_btree_insert_key_leaf(
     trans: *mut btree_trans,
     path: *mut btree_path,
     insert: *mut bkey_i,
@@ -1719,9 +1676,7 @@ pub unsafe fn bch2_btree_insert_key_leaf(
     if !bch2_btree_bset_insert_key_inlined(trans, path, b, insert) {
         return;
     }
-    if (*b).c.level != 0
-        && super::interior::bch2_btree_node_check_topology(trans, b) != 0
-    {
+    if (*b).c.level != 0 && super::interior::bch2_btree_node_check_topology(trans, b) != 0 {
         return;
     }
     let set = super::types::bset(b, last);
@@ -1778,6 +1733,76 @@ unsafe fn verify_update_old_key(trans: *mut btree_trans, i: *mut btree_insert_en
         }
     }
     bkey_fields_eq(&*k.k, &(*i).old_k) && k.v == (*i).old_v
+}
+
+/* Mirrors commit.c's bch2_check_drop_overwrites_from_journal(): journal
+ * overlay entries remain authoritative until their btree update commits.
+ * Accounting keys are deltas and therefore deliberately do not participate
+ * in overwrite deduplication. */
+unsafe fn bch2_check_drop_overwrites_from_journal(trans: *mut btree_trans, check: bool) -> i32 {
+    for idx in 0..(*trans).nr_updates as usize {
+        let update = (*trans).updates.add(idx);
+        if (*(*update).k).k.type_ == super::bset::KEY_TYPE_accounting {
+            continue;
+        }
+        let ret = crate::journal::bch2_journal_key_check_or_overwrite(
+            (*trans).c,
+            (*update).btree_id,
+            (*update).level,
+            (*(*update).k).k.p,
+            check,
+        );
+        if ret != 0 {
+            return ret;
+        }
+    }
+
+    let mut entry_offset = 0usize;
+    while entry_offset < (*trans).journal_entries.u64s as usize {
+        let entry = (*trans)
+            .mem
+            .add(
+                ((*trans).journal_entries.base as usize + entry_offset)
+                    * core::mem::size_of::<u64>(),
+            )
+            .cast::<crate::journal::jset_entry>();
+        let entry_u64s = crate::journal::jset_u64s((*entry).u64s as u32) as usize;
+        if entry_u64s == 0 || entry_offset + entry_u64s > (*trans).journal_entries.u64s as usize {
+            return -3;
+        }
+        if ((*entry).type_ == crate::journal::BCH_JSET_ENTRY_btree_keys
+            || (*entry).type_ == crate::journal::BCH_JSET_ENTRY_write_buffer_keys)
+            && (*entry).u64s != 0
+        {
+            let mut key_offset = 0usize;
+            while key_offset < (*entry).u64s as usize {
+                let remaining = (*entry).u64s as usize - key_offset;
+                if remaining < super::bkey::BKEY_U64S as usize {
+                    return -3;
+                }
+                let key = entry.cast::<u64>().add(1 + key_offset).cast::<bkey_i>();
+                let key_u64s = (*key).k.u64s as usize;
+                if key_u64s < super::bkey::BKEY_U64S as usize || key_u64s > remaining {
+                    return -3;
+                }
+                if (*key).k.type_ != super::bset::KEY_TYPE_accounting {
+                    let ret = crate::journal::bch2_journal_key_check_or_overwrite(
+                        (*trans).c,
+                        (*entry).btree_id,
+                        (*entry).level,
+                        (*key).k.p,
+                        check,
+                    );
+                    if ret != 0 {
+                        return ret;
+                    }
+                }
+                key_offset += key_u64s;
+            }
+        }
+        entry_offset += entry_u64s;
+    }
+    0
 }
 
 unsafe fn bch2_key_trigger(trans: *mut btree_trans, op: btree_trigger_op) -> i32 {
@@ -1904,9 +1929,11 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
         {
             assert!(bpos_eq((*(*i).k).k.p, (*path).pos));
             assert_eq!((*i).cached, (*path).cached);
-            assert!(!((*i).cached
-                && !(*i).key_cache_already_flushed
-                && (*(*i).k).k.type_ == super::bset::KEY_TYPE_deleted));
+            assert!(
+                !((*i).cached
+                    && !(*i).key_cache_already_flushed
+                    && (*(*i).k).k.type_ == super::bset::KEY_TYPE_deleted)
+            );
             assert_eq!((*i).level, (*path).level);
             assert_eq!((*i).btree_id, (*path).btree_id);
             let expected_bkey_type = if (*path).level != 0 {
@@ -1928,13 +1955,12 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
         }
         let mut old_key = bkey::default();
         let old = bch2_btree_path_peek_slot_exact(path, &mut old_key);
-        let required_u64s = if (*(*i).k).k.type_ == super::bset::KEY_TYPE_deleted
-            && !old.v.is_null()
-        {
-            0
-        } else {
-            (*(*i).k).k.u64s as u32
-        };
+        let required_u64s =
+            if (*(*i).k).k.type_ == super::bset::KEY_TYPE_deleted && !old.v.is_null() {
+                0
+            } else {
+                (*(*i).k).k.u64s as u32
+            };
         if !super::interior::bch2_btree_node_insert_fits(b, required_u64s)
             && super::interior::want_new_bset((*trans).c, b).is_null()
         {
@@ -2010,6 +2036,28 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
     }
     (*trans).write_locked = true;
 
+    /* commit.c serializes the overlay check with all replay-time mutations:
+     * a key that changed underneath this transaction requires a restart,
+     * while a successful commit subsequently drops its overlay visibility. */
+    let journal_replay = (*trans).journal_replay_not_finished;
+    let journal_keys = core::ptr::addr_of_mut!((*(*trans).c).journal_keys);
+    let _journal_keys_lock = if journal_replay {
+        Some((&(*journal_keys).overwrite_lock).lock().unwrap())
+    } else {
+        None
+    };
+    if journal_replay {
+        let ret = bch2_check_drop_overwrites_from_journal(trans, true);
+        if ret != 0 {
+            for held in locked[..nr_locked].iter().rev() {
+                six_unlock_write(&(**held).c.lock);
+            }
+            (*trans).write_locked = false;
+            crate::journal::bch2_journal_res_put(journal, &mut (*trans).journal_res);
+            return ret;
+        }
+    }
+
     for idx in 0..(*trans).nr_updates as usize {
         if !verify_update_old_key(trans, (*trans).updates.add(idx)) {
             for held in locked[..nr_locked].iter().rev() {
@@ -2073,7 +2121,10 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
     while entry_offset < (*trans).journal_entries.u64s as usize {
         let source = (*trans)
             .mem
-            .add(((*trans).journal_entries.base as usize + entry_offset) * core::mem::size_of::<u64>())
+            .add(
+                ((*trans).journal_entries.base as usize + entry_offset)
+                    * core::mem::size_of::<u64>(),
+            )
             .cast::<crate::journal::jset_entry>();
         let entry = crate::journal::bch2_journal_add_entry(
             journal,
@@ -2084,11 +2135,7 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
             (*source).u64s,
         );
         let entry_u64s = crate::journal::jset_u64s((*source).u64s as u32) as usize;
-        core::ptr::copy_nonoverlapping(
-            source.cast::<u64>(),
-            entry.cast::<u64>(),
-            entry_u64s,
-        );
+        core::ptr::copy_nonoverlapping(source.cast::<u64>(), entry.cast::<u64>(), entry_u64s);
         entry_offset += entry_u64s;
     }
     let journal_seq = (*trans).journal_res.seq;
@@ -2098,6 +2145,10 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
         let i = (*trans).updates.add(idx);
         let path = (*trans).paths.add((*i).path as usize);
         bch2_btree_insert_key_leaf(trans, path, (*i).k, journal_seq);
+    }
+
+    if journal_replay {
+        let _ = bch2_check_drop_overwrites_from_journal(trans, false);
     }
 
     for held in locked[..nr_locked].iter().rev() {
@@ -2125,8 +2176,7 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
 mod tests {
     use super::*;
     use crate::btree::bkey::{
-        bkey_bytes, BKEY_FORMAT_CURRENT, BKEY_U64S, KEY_FORMAT_CURRENT, POS_MIN, SPOS,
-        SPOS_MAX,
+        bkey_bytes, BKEY_FORMAT_CURRENT, BKEY_U64S, KEY_FORMAT_CURRENT, POS_MIN, SPOS, SPOS_MAX,
     };
     use crate::btree::bset::{
         bch2_bkey_append_ptr, bch_extent_ptr, bkey_i_to_btree_ptr_v2, bset as disk_bset,
@@ -2134,8 +2184,7 @@ mod tests {
     };
     use crate::btree::iter::{
         bch2_btree_iter_peek, bch2_trans_begin, bch2_trans_init, bch2_trans_iter_exit,
-        bch2_trans_iter_init,
-        BTREE_ITER_intent,
+        bch2_trans_iter_init, BTREE_ITER_intent,
     };
     use crate::btree::node_iter::{
         bch2_btree_node_iter_advance, bch2_btree_node_iter_init_from_start,
@@ -2167,24 +2216,13 @@ mod tests {
             stripes.k.type_ = crate::btree::bset::KEY_TYPE_stripe;
             stripes.k.p = SPOS(1, 1, 0);
 
-            assert!(!btree_trans_update_by_path(
-                &mut trans,
-                1,
-                &mut *alloc,
-                BKEY_U64S,
-                0,
-                0,
-            )
-            .is_null());
-            assert!(!btree_trans_update_by_path(
-                &mut trans,
-                2,
-                &mut *stripes,
-                BKEY_U64S,
-                0,
-                0,
-            )
-            .is_null());
+            assert!(
+                !btree_trans_update_by_path(&mut trans, 1, &mut *alloc, BKEY_U64S, 0, 0,).is_null()
+            );
+            assert!(
+                !btree_trans_update_by_path(&mut trans, 2, &mut *stripes, BKEY_U64S, 0, 0,)
+                    .is_null()
+            );
             assert_eq!(trans.nr_updates, 2);
             assert_eq!((*trans.updates).btree_id, 6);
             assert_eq!((*trans.updates.add(1)).btree_id, 4);
@@ -2231,7 +2269,9 @@ mod tests {
             assert_eq!(bch2_trans_subbuf_reserve(&mut trans, &mut buf, 2), 0);
             assert_eq!(buf.u64s, 0);
             assert!(buf.size >= 2);
-            let first = trans.mem.add(buf.base as usize * core::mem::size_of::<u64>());
+            let first = trans
+                .mem
+                .add(buf.base as usize * core::mem::size_of::<u64>());
             core::ptr::write_bytes(first, 0x5a, 2 * core::mem::size_of::<u64>());
             assert_eq!(bch2_trans_subbuf_reserve(&mut trans, &mut buf, 1), 0);
             assert_eq!(buf.u64s, 0);
@@ -2247,7 +2287,10 @@ mod tests {
             let entry = bch2_trans_jset_entry_alloc(&mut trans, 2);
             assert!(!entry.is_null());
             assert_eq!((entry as usize) % core::mem::size_of::<u64>(), 0);
-            assert_eq!(trans.journal_entries.u64s, crate::journal::jset_u64s(2) as u16);
+            assert_eq!(
+                trans.journal_entries.u64s,
+                crate::journal::jset_u64s(2) as u16
+            );
             crate::journal::journal_entry_init(
                 entry,
                 crate::journal::BCH_JSET_ENTRY_write_buffer_keys,
@@ -2255,7 +2298,10 @@ mod tests {
                 0,
                 2,
             );
-            assert_eq!((*entry).type_, crate::journal::BCH_JSET_ENTRY_write_buffer_keys);
+            assert_eq!(
+                (*entry).type_,
+                crate::journal::BCH_JSET_ENTRY_write_buffer_keys
+            );
             assert_eq!((*entry).btree_id, 3);
             assert_eq!((*entry).u64s, 2);
         }
@@ -2275,7 +2321,10 @@ mod tests {
                 .mem
                 .add(trans.journal_entries.base as usize * core::mem::size_of::<u64>())
                 .cast::<crate::journal::jset_entry>();
-            assert_eq!((*entry).type_, crate::journal::BCH_JSET_ENTRY_write_buffer_keys);
+            assert_eq!(
+                (*entry).type_,
+                crate::journal::BCH_JSET_ENTRY_write_buffer_keys
+            );
             assert_eq!((*entry).btree_id, 7);
             assert_eq!((*entry).u64s, BKEY_U64S as u16);
             assert_eq!((*(entry.add(1).cast::<bkey>())).p, key.k.p);
@@ -2420,7 +2469,10 @@ mod tests {
     #[test]
     fn need_whiteout_for_snapshot_matches_parent_short_circuit() {
         let pos = SPOS(1, 1, 1);
-        assert_eq!(unsafe { need_whiteout_for_snapshot(core::ptr::null_mut(), 0, pos) }, -22);
+        assert_eq!(
+            unsafe { need_whiteout_for_snapshot(core::ptr::null_mut(), 0, pos) },
+            -22
+        );
         unsafe {
             let mut fs = bch_fs::default();
             let mut trans = btree_trans::default();
@@ -2639,7 +2691,10 @@ mod tests {
                 },
                 ..Default::default()
             };
-            assert_eq!(bch2_trans_update(&mut trans, &mut iter, &mut insertion, 0), 0);
+            assert_eq!(
+                bch2_trans_update(&mut trans, &mut iter, &mut insertion, 0),
+                0
+            );
 
             let mut hook = btree_trans_commit_hook {
                 fn_: fail_commit,
@@ -2680,18 +2735,16 @@ mod tests {
     fn empty_slot_rejects_missing_transaction_or_iterator() {
         let mut iter = btree_iter::default();
         let pos = SPOS(1, 1, 0);
-        assert_eq!(unsafe {
-            bch2_bkey_get_empty_slot(core::ptr::null_mut(), &mut iter, 0, pos, pos)
-        }, -22);
-        assert_eq!(unsafe {
-            bch2_bkey_get_empty_slot(
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                0,
-                pos,
-                pos,
-            )
-        }, -22);
+        assert_eq!(
+            unsafe { bch2_bkey_get_empty_slot(core::ptr::null_mut(), &mut iter, 0, pos, pos) },
+            -22
+        );
+        assert_eq!(
+            unsafe {
+                bch2_bkey_get_empty_slot(core::ptr::null_mut(), core::ptr::null_mut(), 0, pos, pos)
+            },
+            -22
+        );
     }
 
     #[test]
@@ -2708,10 +2761,8 @@ mod tests {
     #[test]
     fn transaction_writes_large_middle_bset_before_compacting_all() {
         unsafe {
-            let path = std::env::temp_dir().join(format!(
-                "subvol-init-next-write-{}",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("subvol-init-next-write-{}", std::process::id()));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -2859,8 +2910,7 @@ mod tests {
             assert!(!crate::btree::io::btree_node_just_written(&*b));
 
             let mut recovered_words = vec![0u64; 2048];
-            let mut recovered_aux =
-                vec![0u64; crate::btree::types::__btree_aux_data_bytes(14) / 8];
+            let mut recovered_aux = vec![0u64; crate::btree::types::__btree_aux_data_bytes(14) / 8];
             let mut recovered = btree::default();
             recovered.data = recovered_words.as_mut_ptr().cast();
             recovered.aux_data = recovered_aux.as_mut_ptr().cast();
@@ -3278,6 +3328,49 @@ mod tests {
             assert_eq!((second.type_, second.btree_id, second.u64s), (0, 0, 5));
             drop(records);
 
+            /* jset_entry_for_each_key() in the local replay path accepts
+             * multiple variable-length bkeys in one btree-key entry.  Fold
+             * this transaction's two one-key entries into that equivalent
+             * representation before exercising recovery. */
+            let mut combined = vec![0u64; crate::journal::JSET_HEADER_U64S + 11];
+            {
+                let records = c.journal.closed.lock().unwrap();
+                let record = &records[0];
+                combined[..crate::journal::JSET_HEADER_U64S]
+                    .copy_from_slice(&record[..crate::journal::JSET_HEADER_U64S]);
+                combined[5] = 11;
+                let entry = combined
+                    .as_mut_ptr()
+                    .add(crate::journal::JSET_HEADER_U64S)
+                    .cast::<crate::journal::jset_entry>();
+                crate::journal::journal_entry_init(
+                    entry,
+                    crate::journal::BCH_JSET_ENTRY_btree_keys,
+                    0,
+                    0,
+                    10,
+                );
+                core::ptr::copy_nonoverlapping(
+                    record.as_ptr().add(crate::journal::JSET_HEADER_U64S + 1),
+                    combined
+                        .as_mut_ptr()
+                        .add(crate::journal::JSET_HEADER_U64S + 1),
+                    5,
+                );
+                core::ptr::copy_nonoverlapping(
+                    record.as_ptr().add(crate::journal::JSET_HEADER_U64S + 7),
+                    combined
+                        .as_mut_ptr()
+                        .add(crate::journal::JSET_HEADER_U64S + 6),
+                    5,
+                );
+            }
+            {
+                let mut records = c.journal.closed.lock().unwrap();
+                records.clear();
+                records.push(combined);
+            }
+
             (*set).u64s = 10;
             (*set).journal_seq = 0;
             b.set[0].end_offset = 30;
@@ -3310,6 +3403,7 @@ mod tests {
             assert_eq!(replayed, [(2, 7), (3, 8), (4, 1)]);
             assert_eq!((*set).journal_seq, 1);
             assert_eq!(c.journal.closed.lock().unwrap().len(), 1);
+            assert!(c.journal_keys.data.iter().all(|key| key.overwritten));
         }
     }
 }
