@@ -10,12 +10,17 @@ use std::{
     fmt,
     fs::{File, OpenOptions},
     io,
+    ops::{Deref, DerefMut},
     path::Path,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard, Weak,
     },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
+
+use urcu::{boxed::RcuBox, Rcu, RcuThread};
 
 use crate::{
     btree::{
@@ -41,8 +46,8 @@ use crate::{
     journal::{
         bch2_journal_flush, bch2_journal_pin_drop, bch2_journal_read, bch2_journal_replay,
         bch2_journal_replay_key, bch2_journal_restore_for_replay,
-        bch2_journal_update_last_seq_ondisk, journal_checkpoint_markers, journal_start_info,
-        journal_state_offset,
+        bch2_journal_update_last_seq_ondisk, journal_checkpoint_markers, journal_low_on_space,
+        journal_med_on_space, journal_start_info, journal_state_offset,
     },
     sb::{
         bcachefs_metadata_version_current, bch_member, bch_sb_field_journal_v2,
@@ -52,7 +57,7 @@ use crate::{
 };
 
 /// The only durable engine data format accepted by this crate.
-pub const STORAGE_FORMAT_VERSION: u32 = 1;
+pub const STORAGE_FORMAT_VERSION: u32 = 2;
 
 /*
  * Fixed single-version engine layout:
@@ -75,6 +80,12 @@ const CHECKPOINT_DATA_START: u64 = JOURNAL_FILE_SECTORS * 512;
 const CHECKPOINT_ALIGN: u64 = CHECKPOINT_HEADER_BYTES as u64;
 const ENGINE_CHECKPOINT_MAGIC: u64 = 0x5355_4256_4f4c_4350;
 const ENGINE_CHECKPOINT_PAYLOAD_MAGIC: u64 = 0x5355_4256_4f4c_4450;
+const ENGINE_CHECKPOINT_NODE_MAGIC: u64 = 0x5355_4256_4f4c_4e44;
+const CHECKPOINT_PAYLOAD_HEADER_WORDS: usize = 6;
+const CHECKPOINT_ROOT_WORDS: usize = 4;
+const CHECKPOINT_NODE_HEADER_WORDS: usize = 8;
+const CHECKPOINT_NODE_KEY_WORDS: usize = 128;
+const RECLAIM_WORKER_DELAY: Duration = Duration::from_millis(25);
 
 /// A logical btree identifier.  The IDs are engine-local and need not expose
 /// the filesystem-specific `BCH_BTREE_IDS()` namespace.
@@ -132,16 +143,34 @@ pub struct BtreeKey {
 }
 
 /*
- * A checkpoint is the engine's durable btree-base image.  It corresponds to
- * the state reached after bcachefs has written the pinned btree nodes; its
- * sequence is then propagated in subsequent journal records just as
- * write.c propagates btree-root entries.
+ * A checkpoint is the engine's durable btree-base image.  Each root names a
+ * contiguous immutable run of leaf pages.  The next checkpoint allocates a
+ * new page image and publishes it through the alternate header only after all
+ * page checksums are stable, matching bcachefs' root publication after node
+ * write completion.
  */
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckpointRoot {
+    btree: BtreeId,
+    level: u8,
+    first_node: u32,
+    node_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckpointNode {
+    btree: BtreeId,
+    level: u8,
+    page: u32,
+    entries: Vec<BtreeKey>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CheckpointImage {
     sequence: u64,
     generation: u64,
-    entries: Vec<(BtreeId, BtreeKey)>,
+    roots: Vec<CheckpointRoot>,
+    nodes: Vec<CheckpointNode>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -161,12 +190,101 @@ struct CheckpointState {
 }
 
 impl CheckpointState {
-    fn next_image(&self, sequence: u64, entries: Vec<(BtreeId, BtreeKey)>) -> CheckpointImage {
-        CheckpointImage {
+    fn next_image(
+        &self,
+        sequence: u64,
+        entries: Vec<(BtreeId, BtreeKey)>,
+    ) -> Result<CheckpointImage, EngineError> {
+        CheckpointImage::from_entries(
             sequence,
-            generation: self.image.generation.saturating_add(1).max(1),
+            self.image.generation.saturating_add(1).max(1),
             entries,
+        )
+    }
+}
+
+impl CheckpointImage {
+    fn key_count(&self) -> usize {
+        self.nodes.iter().map(|node| node.entries.len()).sum()
+    }
+
+    fn from_entries(
+        sequence: u64,
+        generation: u64,
+        entries: Vec<(BtreeId, BtreeKey)>,
+    ) -> Result<Self, EngineError> {
+        if sequence == 0 || generation == 0 {
+            return Err(EngineError::Checkpoint(-1));
         }
+
+        let mut roots = Vec::new();
+        let mut nodes = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < entries.len() {
+            let btree = entries[cursor].0;
+            let first_node =
+                u32::try_from(nodes.len()).map_err(|_| EngineError::Checkpoint(-12))?;
+            let mut node_entries = Vec::new();
+            let mut node_words = 0usize;
+
+            while cursor < entries.len() && entries[cursor].0 == btree {
+                let key = &entries[cursor].1;
+                let key_words = (BKEY_U64S as usize)
+                    .checked_add(key.value().len())
+                    .ok_or(EngineError::Checkpoint(-12))?;
+                if !node_entries.is_empty()
+                    && node_words
+                        .checked_add(key_words)
+                        .ok_or(EngineError::Checkpoint(-12))?
+                        > CHECKPOINT_NODE_KEY_WORDS
+                {
+                    let page =
+                        u32::try_from(nodes.len()).map_err(|_| EngineError::Checkpoint(-12))?;
+                    nodes.push(CheckpointNode {
+                        btree,
+                        level: 0,
+                        page,
+                        entries: core::mem::take(&mut node_entries),
+                    });
+                    node_words = 0;
+                }
+                node_words = node_words
+                    .checked_add(key_words)
+                    .ok_or(EngineError::Checkpoint(-12))?;
+                node_entries.push(key.clone());
+                cursor += 1;
+            }
+
+            if !node_entries.is_empty() {
+                let page = u32::try_from(nodes.len()).map_err(|_| EngineError::Checkpoint(-12))?;
+                nodes.push(CheckpointNode {
+                    btree,
+                    level: 0,
+                    page,
+                    entries: node_entries,
+                });
+            }
+            let node_count = nodes
+                .len()
+                .checked_sub(first_node as usize)
+                .and_then(|count| u32::try_from(count).ok())
+                .ok_or(EngineError::Checkpoint(-12))?;
+            roots.push(CheckpointRoot {
+                btree,
+                level: 0,
+                first_node,
+                node_count,
+            });
+        }
+
+        let image = Self {
+            sequence,
+            generation,
+            roots,
+            nodes,
+        };
+        validate_checkpoint_image(&image)?;
+        Ok(image)
     }
 }
 
@@ -234,12 +352,59 @@ impl JournalSnapshot {
     }
 
     pub fn checkpoint_key_count(&self) -> usize {
-        self.checkpoint.entries.len()
+        self.checkpoint.key_count()
+    }
+
+    pub fn checkpoint_node_count(&self) -> usize {
+        self.checkpoint.nodes.len()
     }
 
     pub const fn next_sequence(&self) -> u64 {
         self.next_sequence
     }
+}
+
+/// Immutable root/page descriptor copied out while an RCU read-side section
+/// is active.  It describes the checkpoint generation that a reader observed,
+/// without exposing mutable storage-engine internals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointSummary {
+    pub sequence: u64,
+    pub generation: u64,
+    pub root_count: usize,
+    pub node_count: usize,
+    pub key_count: usize,
+}
+
+/// Durable boundary returned by `sync()` and `Transaction::commit_sync()`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurabilityPoint {
+    pub journal_sequence: u64,
+    pub journal_sequence_ondisk: u64,
+    pub checkpoint_sequence: u64,
+    pub checkpoint_generation: u64,
+}
+
+/// Observable state of the single-consumer background journal reclaimer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReclaimStatus {
+    pub requested: u64,
+    pub completed: u64,
+    pub running: bool,
+    pub last_error: Option<i32>,
+}
+
+/// Stable operational counters for the engine core.  The fields intentionally
+/// describe durability and reclaim progress rather than filesystem policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EngineMetrics {
+    pub journal_sequence: u64,
+    pub journal_sequence_ondisk: u64,
+    pub journal_last_sequence: u64,
+    pub journal_last_sequence_ondisk: u64,
+    pub journal_records: usize,
+    pub checkpoint: CheckpointSummary,
+    pub reclaim: ReclaimStatus,
 }
 
 #[derive(Debug)]
@@ -250,6 +415,7 @@ pub enum EngineError {
     Transaction(i32),
     Journal(i32),
     Checkpoint(i32),
+    ReclaimTimeout,
     Io(io::Error),
     Poisoned,
 }
@@ -265,6 +431,9 @@ impl fmt::Display for EngineError {
             Self::Transaction(error) => write!(f, "btree transaction failed: {error}"),
             Self::Journal(error) => write!(f, "journal operation failed: {error}"),
             Self::Checkpoint(error) => write!(f, "checkpoint operation failed: {error}"),
+            Self::ReclaimTimeout => {
+                f.write_str("background journal reclaim did not finish in time")
+            }
             Self::Io(error) => write!(f, "journal device I/O failed: {error}"),
             Self::Poisoned => f.write_str("storage engine mutex is poisoned"),
         }
@@ -320,18 +489,128 @@ impl<'engine> Transaction<'engine> {
     pub fn commit(self) -> Result<(), EngineError> {
         self.engine.commit_operations(&self.operations)
     }
+
+    /// Commits through the iterator/transaction path and waits until the
+    /// resulting journal record is durable.
+    pub fn commit_sync(self) -> Result<DurabilityPoint, EngineError> {
+        let engine = self.engine;
+        self.commit()?;
+        engine.sync()
+    }
 }
 
-/// A self-contained btree/transaction/journal storage engine.
-pub struct StorageEngine {
+/// A read-side transaction.  The userland RCU registration remains tied to
+/// the calling thread, and each btree lookup/scan still constructs the raw
+/// bcachefs-style iterator path while the engine mutex is held.
+pub struct ReadTransaction<'engine> {
+    engine: &'engine StorageEngine,
+    rcu_thread: RcuThread,
+    external_registration: bool,
+}
+
+impl ReadTransaction<'_> {
+    pub fn checkpoint(&self) -> CheckpointSummary {
+        self.rcu_thread.rscs(|rscs| {
+            let image = self.engine.inner.checkpoint_view.read(rscs);
+            checkpoint_summary(&image)
+        })
+    }
+
+    pub fn get(
+        &self,
+        btree: BtreeId,
+        position: KeyPosition,
+    ) -> Result<Option<BtreeKey>, EngineError> {
+        let mut fs = self.engine.lock_fs()?;
+        self.rcu_thread.rscs(|rscs| {
+            let _ = self.engine.inner.checkpoint_view.read(rscs);
+        });
+        unsafe { get_locked(&mut **fs, btree, position) }
+    }
+
+    pub fn scan(&self, btree: BtreeId) -> Result<Vec<BtreeKey>, EngineError> {
+        let mut fs = self.engine.lock_fs()?;
+        self.rcu_thread.rscs(|rscs| {
+            let _ = self.engine.inner.checkpoint_view.read(rscs);
+        });
+        unsafe { scan_locked(&mut **fs, btree) }
+    }
+}
+
+impl Drop for ReadTransaction<'_> {
+    fn drop(&mut self) {
+        if self.external_registration {
+            crate::util::rcu::rcu_external_registration_exit();
+        }
+    }
+}
+
+/* The raw port stores self-references and C-shaped pointers in bch_fs.  The
+ * Box address is fixed before initialization and every access is serialized
+ * by the enclosing Mutex; that is the ownership boundary which makes the
+ * background reclaim thread safe to move between Rust threads. */
+struct EngineFs(Box<bch_fs>);
+
+unsafe impl Send for EngineFs {}
+
+impl Deref for EngineFs {
+    type Target = bch_fs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for EngineFs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Default)]
+struct ReclaimWorkerState {
+    requested: u64,
+    completed: u64,
+    running: bool,
+    stopping: bool,
+    last_error: Option<i32>,
+}
+
+struct ReclaimControl {
+    state: Mutex<ReclaimWorkerState>,
+    wake: Condvar,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Default for ReclaimControl {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ReclaimWorkerState::default()),
+            wake: Condvar::new(),
+            worker: Mutex::new(None),
+        }
+    }
+}
+
+struct EngineState {
     /*
      * btree nodes and journal state retain raw references to their owning
      * bch_fs, just as the C implementation obtains it with container_of().
      * Keep that owner at one stable heap address before any such references
      * are initialized; moving StorageEngine must never invalidate them.
      */
-    fs: Mutex<Box<bch_fs>>,
+    fs: Mutex<EngineFs>,
     checkpoint: Mutex<CheckpointState>,
+    checkpoint_view: RcuBox<CheckpointImage>,
+    rcu: Rcu,
+    reclaim: Arc<ReclaimControl>,
+}
+
+/// A self-contained btree/transaction/journal storage engine.  Clones share
+/// the same durable state and the same single-consumer reclaim worker.
+#[derive(Clone)]
+pub struct StorageEngine {
+    inner: Arc<EngineState>,
 }
 
 impl StorageEngine {
@@ -374,10 +653,16 @@ impl StorageEngine {
                 return Err(EngineError::Journal(ret));
             }
         }
-        Ok(Self {
-            fs: Mutex::new(fs),
+        let rcu = Rcu::init();
+        let inner = Arc::new(EngineState {
+            fs: Mutex::new(EngineFs(fs)),
             checkpoint: Mutex::new(CheckpointState::default()),
-        })
+            checkpoint_view: RcuBox::new(&rcu, CheckpointImage::default()),
+            rcu,
+            reclaim: Arc::new(ReclaimControl::default()),
+        });
+        start_reclaim_worker(&inner)?;
+        Ok(Self { inner })
     }
 
     /// Creates a persistent journal/checkpoint device using the engine's
@@ -403,10 +688,32 @@ impl StorageEngine {
         }
     }
 
+    /// Starts a read-side transaction.  Its operations retain a userland RCU
+    /// registration and derive their btree search path through normal raw
+    /// iterators; callers must use this object rather than direct mutation
+    /// while a read-side context is desired.
+    pub fn read_transaction(&self) -> ReadTransaction<'_> {
+        let rcu_thread = RcuThread::register(&self.inner.rcu);
+        crate::util::rcu::rcu_external_registration_enter();
+        ReadTransaction {
+            engine: self,
+            rcu_thread,
+            external_registration: true,
+        }
+    }
+
     pub fn put(&self, btree: BtreeId, key: BtreeKey) -> Result<(), EngineError> {
         let mut transaction = self.transaction();
         transaction.put(btree, key);
         transaction.commit()
+    }
+
+    /// Commits one put transaction and waits for its journal record to become
+    /// durable on the configured journal device.
+    pub fn put_sync(&self, btree: BtreeId, key: BtreeKey) -> Result<DurabilityPoint, EngineError> {
+        let mut transaction = self.transaction();
+        transaction.put(btree, key);
+        transaction.commit_sync()
     }
 
     pub fn delete(&self, btree: BtreeId, position: KeyPosition) -> Result<(), EngineError> {
@@ -415,46 +722,29 @@ impl StorageEngine {
         transaction.commit()
     }
 
+    /// Commits one delete transaction and waits for its journal record to
+    /// become durable on the configured journal device.
+    pub fn delete_sync(
+        &self,
+        btree: BtreeId,
+        position: KeyPosition,
+    ) -> Result<DurabilityPoint, EngineError> {
+        let mut transaction = self.transaction();
+        transaction.delete(btree, position);
+        transaction.commit_sync()
+    }
+
     pub fn get(
         &self,
         btree: BtreeId,
         position: KeyPosition,
     ) -> Result<Option<BtreeKey>, EngineError> {
-        let mut fs = self.lock_fs()?;
-        unsafe {
-            let mut trans = btree_trans::default();
-            bch2_trans_init(&mut trans, &mut **fs);
-            bch2_trans_begin(&mut trans);
-
-            let mut iter = btree_iter::default();
-            bch2_trans_iter_init(
-                &mut trans,
-                &mut iter,
-                btree.as_u8(),
-                position.raw(),
-                BTREE_ITER_not_extents,
-            );
-            let found = bch2_btree_iter_peek(&mut iter);
-            let result = if bkey_err(found) != 0 {
-                Err(EngineError::Transaction(bkey_err(found)))
-            } else if found.k.is_null()
-                || !bpos_eq((*found.k).p, position.raw())
-                || (*found.k).type_ == KEY_TYPE_deleted
-            {
-                Ok(None)
-            } else {
-                decode_key(found).map(Some)
-            };
-            bch2_trans_iter_exit(&mut iter);
-            bch2_trans_put(&mut trans);
-            result
-        }
+        self.read_transaction().get(btree, position)
     }
 
     /// Returns all live keys ordered by their iterator search position.
     pub fn scan(&self, btree: BtreeId) -> Result<Vec<BtreeKey>, EngineError> {
-        let mut fs = self.lock_fs()?;
-        unsafe { scan_locked(&mut **fs, btree) }
+        self.read_transaction().scan(btree)
     }
 
     /// Checks the root topology and the iterator-visible key order.
@@ -491,13 +781,26 @@ impl StorageEngine {
     /// Publishes the current journal buffer.  Only records returned by
     /// `durable_journal()` after this succeeds can survive a crash.
     pub fn flush_journal(&self) -> Result<(), EngineError> {
-        let fs = self.lock_fs()?;
-        let ret = bch2_journal_flush(&fs.journal);
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(EngineError::Journal(ret))
+        let result = {
+            let fs = self.lock_fs()?;
+            let ret = bch2_journal_flush(&fs.journal);
+            if ret == 0 {
+                Ok(())
+            } else {
+                Err(EngineError::Journal(ret))
+            }
+        };
+        if result.is_ok() {
+            self.schedule_reclaim_if_needed()?;
         }
+        result
+    }
+
+    /// Flushes the journal and reports the exact persistence boundary reached
+    /// by this call.  It does not force checkpoint compaction.
+    pub fn sync(&self) -> Result<DurabilityPoint, EngineError> {
+        self.flush_journal()?;
+        self.durability_point()
     }
 
     /// Writes the current btree state as the durable base, then publishes an
@@ -509,12 +812,90 @@ impl StorageEngine {
         unsafe { self.checkpoint_locked(&mut **fs) }
     }
 
-    /// Reclaims the journal through a complete checkpoint.  The public API is
-    /// synchronous because the engine has no background worker yet; its
-    /// ordering is the same pin-flush/reclaim ordering as
-    /// `bch2_journal_reclaim()`.
+    /// Runs the durable checkpoint path and returns the resulting boundary.
+    pub fn checkpoint_sync(&self) -> Result<DurabilityPoint, EngineError> {
+        self.checkpoint()?;
+        self.durability_point()
+    }
+
+    /// Reclaims the journal through a complete checkpoint.  This is the
+    /// direct-reclaim path used when a caller cannot wait for the background
+    /// single consumer.
     pub fn reclaim_journal(&self) -> Result<(), EngineError> {
         self.checkpoint()
+    }
+
+    /// Kicks the background single-consumer reclaimer and returns its request
+    /// sequence.  Multiple callers are coalesced by that worker.
+    pub fn request_reclaim(&self) -> Result<u64, EngineError> {
+        self.request_reclaim_inner()
+    }
+
+    /// Waits for all reclaim work requested before this call to complete.
+    /// Completion includes an error result in `last_error`, which callers can
+    /// inspect without losing worker liveness.
+    pub fn wait_for_reclaim(&self, timeout: Duration) -> Result<ReclaimStatus, EngineError> {
+        let control = &self.inner.reclaim;
+        let started = Instant::now();
+        let mut state = control.state.lock().map_err(|_| EngineError::Poisoned)?;
+        let target = state.requested;
+        while state.completed < target {
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return Err(EngineError::ReclaimTimeout);
+            };
+            let (next, timed_out) = control
+                .wake
+                .wait_timeout(state, remaining)
+                .map_err(|_| EngineError::Poisoned)?;
+            state = next;
+            if timed_out.timed_out() && state.completed < target {
+                return Err(EngineError::ReclaimTimeout);
+            }
+        }
+        Ok(reclaim_status(&state))
+    }
+
+    pub fn reclaim_status(&self) -> Result<ReclaimStatus, EngineError> {
+        let state = self
+            .inner
+            .reclaim
+            .state
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?;
+        Ok(reclaim_status(&state))
+    }
+
+    /// Reports the durable journal/checkpoint boundary without issuing I/O.
+    pub fn durability_point(&self) -> Result<DurabilityPoint, EngineError> {
+        let fs = self.lock_fs()?;
+        let checkpoint = self.lock_checkpoint()?.image.clone();
+        Ok(DurabilityPoint {
+            journal_sequence: fs.journal.seq.load(Ordering::Acquire),
+            journal_sequence_ondisk: fs.journal.seq_ondisk.load(Ordering::Acquire),
+            checkpoint_sequence: checkpoint.sequence,
+            checkpoint_generation: checkpoint.generation,
+        })
+    }
+
+    pub fn metrics(&self) -> Result<EngineMetrics, EngineError> {
+        let fs = self.lock_fs()?;
+        let journal_records = fs
+            .journal
+            .closed
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?
+            .len();
+        let checkpoint = self.lock_checkpoint()?.image.clone();
+        let reclaim = self.reclaim_status()?;
+        Ok(EngineMetrics {
+            journal_sequence: fs.journal.seq.load(Ordering::Acquire),
+            journal_sequence_ondisk: fs.journal.seq_ondisk.load(Ordering::Acquire),
+            journal_last_sequence: fs.journal.last_seq.load(Ordering::Acquire),
+            journal_last_sequence_ondisk: fs.journal.last_seq_ondisk.load(Ordering::Acquire),
+            journal_records,
+            checkpoint: checkpoint_summary(&checkpoint),
+            reclaim,
+        })
     }
 
     pub fn durable_journal(&self) -> Result<JournalSnapshot, EngineError> {
@@ -568,7 +949,8 @@ impl StorageEngine {
             }
         }
         drop(fs);
-        *engine.lock_checkpoint()? = checkpoint;
+        *engine.lock_checkpoint()? = checkpoint.clone();
+        engine.publish_checkpoint_view(&checkpoint.image);
         Ok(engine)
     }
 
@@ -594,12 +976,15 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn lock_fs(&self) -> Result<MutexGuard<'_, Box<bch_fs>>, EngineError> {
-        self.fs.lock().map_err(|_| EngineError::Poisoned)
+    fn lock_fs(&self) -> Result<MutexGuard<'_, EngineFs>, EngineError> {
+        self.inner.fs.lock().map_err(|_| EngineError::Poisoned)
     }
 
     fn lock_checkpoint(&self) -> Result<MutexGuard<'_, CheckpointState>, EngineError> {
-        self.checkpoint.lock().map_err(|_| EngineError::Poisoned)
+        self.inner
+            .checkpoint
+            .lock()
+            .map_err(|_| EngineError::Poisoned)
     }
 
     unsafe fn checkpoint_locked(&self, fs: &mut bch_fs) -> Result<(), EngineError> {
@@ -622,7 +1007,7 @@ impl StorageEngine {
         let entries = collect_checkpoint_entries(fs)?;
         let current = self.lock_checkpoint()?.clone();
         let mut next = CheckpointState {
-            image: current.next_image(sequence, entries),
+            image: current.next_image(sequence, entries)?,
             slots: current.slots,
             active_slot: current.active_slot,
         };
@@ -645,6 +1030,7 @@ impl StorageEngine {
             .checkpoint_generation
             .store(next.image.generation, Ordering::Release);
         *self.lock_checkpoint()? = next.clone();
+        self.publish_checkpoint_view(&next.image);
 
         /* This is the engine's synchronous node-write completion: the base
          * image contains every live key, so all node pins may be dropped only
@@ -694,7 +1080,11 @@ impl StorageEngine {
         loop {
             match self.commit_operations_once(operations) {
                 Err(EngineError::Transaction(-9)) => self.reclaim_journal()?,
-                result => return result,
+                Ok(()) => {
+                    self.schedule_reclaim_if_needed()?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -818,18 +1208,202 @@ impl StorageEngine {
             }
         }
         drop(fs);
-        *self.lock_checkpoint()? = checkpoint;
+        *self.lock_checkpoint()? = checkpoint.clone();
+        self.publish_checkpoint_view(&checkpoint.image);
         Ok(())
+    }
+
+    fn publish_checkpoint_view(&self, image: &CheckpointImage) {
+        let previous = self.inner.checkpoint_view.update(image.clone());
+        drop(previous);
+    }
+
+    fn request_reclaim_inner(&self) -> Result<u64, EngineError> {
+        let control = &self.inner.reclaim;
+        let mut state = control.state.lock().map_err(|_| EngineError::Poisoned)?;
+        if state.stopping {
+            return Err(EngineError::Transaction(-1));
+        }
+        state.requested = state.requested.saturating_add(1);
+        let requested = state.requested;
+        drop(state);
+        control.wake.notify_one();
+        Ok(requested)
+    }
+
+    fn schedule_reclaim_if_needed(&self) -> Result<(), EngineError> {
+        let should_reclaim = {
+            let fs = self.lock_fs()?;
+            journal_med_on_space(&fs.journal)
+                || journal_low_on_space(&fs.journal)
+                || fs.journal.reclaim_kicked.load(Ordering::Acquire)
+        };
+        if should_reclaim {
+            let _ = self.request_reclaim_inner()?;
+        }
+        Ok(())
+    }
+
+    fn reclaim_background_once(&self) -> Result<(), EngineError> {
+        let mut fs = self.lock_fs()?;
+        if journal_state_offset(fs.journal.reservations.load(Ordering::Acquire)) == 0
+            && fs.journal.seq_ondisk.load(Ordering::Acquire) == 0
+        {
+            return Ok(());
+        }
+        unsafe { self.checkpoint_locked(&mut **fs) }
     }
 }
 
-impl Drop for StorageEngine {
+impl Drop for EngineState {
     fn drop(&mut self) {
+        {
+            let mut state = match self.reclaim.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.stopping = true;
+        }
+        self.reclaim.wake.notify_all();
+        let worker = match self.reclaim.worker.lock() {
+            Ok(mut worker) => worker.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(worker) = worker {
+            if worker.thread().id() != thread::current().id() {
+                let _ = worker.join();
+            }
+        }
+        self.rcu.barrier();
         let fs = match self.fs.get_mut() {
             Ok(fs) => fs,
             Err(poisoned) => poisoned.into_inner(),
         };
         unsafe { crate::sb::io::bch2_free_super(&mut (**fs).disk_sb) };
+    }
+}
+
+fn start_reclaim_worker(inner: &Arc<EngineState>) -> Result<(), EngineError> {
+    let control = Arc::clone(&inner.reclaim);
+    let worker_control = Arc::clone(&control);
+    let weak = Arc::downgrade(inner);
+    let worker = thread::Builder::new()
+        .name("subvol-journal-reclaim".to_owned())
+        .spawn(move || reclaim_worker_loop(weak, worker_control))?;
+    let mut slot = control.worker.lock().map_err(|_| EngineError::Poisoned)?;
+    *slot = Some(worker);
+    Ok(())
+}
+
+fn reclaim_worker_loop(engine: Weak<EngineState>, control: Arc<ReclaimControl>) {
+    loop {
+        let mut state = match control.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.stopping {
+            return;
+        }
+
+        if state.requested <= state.completed {
+            let (next, timeout) = match control.wake.wait_timeout(state, RECLAIM_WORKER_DELAY) {
+                Ok(result) => result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state = next;
+            if state.stopping {
+                return;
+            }
+            if state.requested <= state.completed {
+                let timed_out = timeout.timed_out();
+                drop(state);
+                if !timed_out {
+                    continue;
+                }
+                let Some(inner) = engine.upgrade() else {
+                    return;
+                };
+                if !background_reclaim_needed(&inner) {
+                    continue;
+                }
+                let mut state = match control.state.lock() {
+                    Ok(state) => state,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if state.stopping {
+                    return;
+                }
+                if state.requested <= state.completed {
+                    state.requested = state.requested.saturating_add(1);
+                }
+                drop(state);
+                control.wake.notify_one();
+                continue;
+            }
+        }
+
+        state.running = true;
+        let request = state.requested;
+        drop(state);
+
+        let result = match engine.upgrade() {
+            Some(inner) => StorageEngine { inner }.reclaim_background_once(),
+            None => return,
+        };
+        let error = result.as_ref().err().map(engine_error_code);
+
+        let mut state = match control.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.running = false;
+        state.completed = state.completed.max(request);
+        state.last_error = error;
+        drop(state);
+        control.wake.notify_all();
+    }
+}
+
+fn background_reclaim_needed(engine: &EngineState) -> bool {
+    let fs = match engine.fs.lock() {
+        Ok(fs) => fs,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    journal_med_on_space(&fs.journal)
+        || journal_low_on_space(&fs.journal)
+        || fs.journal.reclaim_kicked.load(Ordering::Acquire)
+}
+
+fn engine_error_code(error: &EngineError) -> i32 {
+    match error {
+        EngineError::Transaction(error)
+        | EngineError::Journal(error)
+        | EngineError::Checkpoint(error) => *error,
+        EngineError::Io(_) => -5,
+        EngineError::ReclaimTimeout => -110,
+        EngineError::InvalidBtreeId(_)
+        | EngineError::ValueTooLarge(_)
+        | EngineError::UnsupportedFormatVersion(_)
+        | EngineError::Poisoned => -1,
+    }
+}
+
+fn reclaim_status(state: &ReclaimWorkerState) -> ReclaimStatus {
+    ReclaimStatus {
+        requested: state.requested,
+        completed: state.completed,
+        running: state.running,
+        last_error: state.last_error,
+    }
+}
+
+fn checkpoint_summary(image: &CheckpointImage) -> CheckpointSummary {
+    CheckpointSummary {
+        sequence: image.sequence,
+        generation: image.generation,
+        root_count: image.roots.len(),
+        node_count: image.nodes.len(),
+        key_count: image.key_count(),
     }
 }
 
@@ -874,6 +1448,39 @@ fn encode_key(position: KeyPosition, value: &[u64], deleted: bool) -> Vec<u64> {
         }
     }
     words
+}
+
+unsafe fn get_locked(
+    fs: &mut bch_fs,
+    btree: BtreeId,
+    position: KeyPosition,
+) -> Result<Option<BtreeKey>, EngineError> {
+    let mut trans = btree_trans::default();
+    bch2_trans_init(&mut trans, fs);
+    bch2_trans_begin(&mut trans);
+
+    let mut iter = btree_iter::default();
+    bch2_trans_iter_init(
+        &mut trans,
+        &mut iter,
+        btree.as_u8(),
+        position.raw(),
+        BTREE_ITER_not_extents,
+    );
+    let found = bch2_btree_iter_peek(&mut iter);
+    let result = if bkey_err(found) != 0 {
+        Err(EngineError::Transaction(bkey_err(found)))
+    } else if found.k.is_null()
+        || !bpos_eq((*found.k).p, position.raw())
+        || (*found.k).type_ == KEY_TYPE_deleted
+    {
+        Ok(None)
+    } else {
+        decode_key(found).map(Some)
+    };
+    bch2_trans_iter_exit(&mut iter);
+    bch2_trans_put(&mut trans);
+    result
 }
 
 unsafe fn scan_locked(fs: &mut bch_fs, btree: BtreeId) -> Result<Vec<BtreeKey>, EngineError> {
@@ -936,7 +1543,7 @@ unsafe fn collect_checkpoint_entries(
 
 fn validate_checkpoint_image(image: &CheckpointImage) -> Result<(), EngineError> {
     if image.sequence == 0 {
-        if image.generation != 0 || !image.entries.is_empty() {
+        if image.generation != 0 || !image.roots.is_empty() || !image.nodes.is_empty() {
             return Err(EngineError::Checkpoint(-1));
         }
         return Ok(());
@@ -945,22 +1552,57 @@ fn validate_checkpoint_image(image: &CheckpointImage) -> Result<(), EngineError>
         return Err(EngineError::Checkpoint(-1));
     }
 
-    let mut previous: Option<(u8, KeyPosition)> = None;
-    for (btree, key) in &image.entries {
-        if btree.as_u8() as usize >= BTREE_ID_NR {
+    let mut expected_first_node = 0usize;
+    let mut previous_btree = None;
+    for root in &image.roots {
+        if root.btree.as_u8() as usize >= BTREE_ID_NR
+            || root.level != 0
+            || root.node_count == 0
+            || root.first_node as usize != expected_first_node
+        {
             return Err(EngineError::Checkpoint(-2));
         }
-        if key.value().len() > BKEY_VAL_U64S_MAX as usize {
+        if previous_btree.is_some_and(|previous| previous >= root.btree.as_u8()) {
             return Err(EngineError::Checkpoint(-2));
         }
-        if let Some((previous_btree, previous_position)) = previous {
-            if previous_btree > btree.as_u8()
-                || (previous_btree == btree.as_u8() && previous_position >= key.position())
+        previous_btree = Some(root.btree.as_u8());
+
+        let end = expected_first_node
+            .checked_add(root.node_count as usize)
+            .filter(|end| *end <= image.nodes.len())
+            .ok_or(EngineError::Checkpoint(-2))?;
+        let mut previous_position = None;
+        for (index, node) in image.nodes[expected_first_node..end].iter().enumerate() {
+            if node.btree != root.btree
+                || node.level != root.level
+                || node.page
+                    != u32::try_from(expected_first_node + index)
+                        .map_err(|_| EngineError::Checkpoint(-2))?
+                || node.entries.is_empty()
             {
                 return Err(EngineError::Checkpoint(-2));
             }
+            let mut encoded_words = 0usize;
+            for key in &node.entries {
+                if key.value().len() > BKEY_VAL_U64S_MAX as usize {
+                    return Err(EngineError::Checkpoint(-2));
+                }
+                if previous_position.is_some_and(|previous| previous >= key.position()) {
+                    return Err(EngineError::Checkpoint(-2));
+                }
+                previous_position = Some(key.position());
+                encoded_words = encoded_words
+                    .checked_add(BKEY_U64S as usize + key.value().len())
+                    .ok_or(EngineError::Checkpoint(-12))?;
+            }
+            if node.entries.len() > 1 && encoded_words > CHECKPOINT_NODE_KEY_WORDS {
+                return Err(EngineError::Checkpoint(-2));
+            }
         }
-        previous = Some((btree.as_u8(), key.position()));
+        expected_first_node = end;
+    }
+    if expected_first_node != image.nodes.len() {
+        return Err(EngineError::Checkpoint(-2));
     }
     Ok(())
 }
@@ -1009,12 +1651,23 @@ unsafe fn load_checkpoint_base(
     if seq == 0 {
         return Err(EngineError::Checkpoint(-1));
     }
-    for (btree, key) in &image.entries {
-        let mut raw = encode_key(key.position(), key.value(), false);
-        let ret =
-            bch2_journal_replay_key(fs, btree.as_u8(), 0, raw.as_mut_ptr().cast::<bkey_i>(), seq);
-        if ret != 0 {
-            return Err(EngineError::Transaction(ret));
+    for root in &image.roots {
+        let start = root.first_node as usize;
+        let end = start + root.node_count as usize;
+        for node in &image.nodes[start..end] {
+            for key in &node.entries {
+                let mut raw = encode_key(key.position(), key.value(), false);
+                let ret = bch2_journal_replay_key(
+                    fs,
+                    root.btree.as_u8(),
+                    root.level,
+                    raw.as_mut_ptr().cast::<bkey_i>(),
+                    seq,
+                );
+                if ret != 0 {
+                    return Err(EngineError::Transaction(ret));
+                }
+            }
         }
     }
 
@@ -1054,16 +1707,81 @@ fn append_checkpoint_word(bytes: &mut Vec<u8>, word: u64) {
     bytes.extend_from_slice(&word.to_le_bytes());
 }
 
-fn checkpoint_payload(image: &CheckpointImage) -> Result<Vec<u8>, EngineError> {
-    validate_checkpoint_image(image)?;
-    let entry_words = image.entries.iter().try_fold(0usize, |total, (_, key)| {
+fn checkpoint_node_words(node: &CheckpointNode) -> Result<Vec<u64>, EngineError> {
+    let words = node.entries.iter().try_fold(0usize, |total, key| {
         total
-            .checked_add(2 + BKEY_U64S as usize + key.value().len())
+            .checked_add(BKEY_U64S as usize + key.value().len())
             .ok_or(EngineError::Checkpoint(-12))
     })?;
-    let bytes = (5usize)
-        .checked_add(entry_words)
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(words)
+        .map_err(|_| EngineError::Checkpoint(-12))?;
+    for key in &node.entries {
+        output.extend(encode_key(key.position(), key.value(), false));
+    }
+    Ok(output)
+}
+
+fn checkpoint_node_checksum(
+    btree: BtreeId,
+    level: u8,
+    page: u32,
+    entry_count: u64,
+    words: &[u64],
+) -> Result<crate::btree::bset::bch_csum, EngineError> {
+    let bytes = CHECKPOINT_NODE_HEADER_WORDS
+        .checked_sub(2)
+        .and_then(|header| header.checked_add(words.len()))
         .and_then(|words| words.checked_mul(core::mem::size_of::<u64>()))
+        .ok_or(EngineError::Checkpoint(-12))?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(bytes)
+        .map_err(|_| EngineError::Checkpoint(-12))?;
+    append_checkpoint_word(&mut encoded, ENGINE_CHECKPOINT_NODE_MAGIC);
+    append_checkpoint_word(&mut encoded, btree.as_u8() as u64);
+    append_checkpoint_word(&mut encoded, level as u64);
+    append_checkpoint_word(&mut encoded, page as u64);
+    append_checkpoint_word(&mut encoded, entry_count);
+    append_checkpoint_word(
+        &mut encoded,
+        u64::try_from(words.len()).map_err(|_| EngineError::Checkpoint(-12))?,
+    );
+    for word in words {
+        append_checkpoint_word(&mut encoded, *word);
+    }
+    Ok(crate::checksum::bch2_checksum(
+        crate::checksum::BCH_CSUM_xxhash,
+        &encoded,
+    ))
+}
+
+fn checkpoint_payload(image: &CheckpointImage) -> Result<Vec<u8>, EngineError> {
+    validate_checkpoint_image(image)?;
+    let mut node_words = Vec::new();
+    node_words
+        .try_reserve_exact(image.nodes.len())
+        .map_err(|_| EngineError::Checkpoint(-12))?;
+    let mut total_words = CHECKPOINT_PAYLOAD_HEADER_WORDS
+        .checked_add(
+            image
+                .roots
+                .len()
+                .checked_mul(CHECKPOINT_ROOT_WORDS)
+                .ok_or(EngineError::Checkpoint(-12))?,
+        )
+        .ok_or(EngineError::Checkpoint(-12))?;
+    for node in &image.nodes {
+        let words = checkpoint_node_words(node)?;
+        total_words = total_words
+            .checked_add(CHECKPOINT_NODE_HEADER_WORDS)
+            .and_then(|total| total.checked_add(words.len()))
+            .ok_or(EngineError::Checkpoint(-12))?;
+        node_words.push(words);
+    }
+    let bytes = total_words
+        .checked_mul(core::mem::size_of::<u64>())
         .ok_or(EngineError::Checkpoint(-12))?;
     let mut payload = Vec::new();
     payload
@@ -1076,15 +1794,34 @@ fn checkpoint_payload(image: &CheckpointImage) -> Result<Vec<u8>, EngineError> {
     append_checkpoint_word(&mut payload, image.generation);
     append_checkpoint_word(
         &mut payload,
-        u64::try_from(image.entries.len()).map_err(|_| EngineError::Checkpoint(-12))?,
+        u64::try_from(image.roots.len()).map_err(|_| EngineError::Checkpoint(-12))?,
     );
-    for (btree, key) in &image.entries {
-        let words = encode_key(key.position(), key.value(), false);
-        append_checkpoint_word(&mut payload, btree.as_u8() as u64);
+    append_checkpoint_word(
+        &mut payload,
+        u64::try_from(image.nodes.len()).map_err(|_| EngineError::Checkpoint(-12))?,
+    );
+    for root in &image.roots {
+        append_checkpoint_word(&mut payload, root.btree.as_u8() as u64);
+        append_checkpoint_word(&mut payload, root.level as u64);
+        append_checkpoint_word(&mut payload, root.first_node as u64);
+        append_checkpoint_word(&mut payload, root.node_count as u64);
+    }
+    for (node, words) in image.nodes.iter().zip(node_words) {
+        let entry_count =
+            u64::try_from(node.entries.len()).map_err(|_| EngineError::Checkpoint(-12))?;
+        let checksum =
+            checkpoint_node_checksum(node.btree, node.level, node.page, entry_count, &words)?;
+        append_checkpoint_word(&mut payload, ENGINE_CHECKPOINT_NODE_MAGIC);
+        append_checkpoint_word(&mut payload, node.btree.as_u8() as u64);
+        append_checkpoint_word(&mut payload, node.level as u64);
+        append_checkpoint_word(&mut payload, node.page as u64);
+        append_checkpoint_word(&mut payload, entry_count);
         append_checkpoint_word(
             &mut payload,
             u64::try_from(words.len()).map_err(|_| EngineError::Checkpoint(-12))?,
         );
+        append_checkpoint_word(&mut payload, checksum.lo);
+        append_checkpoint_word(&mut payload, checksum.hi);
         for word in words {
             append_checkpoint_word(&mut payload, word);
         }
@@ -1119,57 +1856,134 @@ fn checkpoint_image_from_payload(
     {
         return Err(EngineError::Checkpoint(-2));
     }
-    let count = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
+    let root_count = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
         .map_err(|_| EngineError::Checkpoint(-2))?;
-    let mut entries = Vec::new();
-    entries
-        .try_reserve_exact(count)
-        .map_err(|_| EngineError::Checkpoint(-12))?;
+    let node_count = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
+        .map_err(|_| EngineError::Checkpoint(-2))?;
+    let remaining_words = (payload.len() - offset) / core::mem::size_of::<u64>();
+    if root_count > remaining_words / CHECKPOINT_ROOT_WORDS {
+        return Err(EngineError::Checkpoint(-2));
+    }
 
-    for _ in 0..count {
+    let mut roots = Vec::new();
+    roots
+        .try_reserve_exact(root_count)
+        .map_err(|_| EngineError::Checkpoint(-12))?;
+    for _ in 0..root_count {
         let btree_id = checkpoint_payload_word(payload, &mut offset)?;
         if btree_id > u8::MAX as u64 || btree_id as usize >= BTREE_ID_NR {
             return Err(EngineError::Checkpoint(-2));
         }
-        let key_u64s = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
-            .map_err(|_| EngineError::Checkpoint(-2))?;
-        if key_u64s < BKEY_U64S as usize
-            || key_u64s > BKEY_U64S as usize + BKEY_VAL_U64S_MAX as usize
+        let level = checkpoint_payload_word(payload, &mut offset)?;
+        let first_node = checkpoint_payload_word(payload, &mut offset)?;
+        let root_node_count = checkpoint_payload_word(payload, &mut offset)?;
+        if level > u8::MAX as u64
+            || first_node > u32::MAX as u64
+            || root_node_count > u32::MAX as u64
         {
             return Err(EngineError::Checkpoint(-2));
         }
-        let key_bytes = key_u64s
-            .checked_mul(core::mem::size_of::<u64>())
-            .ok_or(EngineError::Checkpoint(-2))?;
-        if offset
-            .checked_add(key_bytes)
-            .filter(|end| *end <= payload.len())
-            .is_none()
+        roots.push(CheckpointRoot {
+            btree: BtreeId(btree_id as u8),
+            level: level as u8,
+            first_node: first_node as u32,
+            node_count: root_node_count as u32,
+        });
+    }
+    let remaining_words = (payload.len() - offset) / core::mem::size_of::<u64>();
+    if node_count > remaining_words / CHECKPOINT_NODE_HEADER_WORDS {
+        return Err(EngineError::Checkpoint(-2));
+    }
+
+    let mut nodes = Vec::new();
+    nodes
+        .try_reserve_exact(node_count)
+        .map_err(|_| EngineError::Checkpoint(-12))?;
+    for _ in 0..node_count {
+        if checkpoint_payload_word(payload, &mut offset)? != ENGINE_CHECKPOINT_NODE_MAGIC {
+            return Err(EngineError::Checkpoint(-2));
+        }
+        let btree_id = checkpoint_payload_word(payload, &mut offset)?;
+        let level = checkpoint_payload_word(payload, &mut offset)?;
+        let page = checkpoint_payload_word(payload, &mut offset)?;
+        let entry_count = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
+            .map_err(|_| EngineError::Checkpoint(-2))?;
+        let page_words = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
+            .map_err(|_| EngineError::Checkpoint(-2))?;
+        let checksum_lo = checkpoint_payload_word(payload, &mut offset)?;
+        let checksum_hi = checkpoint_payload_word(payload, &mut offset)?;
+        if btree_id > u8::MAX as u64
+            || btree_id as usize >= BTREE_ID_NR
+            || level > u8::MAX as u64
+            || page > u32::MAX as u64
+            || entry_count == 0
+            || entry_count > page_words / (BKEY_U64S as usize)
         {
+            return Err(EngineError::Checkpoint(-2));
+        }
+        if page_words > (payload.len() - offset) / core::mem::size_of::<u64>() {
             return Err(EngineError::Checkpoint(-2));
         }
         let mut words = Vec::new();
         words
-            .try_reserve_exact(key_u64s)
+            .try_reserve_exact(page_words)
             .map_err(|_| EngineError::Checkpoint(-12))?;
-        for _ in 0..key_u64s {
+        for _ in 0..page_words {
             words.push(checkpoint_payload_word(payload, &mut offset)?);
         }
-        let raw = words.as_ptr().cast::<bkey_i>();
-        let key = unsafe {
-            if (*raw).k.u64s as usize != key_u64s
-                || (*raw).k.format != KEY_FORMAT_CURRENT
-                || (*raw).k.type_ != KEY_TYPE_cookie
+        let checksum = checkpoint_node_checksum(
+            BtreeId(btree_id as u8),
+            level as u8,
+            page as u32,
+            entry_count as u64,
+            &words,
+        )?;
+        if checksum.lo != checksum_lo || checksum.hi != checksum_hi {
+            return Err(EngineError::Checkpoint(-2));
+        }
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(entry_count)
+            .map_err(|_| EngineError::Checkpoint(-12))?;
+        let mut word_offset = 0usize;
+        for _ in 0..entry_count {
+            if words.len().saturating_sub(word_offset) < BKEY_U64S as usize {
+                return Err(EngineError::Checkpoint(-2));
+            }
+            let raw = words[word_offset..].as_ptr().cast::<bkey_i>();
+            let key_u64s = unsafe { (*raw).k.u64s as usize };
+            if key_u64s < BKEY_U64S as usize
+                || key_u64s > BKEY_U64S as usize + BKEY_VAL_U64S_MAX as usize
+                || word_offset
+                    .checked_add(key_u64s)
+                    .filter(|end| *end <= words.len())
+                    .is_none()
             {
                 return Err(EngineError::Checkpoint(-2));
             }
-            decode_key(bkey_s_c {
-                k: &(*raw).k,
-                v: &(*raw).v,
-            })
-            .map_err(|_| EngineError::Checkpoint(-2))?
-        };
-        entries.push((BtreeId(btree_id as u8), key));
+            let key = unsafe {
+                if (*raw).k.format != KEY_FORMAT_CURRENT || (*raw).k.type_ != KEY_TYPE_cookie {
+                    return Err(EngineError::Checkpoint(-2));
+                }
+                decode_key(bkey_s_c {
+                    k: &(*raw).k,
+                    v: &(*raw).v,
+                })
+                .map_err(|_| EngineError::Checkpoint(-2))?
+            };
+            entries.push(key);
+            word_offset += key_u64s;
+        }
+        if word_offset != words.len() {
+            return Err(EngineError::Checkpoint(-2));
+        }
+        nodes.push(CheckpointNode {
+            btree: BtreeId(btree_id as u8),
+            level: level as u8,
+            page: page as u32,
+            entries,
+        });
     }
     if offset != payload.len() {
         return Err(EngineError::Checkpoint(-2));
@@ -1178,7 +1992,8 @@ fn checkpoint_image_from_payload(
     let image = CheckpointImage {
         sequence: expected_sequence,
         generation: expected_generation,
-        entries,
+        roots,
+        nodes,
     };
     validate_checkpoint_image(&image)?;
     Ok(image)
@@ -1516,12 +2331,52 @@ unsafe fn configure_persistent_journal(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        fs,
+        os::unix::fs::FileExt,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{atomic::AtomicU64, Arc},
+        time::Duration,
+    };
 
     use super::*;
 
     fn key(offset: u64, value: &[u64]) -> BtreeKey {
         BtreeKey::new(KeyPosition::new(1, offset, 0), value.to_vec()).unwrap()
+    }
+
+    static TEST_FILE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    fn persistent_test_path(label: &str) -> PathBuf {
+        let nonce = TEST_FILE_NONCE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        std::env::temp_dir().join(format!("subvol-{label}-{}-{nonce}", std::process::id(),))
+    }
+
+    fn clear_journal_region(path: &Path) {
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        let zeros = vec![0; JOURNAL_BUCKETS as usize * JOURNAL_BUCKET_SIZE as usize * 512];
+        let offset = JOURNAL_BUCKET_START * JOURNAL_BUCKET_SIZE as u64 * 512;
+        assert_eq!(file.write_at(&zeros, offset).unwrap(), zeros.len());
+        file.sync_all().unwrap();
+    }
+
+    fn newest_checkpoint_slot(path: &Path) -> (usize, CheckpointSlot) {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let file_len = file.metadata().unwrap().len();
+        (0..CHECKPOINT_HEADER_SLOTS)
+            .filter_map(|index| unsafe {
+                read_checkpoint_slot(&file, file_len, index)
+                    .unwrap()
+                    .map(|(slot, _)| (index, slot))
+            })
+            .max_by_key(|(_, slot)| (slot.generation, slot.sequence))
+            .expect("checkpoint slot was published")
     }
 
     #[test]
@@ -1886,6 +2741,273 @@ mod tests {
                 model.values().cloned().collect::<Vec<_>>()
             );
             recovered.verify(BtreeId::DEFAULT).unwrap();
+        }
+    }
+
+    #[test]
+    fn durability_api_and_metrics_report_the_committed_boundary() {
+        let engine = StorageEngine::new().unwrap();
+        let mut transaction = engine.transaction();
+        transaction.put(BtreeId::DEFAULT, key(401, &[1, 2, 3]));
+        let durable = transaction.commit_sync().unwrap();
+        assert_ne!(durable.journal_sequence_ondisk, 0);
+        assert_eq!(durable.checkpoint_generation, 0);
+
+        let before = engine.metrics().unwrap();
+        assert_eq!(before.checkpoint.generation, 0);
+        assert_ne!(before.journal_records, 0);
+
+        let checkpoint = engine.checkpoint_sync().unwrap();
+        assert_ne!(checkpoint.checkpoint_generation, 0);
+        let after = engine.metrics().unwrap();
+        assert_eq!(
+            after.checkpoint.generation,
+            checkpoint.checkpoint_generation
+        );
+        assert_eq!(after.checkpoint.key_count, 1);
+        assert_eq!(engine.durable_journal().unwrap().checkpoint_node_count(), 1);
+    }
+
+    #[test]
+    fn high_watermark_kicks_background_reclaim_and_preserves_the_tail() {
+        let engine = StorageEngine::new().unwrap();
+        engine.put_sync(BtreeId::DEFAULT, key(410, &[1])).unwrap();
+        let before = engine.reclaim_status().unwrap();
+        {
+            let fs = engine.lock_fs().unwrap();
+            fs.journal.flags.fetch_or(
+                1usize << crate::journal::JOURNAL_med_on_space,
+                std::sync::atomic::Ordering::AcqRel,
+            );
+        }
+
+        /* commit_operations() observes the watermark after its transaction
+         * path completes, just as a journal producer kicks the C reclaimer. */
+        engine.put(BtreeId::DEFAULT, key(411, &[2, 3])).unwrap();
+        let status = engine.wait_for_reclaim(Duration::from_secs(1)).unwrap();
+        assert!(status.requested > before.requested);
+        assert!(status.completed >= status.requested);
+        assert_eq!(status.last_error, None);
+        assert_ne!(engine.metrics().unwrap().checkpoint.generation, 0);
+        assert_eq!(
+            engine.scan(BtreeId::DEFAULT).unwrap(),
+            vec![key(410, &[1]), key(411, &[2, 3])]
+        );
+    }
+
+    #[test]
+    fn checkpoint_pages_are_cow_and_corrupt_page_falls_back_to_prior_root() {
+        let path = persistent_test_path("checkpoint-cow-pages");
+        {
+            let engine = StorageEngine::create_persistent(&path).unwrap();
+            for batch in 0..2u64 {
+                let mut transaction = engine.transaction();
+                for offset in 0..16u64 {
+                    let offset = batch * 16 + offset;
+                    transaction.put(
+                        BtreeId::DEFAULT,
+                        key(
+                            500 + offset,
+                            &[offset, offset.wrapping_add(1), offset.wrapping_add(2)],
+                        ),
+                    );
+                }
+                transaction.commit().unwrap();
+            }
+            engine.sync().unwrap();
+            let first = engine.checkpoint_sync().unwrap();
+            assert!(first.checkpoint_generation >= 1);
+            assert!(engine.read_transaction().checkpoint().node_count > 1);
+
+            engine
+                .put_sync(BtreeId::DEFAULT, key(900, &[0xfeed, 0xbeef]))
+                .unwrap();
+            engine.checkpoint_sync().unwrap();
+        }
+
+        let (slot_index, slot) = newest_checkpoint_slot(&path);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut payload = vec![0; usize::try_from(slot.bytes).unwrap()];
+        read_exact_at(&file, &mut payload, slot.offset).unwrap();
+        let first_page_word = (CHECKPOINT_PAYLOAD_HEADER_WORDS
+            + CHECKPOINT_ROOT_WORDS
+            + CHECKPOINT_NODE_HEADER_WORDS)
+            * core::mem::size_of::<u64>();
+        payload[first_page_word] ^= 0x80;
+
+        /* Rewrite the whole-payload checksum and header: recovery must still
+         * reject the image through the immutable page checksum, then select
+         * the alternate COW root. */
+        let checksum = crate::checksum::bch2_checksum(crate::checksum::BCH_CSUM_xxhash, &payload);
+        write_all_at(&file, &payload, slot.offset).unwrap();
+        write_all_at(
+            &file,
+            &checkpoint_header(slot, checksum),
+            checkpoint_slot_offset(slot_index),
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        clear_journal_region(&path);
+
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        assert_eq!(recovered.scan(BtreeId::DEFAULT).unwrap().len(), 32);
+        assert!(recovered
+            .get(BtreeId::DEFAULT, KeyPosition::new(1, 900, 0))
+            .unwrap()
+            .is_none());
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_journal_tail_never_overrides_a_valid_checkpoint_base() {
+        let path = persistent_test_path("corrupt-journal-tail");
+        {
+            let engine = StorageEngine::create_persistent(&path).unwrap();
+            engine.put_sync(BtreeId::DEFAULT, key(600, &[1])).unwrap();
+            engine.checkpoint_sync().unwrap();
+            engine
+                .inject_fault(FaultPoint::CheckpointWrite, u32::MAX)
+                .unwrap();
+            engine.put_sync(BtreeId::DEFAULT, key(601, &[2])).unwrap();
+        }
+
+        clear_journal_region(&path);
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        let journal_start = JOURNAL_BUCKET_START * JOURNAL_BUCKET_SIZE as u64 * 512;
+        assert_eq!(file.write_at(&[0xa5; 64], journal_start).unwrap(), 64);
+        file.sync_all().unwrap();
+        drop(file);
+
+        match StorageEngine::open_persistent(&path) {
+            Ok(recovered) => {
+                assert_eq!(
+                    recovered
+                        .get(BtreeId::DEFAULT, KeyPosition::new(1, 600, 0))
+                        .unwrap(),
+                    Some(key(600, &[1]))
+                );
+                assert!(recovered
+                    .get(BtreeId::DEFAULT, KeyPosition::new(1, 601, 0))
+                    .unwrap()
+                    .is_none());
+            }
+            Err(EngineError::Journal(_)) => {}
+            Err(error) => panic!("unexpected corrupted-journal result: {error}"),
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_rcu_read_transactions_and_writers_keep_iterator_order() {
+        let engine = Arc::new(StorageEngine::new().unwrap());
+        let mut workers = Vec::new();
+
+        for writer in 0..4u64 {
+            let engine = Arc::clone(&engine);
+            workers.push(std::thread::spawn(move || {
+                for offset in 0..24u64 {
+                    engine
+                        .put(
+                            BtreeId::DEFAULT,
+                            BtreeKey::new(
+                                KeyPosition::new(writer + 1, offset + 1, 0),
+                                vec![writer, offset],
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                }
+                engine.sync().unwrap();
+            }));
+        }
+        for _ in 0..3 {
+            let engine = Arc::clone(&engine);
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..32 {
+                    let reader = engine.read_transaction();
+                    let _ = reader.checkpoint();
+                    let keys = reader.scan(BtreeId::DEFAULT).unwrap();
+                    assert!(keys
+                        .windows(2)
+                        .all(|pair| pair[0].position() < pair[1].position()));
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        engine.sync().unwrap();
+        assert_eq!(engine.scan(BtreeId::DEFAULT).unwrap().len(), 96);
+        engine.verify(BtreeId::DEFAULT).unwrap();
+    }
+
+    #[test]
+    fn process_crash_child() {
+        let Ok(path) = std::env::var("SUBVOL_ENGINE_CRASH_PATH") else {
+            return;
+        };
+        let ready = std::env::var("SUBVOL_ENGINE_CRASH_READY").unwrap();
+        let phase = std::env::var("SUBVOL_ENGINE_CRASH_PHASE").unwrap();
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        match phase.as_str() {
+            "journal" => {
+                engine.put_sync(BtreeId::DEFAULT, key(701, &[1])).unwrap();
+            }
+            "checkpoint" => {
+                engine.put_sync(BtreeId::DEFAULT, key(702, &[2])).unwrap();
+                engine.checkpoint_sync().unwrap();
+            }
+            "tail" => {
+                engine.put_sync(BtreeId::DEFAULT, key(703, &[3])).unwrap();
+                engine.checkpoint_sync().unwrap();
+                engine.put_sync(BtreeId::DEFAULT, key(704, &[4])).unwrap();
+            }
+            _ => panic!("unknown crash phase {phase}"),
+        }
+        fs::write(ready, b"durable-before-abort").unwrap();
+        std::process::abort();
+    }
+
+    fn run_crash_child(path: &Path, phase: &str) {
+        let ready = path.with_extension("ready");
+        let _ = fs::remove_file(&ready);
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::tests::process_crash_child",
+                "--nocapture",
+            ])
+            .env("SUBVOL_ENGINE_CRASH_PATH", path)
+            .env("SUBVOL_ENGINE_CRASH_READY", &ready)
+            .env("SUBVOL_ENGINE_CRASH_PHASE", phase)
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert!(ready.exists());
+        fs::remove_file(ready).unwrap();
+    }
+
+    #[test]
+    fn process_abort_recovery_observes_only_durable_boundaries() {
+        for (phase, expected) in [
+            ("journal", vec![key(701, &[1])]),
+            ("checkpoint", vec![key(702, &[2])]),
+            ("tail", vec![key(703, &[3]), key(704, &[4])]),
+        ] {
+            let path = persistent_test_path(&format!("process-crash-{phase}"));
+            run_crash_child(&path, phase);
+            let recovered = StorageEngine::open_persistent(&path).unwrap();
+            assert_eq!(recovered.scan(BtreeId::DEFAULT).unwrap(), expected);
+            recovered.verify(BtreeId::DEFAULT).unwrap();
+            drop(recovered);
+            fs::remove_file(path).unwrap();
         }
     }
 }

@@ -18,7 +18,9 @@ impl Default for rcu_head {
     }
 }
 
-#[link(name = "urcu")]
+/* Keep the raw callback/head API needed by the bcachefs-shaped rhashtable on
+ * the same liburcu memb implementation used by the safe `urcu` crate. */
+#[link(name = "urcu-memb")]
 unsafe extern "C" {
     fn urcu_memb_init();
     fn urcu_memb_register_thread();
@@ -31,11 +33,30 @@ unsafe extern "C" {
 
 thread_local! {
     static READ_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static EXTERNAL_REGISTRATION_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/* `urcu::RcuThread` owns registration for engine read transactions.  The raw
+ * bcachefs-shaped hash/iterator code may enter a short nested read section;
+ * this bridge keeps it from registering the same userspace-RCU thread twice. */
+pub(crate) fn rcu_external_registration_enter() {
+    EXTERNAL_REGISTRATION_DEPTH.with(|depth| depth.set(depth.get() + 1));
+}
+
+pub(crate) fn rcu_external_registration_exit() {
+    EXTERNAL_REGISTRATION_DEPTH.with(|depth| {
+        debug_assert!(depth.get() != 0);
+        depth.set(depth.get() - 1);
+    });
+}
+
+fn rcu_external_registration_active() -> bool {
+    EXTERNAL_REGISTRATION_DEPTH.with(|depth| depth.get() != 0)
 }
 
 pub fn rcu_read_lock() {
     READ_DEPTH.with(|depth| {
-        if depth.get() == 0 {
+        if depth.get() == 0 && !rcu_external_registration_active() {
             unsafe {
                 urcu_memb_init();
                 urcu_memb_register_thread();
@@ -51,7 +72,7 @@ pub fn rcu_read_unlock() {
         debug_assert!(depth.get() != 0);
         unsafe { urcu_memb_read_unlock() };
         depth.set(depth.get() - 1);
-        if depth.get() == 0 {
+        if depth.get() == 0 && !rcu_external_registration_active() {
             unsafe { urcu_memb_unregister_thread() };
         }
     });
