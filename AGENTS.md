@@ -4,7 +4,7 @@
 bcachefs 风格的 btree、transaction 和 journal 设计。该核心作为 Rust
 存储引擎使用，暂不追求完整 bcachefs 文件系统兼容。
 
-- 本地 `/home/black/Documents/bcachefs-tools` 仅作为 bcachefs 语义、布局和
+- 本地 `/home/black/Documents/bcachefs-tools/fs` 仅作为 bcachefs 语义、布局和
   边界行为的对照依据，不作为运行时依赖。
 - 近期只保证单一数据格式版本，不实现旧格式迁移和多版本兼容。
 - 交付重点是 btree 操作正确性、事务一致性、journal 持久化与恢复，以及

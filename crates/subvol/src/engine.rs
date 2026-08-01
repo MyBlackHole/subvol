@@ -12,10 +12,7 @@ use std::{
     io,
     ops::{Deref, DerefMut},
     path::Path,
-    sync::{
-        atomic::Ordering,
-        Arc, Condvar, Mutex, MutexGuard, Weak,
-    },
+    sync::{atomic::Ordering, Arc, Condvar, Mutex, MutexGuard, Weak},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -34,7 +31,8 @@ use crate::{
         iter::{
             bch2_btree_iter_next, bch2_btree_iter_peek, bch2_btree_iter_traverse, bch2_trans_begin,
             bch2_trans_init, bch2_trans_iter_exit, bch2_trans_iter_init, bch2_trans_put,
-            btree_iter, btree_trans, BTREE_ITER_intent, BTREE_ITER_not_extents,
+            btree_iter, btree_trans, BTREE_ITER_all_snapshots, BTREE_ITER_intent,
+            BTREE_ITER_not_extents, BTREE_ITER_snapshot_field,
         },
         types::{
             bch2_btree_id_root_b, bch_fs, clear_btree_node_fake, clear_btree_node_need_rewrite,
@@ -819,6 +817,11 @@ impl StorageEngine {
                  * header, never its separately allocated key buffer. */
                 let mut staged_keys = Vec::with_capacity(operations.len());
                 let mut ret = 0;
+                crate::rewrite_log_debug!(
+                    "transaction round begin ops={} restarted={}",
+                    operations.len(),
+                    trans.restarted
+                );
                 for operation in operations {
                     let (btree, position, deleted, value) = match operation {
                         TransactionOperation::Put { btree, key } => {
@@ -828,6 +831,13 @@ impl StorageEngine {
                             (*btree, *position, true, &[] as &[u64])
                         }
                     };
+                    crate::rewrite_log_debug!(
+                        "transaction op inode={} offset={} snap={} deleted={}",
+                        position.inode,
+                        position.offset,
+                        position.snapshot,
+                        deleted
+                    );
                     staged_keys.push(encode_key(position, value, deleted));
                     let raw = staged_keys
                         .last_mut()
@@ -848,15 +858,21 @@ impl StorageEngine {
                         ret = bch2_trans_update(&mut trans, &mut iter, raw, 0);
                     }
                     bch2_trans_iter_exit(&mut iter);
+                    crate::rewrite_log_debug!("transaction op staged ret={ret}");
                     if ret != 0 {
                         break;
                     }
                 }
                 if ret == 0 {
                     ret = bch2_trans_commit(&mut trans);
+                    crate::rewrite_log_debug!("transaction commit ret={ret}");
                 }
 
                 if ret == -4 {
+                    crate::rewrite_log_debug!(
+                        "transaction restart nr_updates={}",
+                        trans.nr_updates
+                    );
                     /* The local commit/replay loops begin a fresh transaction
                      * before retraversing every iterator path.  Do this while
                      * the old key buffers are still alive. */
@@ -1177,7 +1193,16 @@ unsafe fn scan_locked(fs: &mut bch_fs, btree: BtreeId) -> Result<Vec<BtreeKey>, 
         &mut iter,
         btree.as_u8(),
         POS_MIN,
-        BTREE_ITER_not_extents,
+        /* Full-tree scan: every key carries an explicit snapshot field
+         * (KeyPosition), so traversal must enumerate all snapshots.
+         * Without all_snapshots the iterator's advance() jumps to the
+         * next nosnap position (bpos_nosnap_successor) and skips keys
+         * that share (inode, offset) across snapshots — matching
+         * bcachefs's filtered traversal.  The explicit snapshot_field
+         * flag keeps all_snapshots from being normalized away in
+         * bch2_btree_iter_flags() when the btree id reports no
+         * snapshot field. */
+        BTREE_ITER_not_extents | BTREE_ITER_snapshot_field | BTREE_ITER_all_snapshots,
     );
 
     let mut output = Vec::new();
@@ -1195,6 +1220,12 @@ unsafe fn scan_locked(fs: &mut bch_fs, btree: BtreeId) -> Result<Vec<BtreeKey>, 
                 Ok(key) => key,
                 Err(error) => break Err(error),
             };
+            crate::rewrite_log_debug!(
+                "scan visit ({},{},{})",
+                key.position().inode,
+                key.position().offset,
+                key.position().snapshot,
+            );
             if output
                 .last()
                 .is_some_and(|previous: &BtreeKey| previous.position() >= key.position())

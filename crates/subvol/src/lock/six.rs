@@ -221,6 +221,14 @@ fn __do_six_trylock(
             Ok(_) => {
                 assert_ne!(lock.state.load(Ordering::Relaxed) & held_mask(lock_type), 0);
                 six_set_owner(lock, lock_type, old, task);
+                if lock_type == six_lock_type::SIX_LOCK_read {
+                    let node = (lock as *const six_lock as usize)
+                        - core::mem::offset_of!(super::super::btree::types::btree, c.lock);
+                    crate::rewrite_log_debug!(
+                        "six read acquire node={node:#x} count={}",
+                        lock.state.load(Ordering::Relaxed) & SIX_LOCK_HELD_READ
+                    );
+                }
                 return true;
             }
             Err(new_old) => old = new_old,
@@ -373,6 +381,14 @@ fn do_six_unlock_type(lock: &six_lock, lock_type: six_lock_type) {
 
     assert_ne!(lock.state.load(Ordering::Relaxed) & held_mask(lock_type), 0);
     let state = lock.state.fetch_sub(v, Ordering::Release).wrapping_sub(v);
+    if lock_type == six_lock_type::SIX_LOCK_read {
+        let node = (lock as *const six_lock as usize)
+            - core::mem::offset_of!(super::super::btree::types::btree, c.lock);
+        crate::rewrite_log_debug!(
+            "six read release node={node:#x} count={}",
+            state & SIX_LOCK_HELD_READ
+        );
+    }
     six_lock_wakeup(lock, state, unlock_wakeup(lock_type));
 }
 
@@ -558,6 +574,12 @@ pub fn six_lock_increment(lock: &six_lock, lock_type: six_lock_type) {
                 0
             );
             lock.state.fetch_add(lock_val(lock_type), Ordering::Relaxed);
+            let node = (lock as *const six_lock as usize)
+                - core::mem::offset_of!(super::super::btree::types::btree, c.lock);
+            crate::rewrite_log_debug!(
+                "six read increment node={node:#x} count={}",
+                lock.state.load(Ordering::Relaxed) & SIX_LOCK_HELD_READ
+            );
         }
         six_lock_type::SIX_LOCK_write => {
             lock.write_lock_recurse.fetch_add(1, Ordering::Relaxed);

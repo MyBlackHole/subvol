@@ -426,9 +426,7 @@ pub unsafe fn bch2_btree_node_data_free(b: *mut btree) {
     }
 }
 
-pub unsafe fn __bch2_btree_node_mem_alloc(
-    c: *mut super::types::bch_fs,
-) -> *mut btree {
+pub unsafe fn __bch2_btree_node_mem_alloc(c: *mut super::types::bch_fs) -> *mut btree {
     if c.is_null() || (*c).disk_sb.sb.is_null() {
         return core::ptr::null_mut();
     }
@@ -468,8 +466,7 @@ pub unsafe fn __bch2_btree_node_mem_alloc(
     super::types::INIT_LIST_HEAD(&mut node.write_blocked);
     super::bset_build::bch2_btree_keys_init(&mut *node);
     let node = Box::into_raw(node);
-    (*c)
-        .btree
+    (*c).btree
         .cache
         .allocations
         .lock()
@@ -668,10 +665,7 @@ pub unsafe fn bch2_btree_node_mem_alloc(
     node
 }
 
-pub unsafe fn bch2_btree_node_evict(
-    trans: *mut btree_trans,
-    key: *const super::bkey::bkey_i,
-) {
+pub unsafe fn bch2_btree_node_evict(trans: *mut btree_trans, key: *const super::bkey::bkey_i) {
     if trans.is_null() || (*trans).c.is_null() || key.is_null() {
         return;
     }
@@ -856,7 +850,10 @@ mod tests {
             assert!(!(*node).data.is_null());
             assert!(!(*node).aux_data.is_null());
             assert_eq!((*node).key.k.type_, KEY_TYPE_btree_ptr_v2);
-            assert_eq!((*node).cache_state, btree_node_cache_state::BTREE_NODE_CACHE_NONE);
+            assert_eq!(
+                (*node).cache_state,
+                btree_node_cache_state::BTREE_NODE_CACHE_NONE
+            );
             bch2_btree_node_mem_free(&mut c, node);
             bch2_free_super(&mut c.disk_sb);
         }
@@ -888,7 +885,10 @@ mod tests {
             );
             let hash = (*node).hash_val;
             bch2_btree_node_evict(&mut trans, &(*node).key);
-            assert_eq!((*node).cache_state, btree_node_cache_state::BTREE_NODE_CACHE_FREED);
+            assert_eq!(
+                (*node).cache_state,
+                btree_node_cache_state::BTREE_NODE_CACHE_FREED
+            );
             let mut live = 0;
             assert!(bch2_btree_evicted_size_lookup(&mut c, hash, &mut live));
             assert_eq!(live, 0);
@@ -920,13 +920,8 @@ mod tests {
                 ),
                 0
             );
-            let got = super::super::io::bch2_btree_node_get_noiter(
-                &mut trans,
-                &(*node).key,
-                0,
-                0,
-                true,
-            );
+            let got =
+                super::super::io::bch2_btree_node_get_noiter(&mut trans, &(*node).key, 0, 0, true);
             assert_eq!(got, node);
             assert_eq!(crate::lock::six::six_lock_counts(&(*node).c.lock).n[0], 1);
             crate::lock::six::six_unlock_read(&(*node).c.lock);

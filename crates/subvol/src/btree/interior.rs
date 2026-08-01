@@ -348,6 +348,35 @@ unsafe fn btree_node_reset_sib_u64s(b: *mut btree) {
     };
 }
 
+unsafe fn bch2_btree_node_lock_write(trans: *mut super::iter::btree_trans, b: *mut btree) -> i32 {
+    let level = (*b).c.level as usize;
+    /* bcachefs fs/btree/locking.c bch2_btree_node_lock_write():
+     * six_unlock() 在 reader 计数归零前不会唤醒写者，因此获取
+     * write 锁前必须先释放本事务内所有路径对该节点的 read 锁
+     * （bch2_btree_node_lock_counts() + six_lock_readers_add(-readers)），
+     * 获取成功后再恢复，避免自身路径的 read 锁永久阻塞 write。 */
+    let mut readers = 0u32;
+    for pid in 1..super::iter::BTREE_ITER_INITIAL {
+        if (*trans).paths_allocated & (1u64 << pid) == 0 {
+            continue;
+        }
+        let p = (*trans).paths.add(pid);
+        if (*p).l[level].b == b
+            && super::iter::btree_node_locked_type(p, level) == super::iter::BTREE_NODE_READ_LOCKED
+        {
+            readers += 1;
+        }
+    }
+    if readers > 0 {
+        crate::lock::six::six_lock_readers_add(&(*b).c.lock, -(readers as i32));
+    }
+    let ret = crate::lock::six::six_lock_write(&(*b).c.lock);
+    if readers > 0 {
+        crate::lock::six::six_lock_readers_add(&(*b).c.lock, readers as i32);
+    }
+    ret
+}
+
 pub(crate) unsafe fn bch2_btree_split_leaf(
     trans: *mut super::iter::btree_trans,
     path_idx: super::iter::btree_path_idx_t,
@@ -728,9 +757,16 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         } else {
             core::ptr::null_mut()
         };
+        crate::rewrite_log_debug!(
+            "btree split up-level old_level={} parent_level={} parent_null={}",
+            (*old_node).c.level,
+            parent_level,
+            parent.is_null()
+        );
         let old_pos = (*(*old_node).data).max_key;
 
         if parent.is_null() {
+            crate::rewrite_log_debug!("btree split making new root");
             if parent_level >= super::bset::BTREE_MAX_DEPTH as usize {
                 release_paths(&replacement_paths);
                 for node in replacement {
@@ -832,14 +868,39 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         let required = if old_writeable { 10 } else { 20 };
 
         if bch2_btree_node_insert_fits(parent, required) {
-            if crate::lock::six::six_lock_write(&(*old_node).c.lock) != 0 {
+            crate::rewrite_log_debug!("btree split fits in parent");
+            crate::rewrite_log_debug!(
+                "btree split locks old_node: {:?} parent: {:?}",
+                crate::lock::six::six_lock_counts(&(*old_node).c.lock),
+                crate::lock::six::six_lock_counts(&(*parent).c.lock)
+            );
+            crate::rewrite_log_debug!("btree split lock old_node write");
+            if bch2_btree_node_lock_write(trans, old_node) != 0 {
                 release_paths(&replacement_paths);
                 for node in replacement {
                     release_node(node);
                 }
                 return -10;
             }
-            if crate::lock::six::six_lock_write(&(*parent).c.lock) != 0 {
+            crate::rewrite_log_debug!("btree split lock parent write");
+            for pid in 1..super::iter::BTREE_ITER_INITIAL {
+                if (*trans).paths_allocated & (1u64 << pid) == 0 {
+                    continue;
+                }
+                let p = (*trans).paths.add(pid);
+                let l0 = (*p).nodes_locked & 3;
+                let pos = core::ptr::addr_of!((*p).pos).read_unaligned();
+                let l0b = core::ptr::addr_of!((*p).l[0].b).read_unaligned();
+                let l1b = core::ptr::addr_of!((*p).l[1].b).read_unaligned();
+                let inode = core::ptr::addr_of!(pos.inode).read_unaligned();
+                let offset = core::ptr::addr_of!(pos.offset).read_unaligned();
+                let snapshot = core::ptr::addr_of!(pos.snapshot).read_unaligned();
+                crate::rewrite_log_debug!(
+                    "btree split path#{pid} pos=({inode},{offset},{snapshot}) locks=0x{l0:x} l0b={l0b:p} l1b={l1b:p} ref={}",
+                    (*p).ref_
+                );
+            }
+            if bch2_btree_node_lock_write(trans, parent) != 0 {
                 crate::lock::six::six_unlock_write(&(*old_node).c.lock);
                 release_paths(&replacement_paths);
                 for node in replacement {

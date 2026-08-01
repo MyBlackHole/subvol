@@ -978,8 +978,7 @@ mod tests {
         use std::os::unix::fs::FileExt;
 
         unsafe {
-            let path = std::env::temp_dir()
-                .join(format!("subvol-super-{}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("subvol-super-{}", std::process::id()));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -1051,10 +1050,7 @@ mod tests {
         use std::os::unix::fs::FileExt;
 
         unsafe {
-            let path = std::env::temp_dir().join(format!(
-                "subvol-backups-{}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir().join(format!("subvol-backups-{}", std::process::id()));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)

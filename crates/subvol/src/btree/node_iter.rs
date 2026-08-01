@@ -66,6 +66,28 @@ pub unsafe fn bch2_bkey_cmp_packed(
     } else {
         let mut unpacked = bkey::default();
         let (l, r) = if bkey_packed(&*l) {
+            if unsafe { (*l).format } & 0x7f != super::bkey::KEY_FORMAT_LOCAL_BTREE {
+                let bset_u64s = unsafe { (*(*b).data).keys.u64s };
+                let set0 = unsafe { &*(*b).set.as_ptr() };
+                let data_off = (l as usize).wrapping_sub(unsafe { (*b).data as usize });
+                let words = unsafe {
+                    core::slice::from_raw_parts(
+                        ((*b).data as *const u64).add(set0.data_offset as usize),
+                        78,
+                    )
+                };
+                crate::rewrite_log_error!(
+                    "cmp_packed bad key: b={b:p} data={:p} byte_order={} id={} level={} key={l:p} key_off_from_data={data_off:#x} set0_do={} set0_eo={} set0_sz={} set0_u64s={bset_u64s} at_l={:#x} words={words:x?}",
+                    unsafe { (*b).data },
+                    unsafe { (*b).byte_order },
+                    unsafe { (*b).c.btree_id },
+                    unsafe { (*b).c.level },
+                    set0.data_offset,
+                    set0.end_offset,
+                    set0.size,
+                    (l as *const u64).read_unaligned(),
+                );
+            }
             __bch2_bkey_unpack_key(&(*b).format, &mut unpacked, &*l);
             (&unpacked as *const bkey, r as *const bkey)
         } else if bkey_packed(&*r) {
@@ -228,6 +250,35 @@ pub unsafe fn bch2_btree_node_iter_init(
         }
     }
     bch2_btree_node_iter_sort(iter, b);
+    let (si, so, ss) = unsafe {
+        (
+            core::ptr::addr_of!((*search).inode).read_unaligned(),
+            core::ptr::addr_of!((*search).offset).read_unaligned(),
+            core::ptr::addr_of!((*search).snapshot).read_unaligned(),
+        )
+    };
+    let kk = bch2_btree_node_iter_peek_all(iter, b);
+    if !kk.is_null() {
+        let kpos = bkey_unpack_pos(b, kk);
+        let (ki, ko, ks) = unsafe {
+            (
+                core::ptr::addr_of!(kpos.inode).read_unaligned(),
+                core::ptr::addr_of!(kpos.offset).read_unaligned(),
+                core::ptr::addr_of!(kpos.snapshot).read_unaligned(),
+            )
+        };
+        crate::rewrite_log_debug!(
+            "node_iter_init b={b:p} L{} search=({si},{so},{ss}) -> pk=({ki},{ko},{ks})t{} off={:#x}",
+            (*b).c.level,
+            (*kk).type_,
+            (kk as usize).wrapping_sub((*b).data as usize),
+        );
+    } else {
+        crate::rewrite_log_debug!(
+            "node_iter_init b={b:p} L{} search=({si},{so},{ss}) -> END",
+            (*b).c.level,
+        );
+    }
 }
 
 pub unsafe fn __bch2_btree_node_iter_peek_all(
@@ -412,6 +463,9 @@ pub unsafe fn bch2_btree_node_iter_fix(
             continue;
         }
         let linked = (*trans).paths.add(idx);
+        if (*linked).l[level].b != b {
+            continue;
+        }
         __bch2_btree_node_iter_fix(
             linked,
             b,

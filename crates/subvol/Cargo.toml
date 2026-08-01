@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 urcu = "0.0.4"
+
+[dev-dependencies]
+proptest = "1"

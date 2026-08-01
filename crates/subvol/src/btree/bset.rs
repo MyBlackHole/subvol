@@ -1,8 +1,6 @@
 use super::bkey::{
-    bch_val, bkey, bkey_format, bkey_i, bkey_s, bkey_s_c, bkey_start_offset,
-    bkey_start_pos,
-    bkey_val_bytes, bkey_val_u64s, bpos, bpos_ge, bpos_gt, bpos_le, bpos_lt,
-    set_bkey_val_u64s,
+    bch_val, bkey, bkey_format, bkey_i, bkey_s, bkey_s_c, bkey_start_offset, bkey_start_pos,
+    bkey_val_bytes, bkey_val_u64s, bpos, bpos_ge, bpos_gt, bpos_le, bpos_lt, set_bkey_val_u64s,
 };
 
 pub const BTREE_MAX_DEPTH: u8 = 4;
@@ -37,10 +35,7 @@ pub const fn dev_mask_nr(devs: &bch_devs_mask) -> u32 {
     ret
 }
 
-pub unsafe fn bch2_dev_idx_is_online(
-    c: *const super::types::bch_fs,
-    dev: u32,
-) -> bool {
+pub unsafe fn bch2_dev_idx_is_online(c: *const super::types::bch_fs, dev: u32) -> bool {
     let word = (dev as usize) / usize::BITS as usize;
     let bit = (dev as usize) % usize::BITS as usize;
     ((*c).devs_online.d[word] & (1usize << bit)) != 0
@@ -166,11 +161,10 @@ pub const BCH_EXTENT_ENTRY_reconcile: u8 = 7;
 pub const BCH_EXTENT_ENTRY_reconcile_bp: u8 = 8;
 pub const BCH_EXTENT_ENTRY_MAX: u8 = 9;
 pub const BCH_REPLICAS_MAX: u32 = 4;
-pub const BKEY_EXTENT_PTR_U64S_MAX: u32 =
-    ((core::mem::size_of::<bch_extent_crc128>() + core::mem::size_of::<bch_extent_ptr>()) / 8)
-        as u32;
-pub const BKEY_EXTENT_VAL_U64S_MAX: u32 =
-    5 + BKEY_EXTENT_PTR_U64S_MAX * (BCH_REPLICAS_MAX * 2 + 1);
+pub const BKEY_EXTENT_PTR_U64S_MAX: u32 = ((core::mem::size_of::<bch_extent_crc128>()
+    + core::mem::size_of::<bch_extent_ptr>())
+    / 8) as u32;
+pub const BKEY_EXTENT_VAL_U64S_MAX: u32 = 5 + BKEY_EXTENT_PTR_U64S_MAX * (BCH_REPLICAS_MAX * 2 + 1);
 
 pub static bch_crc_bytes: [u8; 8] = [0, 4, 8, 10, 16, 4, 8, 8];
 
@@ -180,9 +174,7 @@ pub const fn extent_entry_u64s_known(type_: u8) -> u32 {
         BCH_EXTENT_ENTRY_crc32 => (core::mem::size_of::<bch_extent_crc32>() / 8) as u32,
         BCH_EXTENT_ENTRY_crc64 => (core::mem::size_of::<bch_extent_crc64>() / 8) as u32,
         BCH_EXTENT_ENTRY_crc128 => (core::mem::size_of::<bch_extent_crc128>() / 8) as u32,
-        BCH_EXTENT_ENTRY_stripe_ptr => {
-            (core::mem::size_of::<bch_extent_stripe_ptr>() / 8) as u32
-        }
+        BCH_EXTENT_ENTRY_stripe_ptr => (core::mem::size_of::<bch_extent_stripe_ptr>() / 8) as u32,
         BCH_EXTENT_ENTRY_rebalance_v1 => 1,
         BCH_EXTENT_ENTRY_flags => (core::mem::size_of::<bch_extent_flags>() / 8) as u32,
         BCH_EXTENT_ENTRY_reconcile => (core::mem::size_of::<bch_extent_reconcile>() / 8) as u32,
@@ -217,7 +209,9 @@ pub unsafe fn extent_entry_next(
     c: *const super::types::bch_fs,
     entry: *const bch_extent_entry,
 ) -> *const bch_extent_entry {
-    (entry.cast::<u8>()).add(extent_entry_bytes(c, entry)).cast()
+    (entry.cast::<u8>())
+        .add(extent_entry_bytes(c, entry))
+        .cast()
 }
 
 /// Matches bcachefs `extent_entry_next_safe()`.
@@ -267,7 +261,9 @@ pub unsafe fn extent_entry_drop(
     let entry_u64 = entry.cast::<u64>();
     let next_u64 = next.cast::<u64>();
     core::ptr::copy(next_u64, entry_u64, end.offset_from(next_u64) as usize);
-    (*k.k).u64s = (*k.k).u64s.wrapping_sub(next_u64.offset_from(entry_u64) as u8);
+    (*k.k).u64s = (*k.k)
+        .u64s
+        .wrapping_sub(next_u64.offset_from(entry_u64) as u8);
 }
 
 pub unsafe fn bch2_bkey_extent_entry_drop_s(
@@ -282,9 +278,7 @@ pub unsafe fn bch2_bkey_extent_entry_drop_s(
         entry.cast::<u64>(),
         end.cast::<u64>().offset_from(next.cast::<u64>()) as usize,
     );
-    (*k.k).u64s = (*k.k)
-        .u64s
-        .wrapping_sub(extent_entry_u64s(c, entry) as u8);
+    (*k.k).u64s = (*k.k).u64s.wrapping_sub(extent_entry_u64s(c, entry) as u8);
 }
 
 pub unsafe fn bch2_bkey_extent_entry_drop(
@@ -561,9 +555,7 @@ pub unsafe fn bch2_extent_crc_append(
         && new.nonce <= CRC32_NONCE_MAX
     {
         BCH_EXTENT_ENTRY_crc32
-    } else if bytes <= 10
-        && new.uncompressed_size <= CRC64_SIZE_MAX
-        && new.nonce <= CRC64_NONCE_MAX
+    } else if bytes <= 10 && new.uncompressed_size <= CRC64_SIZE_MAX && new.nonce <= CRC64_NONCE_MAX
     {
         BCH_EXTENT_ENTRY_crc64
     } else if bytes <= 16
@@ -770,10 +762,7 @@ pub unsafe fn bch2_bkey_drop_ptr(
         let mut decoded = extent_ptr_decoded::default();
         if bch2_bkey_has_device_decode(
             c,
-            bkey_s_c {
-                k: k.k,
-                v: k.v,
-            },
+            bkey_s_c { k: k.k, v: k.v },
             BCH_EXTENT_PTR_DEV(&*ptr) as u32,
             &mut decoded,
         ) && decoded.has_ec
@@ -813,11 +802,7 @@ pub unsafe fn bch2_bkey_drop_ptrs_mask(
     }
 }
 
-pub unsafe fn bch2_bkey_drop_device_noerror(
-    c: *const super::types::bch_fs,
-    k: bkey_s,
-    dev: u32,
-) {
+pub unsafe fn bch2_bkey_drop_device_noerror(c: *const super::types::bch_fs, k: bkey_s, dev: u32) {
     loop {
         let ranges = bch2_bkey_ptrs(k);
         let mut entry = ranges.start;
@@ -836,11 +821,7 @@ pub unsafe fn bch2_bkey_drop_device_noerror(
     }
 }
 
-pub unsafe fn bch2_bkey_drop_device(
-    c: *const super::types::bch_fs,
-    k: bkey_s,
-    dev: u32,
-) {
+pub unsafe fn bch2_bkey_drop_device(c: *const super::types::bch_fs, k: bkey_s, dev: u32) {
     loop {
         let ranges = bch2_bkey_ptrs(k);
         let mut entry = ranges.start;
@@ -859,11 +840,7 @@ pub unsafe fn bch2_bkey_drop_device(
     }
 }
 
-unsafe fn bch2_bkey_drop_ec(
-    c: *const super::types::bch_fs,
-    k: *mut bkey_i,
-    dev: u32,
-) {
+unsafe fn bch2_bkey_drop_ec(c: *const super::types::bch_fs, k: *mut bkey_i, dev: u32) {
     let key = bkey_s {
         k: core::ptr::addr_of_mut!((*k).k),
         v: core::ptr::addr_of_mut!((*k).v),
@@ -874,9 +851,7 @@ unsafe fn bch2_bkey_drop_ec(
     while !entry.is_null() && (entry as usize) < (ptrs.end as usize) {
         if extent_entry_is_stripe_ptr(entry) {
             ec = entry;
-        } else if extent_entry_is_ptr(entry)
-            && BCH_EXTENT_PTR_DEV(&(*entry).ptr) as u32 == dev
-        {
+        } else if extent_entry_is_ptr(entry) && BCH_EXTENT_PTR_DEV(&(*entry).ptr) as u32 == dev {
             if !ec.is_null() {
                 bch2_bkey_extent_entry_drop(c, k, ec);
             }
@@ -1204,10 +1179,10 @@ pub unsafe fn bch2_bkey_ptrs_c(k: bkey_s_c) -> bkey_ptrs_c {
         };
     }
     let start = match (*k.k).type_ {
-        KEY_TYPE_btree_ptr_v2 => k
-            .v
-            .cast::<u8>()
-            .add(core::mem::size_of::<bch_btree_ptr_v2>()),
+        KEY_TYPE_btree_ptr_v2 => {
+            k.v.cast::<u8>()
+                .add(core::mem::size_of::<bch_btree_ptr_v2>())
+        }
         KEY_TYPE_stripe => {
             let stripe = k.v.cast::<bch_stripe>();
             core::ptr::addr_of!((*stripe).ptrs)
@@ -1319,14 +1294,7 @@ pub unsafe fn bch2_bkey_has_device(
     k: super::bkey::bkey_s,
     dev: u32,
 ) -> *mut bch_extent_ptr {
-    bch2_bkey_has_device_c(
-        c,
-        bkey_s_c {
-            k: k.k,
-            v: k.v,
-        },
-        dev,
-    ) as *mut bch_extent_ptr
+    bch2_bkey_has_device_c(c, bkey_s_c { k: k.k, v: k.v }, dev) as *mut bch_extent_ptr
 }
 
 pub unsafe fn bch2_bkey_has_device_decode(
@@ -1353,7 +1321,8 @@ pub unsafe fn bch2_bkey_has_device_decode(
                 }
                 x if x == BCH_EXTENT_ENTRY_crc32 as u32
                     || x == BCH_EXTENT_ENTRY_crc64 as u32
-                    || x == BCH_EXTENT_ENTRY_crc128 as u32 => {
+                    || x == BCH_EXTENT_ENTRY_crc128 as u32 =>
+                {
                     decoded.crc = bch2_extent_crc_unpack(k.k, entry.cast());
                     crc = decoded.crc;
                 }
@@ -1377,11 +1346,7 @@ pub unsafe fn bch2_bkey_has_device_decode(
     false
 }
 
-pub unsafe fn bch2_bkey_dev_ptr_bit(
-    c: *const super::types::bch_fs,
-    k: bkey_s_c,
-    dev: u32,
-) -> u32 {
+pub unsafe fn bch2_bkey_dev_ptr_bit(c: *const super::types::bch_fs, k: bkey_s_c, dev: u32) -> u32 {
     let ptrs = bch2_bkey_ptrs_c(k);
     let mut entry = ptrs.start;
     let mut ptr_bit = 1u32;
@@ -1397,10 +1362,7 @@ pub unsafe fn bch2_bkey_dev_ptr_bit(
     0
 }
 
-pub unsafe fn bch2_bkey_devs(
-    c: *const super::types::bch_fs,
-    k: bkey_s_c,
-) -> bch_devs_list {
+pub unsafe fn bch2_bkey_devs(c: *const super::types::bch_fs, k: bkey_s_c) -> bch_devs_list {
     let mut ret = bch_devs_list::default();
     let ptrs = bch2_bkey_ptrs_c(k);
     let mut entry = ptrs.start;
@@ -1427,18 +1389,13 @@ pub unsafe fn bch2_bkey_ptrs_match(
     let p1_ec_block = (p1.ec.v >> 5) & 0xff;
     let p2_ec_block = (p2.ec.v >> 5) & 0xff;
     let same_device_or_ec = BCH_EXTENT_PTR_DEV(&p1.ptr) == BCH_EXTENT_PTR_DEV(&p2.ptr)
-        || (p1.has_ec
-            && p2.has_ec
-            && p1_ec_idx == p2_ec_idx
-            && p1_ec_block == p2_ec_block);
+        || (p1.has_ec && p2.has_ec && p1_ec_idx == p2_ec_idx && p1_ec_block == p2_ec_block);
     if !same_device_or_ec || BCH_EXTENT_PTR_GEN(&p1.ptr) != BCH_EXTENT_PTR_GEN(&p2.ptr) {
         return false;
     }
-    let p1_disk_offset = BCH_EXTENT_PTR_OFFSET(&p1.ptr) as i128
-        + p1.crc.offset as i128
+    let p1_disk_offset = BCH_EXTENT_PTR_OFFSET(&p1.ptr) as i128 + p1.crc.offset as i128
         - bkey_start_offset(&*k1.k) as i128;
-    let p2_disk_offset = BCH_EXTENT_PTR_OFFSET(&p2.ptr) as i128
-        + p2.crc.offset as i128
+    let p2_disk_offset = BCH_EXTENT_PTR_OFFSET(&p2.ptr) as i128 + p2.crc.offset as i128
         - bkey_start_offset(&*k2.k) as i128;
     if p1_disk_offset != p2_disk_offset {
         return false;
@@ -1448,7 +1405,7 @@ pub unsafe fn bch2_bkey_ptrs_match(
             < BCH_EXTENT_PTR_OFFSET(&p2.ptr) + p2.crc.compressed_size as u64)
         || (BCH_EXTENT_PTR_OFFSET(&p2.ptr) >= BCH_EXTENT_PTR_OFFSET(&p1.ptr)
             && BCH_EXTENT_PTR_OFFSET(&p2.ptr)
-        < BCH_EXTENT_PTR_OFFSET(&p1.ptr) + p1.crc.compressed_size as u64)
+                < BCH_EXTENT_PTR_OFFSET(&p1.ptr) + p1.crc.compressed_size as u64)
 }
 
 pub unsafe fn bch2_extents_match(
@@ -1483,7 +1440,8 @@ pub unsafe fn bch2_extents_match(
                     }
                     x if x == BCH_EXTENT_ENTRY_crc32 as u32
                         || x == BCH_EXTENT_ENTRY_crc64 as u32
-                        || x == BCH_EXTENT_ENTRY_crc128 as u32 => {
+                        || x == BCH_EXTENT_ENTRY_crc128 as u32 =>
+                    {
                         p1.crc = bch2_extent_crc_unpack(k1.k, entry1.cast());
                         crc1 = p1.crc;
                     }
@@ -1516,7 +1474,8 @@ pub unsafe fn bch2_extents_match(
                         }
                         x if x == BCH_EXTENT_ENTRY_crc32 as u32
                             || x == BCH_EXTENT_ENTRY_crc64 as u32
-                            || x == BCH_EXTENT_ENTRY_crc128 as u32 => {
+                            || x == BCH_EXTENT_ENTRY_crc128 as u32 =>
+                        {
                             p2.crc = bch2_extent_crc_unpack(k2.k, entry2.cast());
                             crc2 = p2.crc;
                         }
@@ -1568,7 +1527,8 @@ pub unsafe fn bch2_extent_has_ptr(
                 }
                 x if x == BCH_EXTENT_ENTRY_crc32 as u32
                     || x == BCH_EXTENT_ENTRY_crc64 as u32
-                    || x == BCH_EXTENT_ENTRY_crc128 as u32 => {
+                    || x == BCH_EXTENT_ENTRY_crc128 as u32 =>
+                {
                     p2.crc = bch2_extent_crc_unpack(k2.k, entry2.cast());
                     crc2 = p2.crc;
                 }
@@ -1583,11 +1543,9 @@ pub unsafe fn bch2_extent_has_ptr(
         if !found2 {
             break;
         }
-        let p1_disk_offset = BCH_EXTENT_PTR_OFFSET(&p1.ptr) as i128
-            + p1.crc.offset as i128
+        let p1_disk_offset = BCH_EXTENT_PTR_OFFSET(&p1.ptr) as i128 + p1.crc.offset as i128
             - bkey_start_offset(&*k1.k) as i128;
-        let p2_disk_offset = BCH_EXTENT_PTR_OFFSET(&p2.ptr) as i128
-            + p2.crc.offset as i128
+        let p2_disk_offset = BCH_EXTENT_PTR_OFFSET(&p2.ptr) as i128 + p2.crc.offset as i128
             - bkey_start_offset(&*k2.k) as i128;
         if BCH_EXTENT_PTR_DEV(&p1.ptr) == BCH_EXTENT_PTR_DEV(&p2.ptr)
             && BCH_EXTENT_PTR_GEN(&p1.ptr) == BCH_EXTENT_PTR_GEN(&p2.ptr)
@@ -1624,7 +1582,8 @@ pub unsafe fn bch2_bkey_matches_ptr(
                 }
                 x if x == BCH_EXTENT_ENTRY_crc32 as u32
                     || x == BCH_EXTENT_ENTRY_crc64 as u32
-                    || x == BCH_EXTENT_ENTRY_crc128 as u32 => {
+                    || x == BCH_EXTENT_ENTRY_crc128 as u32 =>
+                {
                     p.crc = bch2_extent_crc_unpack(k.k, entry.cast());
                     crc = p.crc;
                 }
@@ -1639,8 +1598,7 @@ pub unsafe fn bch2_bkey_matches_ptr(
         if !found {
             break;
         }
-        let disk_offset = BCH_EXTENT_PTR_OFFSET(&p.ptr) as i128
-            + p.crc.offset as i128
+        let disk_offset = BCH_EXTENT_PTR_OFFSET(&p.ptr) as i128 + p.crc.offset as i128
             - bkey_start_offset(&*k.k) as i128;
         if BCH_EXTENT_PTR_DEV(&p.ptr) == BCH_EXTENT_PTR_DEV(&m)
             && BCH_EXTENT_PTR_GEN(&p.ptr) == BCH_EXTENT_PTR_GEN(&m)
@@ -1653,10 +1611,7 @@ pub unsafe fn bch2_bkey_matches_ptr(
     false
 }
 
-pub unsafe fn bch2_bkey_replicas(
-    c: *mut super::types::bch_fs,
-    k: bkey_s_c,
-) -> u32 {
+pub unsafe fn bch2_bkey_replicas(c: *mut super::types::bch_fs, k: bkey_s_c) -> u32 {
     let ptrs = bch2_bkey_ptrs_c(k);
     let mut entry = ptrs.start;
     let mut crc = bch2_extent_crc_unpack(k.k, core::ptr::null());
@@ -1676,7 +1631,8 @@ pub unsafe fn bch2_bkey_replicas(
                 }
                 x if x == BCH_EXTENT_ENTRY_crc32 as u32
                     || x == BCH_EXTENT_ENTRY_crc64 as u32
-                    || x == BCH_EXTENT_ENTRY_crc128 as u32 => {
+                    || x == BCH_EXTENT_ENTRY_crc128 as u32 =>
+                {
                     p.crc = bch2_extent_crc_unpack(k.k, entry.cast());
                     crc = p.crc;
                 }
@@ -1702,10 +1658,7 @@ pub unsafe fn bch2_bkey_replicas(
     replicas
 }
 
-pub unsafe fn bch2_bkey_sectors_compressed(
-    c: *const super::types::bch_fs,
-    k: bkey_s_c,
-) -> u32 {
+pub unsafe fn bch2_bkey_sectors_compressed(c: *const super::types::bch_fs, k: bkey_s_c) -> u32 {
     let ptrs = bch2_bkey_ptrs_c(k);
     if ptrs.start.is_null() || ptrs.end.is_null() {
         return 0;
@@ -1718,7 +1671,8 @@ pub unsafe fn bch2_bkey_sectors_compressed(
         match extent_entry_type(entry) {
             x if x == BCH_EXTENT_ENTRY_crc32 as u32
                 || x == BCH_EXTENT_ENTRY_crc64 as u32
-                || x == BCH_EXTENT_ENTRY_crc128 as u32 => {
+                || x == BCH_EXTENT_ENTRY_crc128 as u32 =>
+            {
                 crc = bch2_extent_crc_unpack(k.k, entry.cast::<bch_extent_crc>());
             }
             x if x == BCH_EXTENT_ENTRY_ptr as u32 => {
@@ -1733,10 +1687,7 @@ pub unsafe fn bch2_bkey_sectors_compressed(
     ret
 }
 
-pub unsafe fn bch2_bkey_nr_dirty_ptrs(
-    c: *const super::types::bch_fs,
-    k: bkey_s_c,
-) -> u32 {
+pub unsafe fn bch2_bkey_nr_dirty_ptrs(c: *const super::types::bch_fs, k: bkey_s_c) -> u32 {
     let ptrs = bch2_bkey_ptrs_c(k);
     if ptrs.start.is_null() || ptrs.end.is_null() {
         return 0;
@@ -1755,10 +1706,7 @@ pub unsafe fn bch2_bkey_nr_dirty_ptrs(
     ret
 }
 
-pub unsafe fn bch2_bkey_nr_ptrs_allocated(
-    c: *const super::types::bch_fs,
-    k: bkey_s_c,
-) -> u32 {
+pub unsafe fn bch2_bkey_nr_ptrs_allocated(c: *const super::types::bch_fs, k: bkey_s_c) -> u32 {
     if k.k.is_null() || k.v.is_null() {
         return 0;
     }
@@ -1803,7 +1751,8 @@ pub unsafe fn bch2_bkey_nr_ptrs_fully_allocated(
         match extent_entry_type(entry) {
             x if x == BCH_EXTENT_ENTRY_crc32 as u32
                 || x == BCH_EXTENT_ENTRY_crc64 as u32
-                || x == BCH_EXTENT_ENTRY_crc128 as u32 => {
+                || x == BCH_EXTENT_ENTRY_crc128 as u32 =>
+            {
                 crc = bch2_extent_crc_unpack(k.k, entry.cast::<bch_extent_crc>());
             }
             x if x == BCH_EXTENT_ENTRY_ptr as u32 => {
@@ -1818,10 +1767,7 @@ pub unsafe fn bch2_bkey_nr_ptrs_fully_allocated(
     ret
 }
 
-pub unsafe fn bkey_extent_is_unwritten(
-    c: *const super::types::bch_fs,
-    k: bkey_s_c,
-) -> bool {
+pub unsafe fn bkey_extent_is_unwritten(c: *const super::types::bch_fs, k: bkey_s_c) -> bool {
     let ptrs = bch2_bkey_ptrs_c(k);
     if ptrs.start.is_null() || ptrs.end.is_null() {
         return false;
@@ -1901,9 +1847,7 @@ pub unsafe fn bkey_inline_data_bytes(k: *const bkey) -> usize {
 }
 
 pub const fn bkey_extent_is_data(k: &bkey) -> bool {
-    bkey_extent_is_direct_data(k)
-        || bkey_extent_is_inline_data(k)
-        || k.type_ == KEY_TYPE_reflink_p
+    bkey_extent_is_direct_data(k) || bkey_extent_is_inline_data(k) || k.type_ == KEY_TYPE_reflink_p
 }
 
 pub const fn bkey_extent_is_allocation(k: &bkey) -> bool {
@@ -1919,18 +1863,11 @@ pub const fn bkey_extent_is_allocation(k: &bkey) -> bool {
     )
 }
 
-pub unsafe fn bkey_extent_is_reservation(
-    c: *const super::types::bch_fs,
-    k: bkey_s_c,
-) -> bool {
-    !k.k.is_null()
-        && ((*k.k).type_ == KEY_TYPE_reservation || bkey_extent_is_unwritten(c, k))
+pub unsafe fn bkey_extent_is_reservation(c: *const super::types::bch_fs, k: bkey_s_c) -> bool {
+    !k.k.is_null() && ((*k.k).type_ == KEY_TYPE_reservation || bkey_extent_is_unwritten(c, k))
 }
 
-pub unsafe fn bch2_bkey_is_incompressible(
-    c: *const super::types::bch_fs,
-    k: bkey_s_c,
-) -> bool {
+pub unsafe fn bch2_bkey_is_incompressible(c: *const super::types::bch_fs, k: bkey_s_c) -> bool {
     let ptrs = bch2_bkey_ptrs_c(k);
     if ptrs.start.is_null() || ptrs.end.is_null() {
         return false;
@@ -1988,8 +1925,7 @@ pub unsafe fn bch2_bkey_can_read(c: *const super::types::bch_fs, k: bkey_s_c) ->
             break;
         }
         if BCH_EXTENT_PTR_CACHED(&p.ptr) == 0
-            && (BCH_EXTENT_PTR_DEV(&p.ptr) as u32
-                != crate::sb::BCH_SB_MEMBER_INVALID as u32
+            && (BCH_EXTENT_PTR_DEV(&p.ptr) as u32 != crate::sb::BCH_SB_MEMBER_INVALID as u32
                 || p.has_ec)
         {
             return true;
@@ -2007,7 +1943,10 @@ pub unsafe fn bch2_bkey_propagate_incompressible(
     if dst.is_null() || !bch2_bkey_is_incompressible(c, src) {
         return;
     }
-    let ptrs = bch2_bkey_ptrs(bkey_s { k: &mut (*dst).k, v: &mut (*dst).v });
+    let ptrs = bch2_bkey_ptrs(bkey_s {
+        k: &mut (*dst).k,
+        v: &mut (*dst).v,
+    });
     if ptrs.start.is_null() || ptrs.end.is_null() {
         return;
     }
@@ -2043,11 +1982,7 @@ pub unsafe fn bch2_bkey_append_ptr(
     (*k).k.u64s += 1;
 }
 
-pub unsafe fn bch2_cut_front_s(
-    _c: *const super::types::bch_fs,
-    where_: bpos,
-    k: bkey_s,
-) -> i32 {
+pub unsafe fn bch2_cut_front_s(_c: *const super::types::bch_fs, where_: bpos, k: bkey_s) -> i32 {
     if k.k.is_null() {
         return -22;
     }
@@ -2091,15 +2026,13 @@ pub unsafe fn bch2_cut_front_s(
                     x if x == BCH_EXTENT_ENTRY_crc64 as u32 => {
                         let crc = &mut (*entry).crc64;
                         crc.word0 = (crc.word0 & !(0x1ff << 21))
-                            | (((((crc.word0 >> 21) & 0x1ff).wrapping_add(sub)) & 0x1ff)
-                                << 21);
+                            | (((((crc.word0 >> 21) & 0x1ff).wrapping_add(sub)) & 0x1ff) << 21);
                         seen_crc = true;
                     }
                     x if x == BCH_EXTENT_ENTRY_crc128 as u32 => {
                         let crc = &mut (*entry).crc128;
                         crc.word0 = (crc.word0 & !(0x1fff << 30))
-                            | (((((crc.word0 >> 30) & 0x1fff).wrapping_add(sub)) & 0x1fff)
-                                << 30);
+                            | (((((crc.word0 >> 30) & 0x1fff).wrapping_add(sub)) & 0x1fff) << 30);
                         seen_crc = true;
                     }
                     _ => {}
@@ -2521,17 +2454,15 @@ mod tests {
                 ),
                 0
             );
-            assert!(
-                bch2_bkey_has_device_c(
-                    core::ptr::null(),
-                    bkey_s_c {
-                        k: &(*key).k,
-                        v: core::ptr::addr_of!((*key).v).cast::<bch_val>(),
-                    },
-                    3,
-                )
-                .is_null()
-            );
+            assert!(bch2_bkey_has_device_c(
+                core::ptr::null(),
+                bkey_s_c {
+                    k: &(*key).k,
+                    v: core::ptr::addr_of!((*key).v).cast::<bch_val>(),
+                },
+                3,
+            )
+            .is_null());
             let mut decoded = extent_ptr_decoded::default();
             assert!(bch2_bkey_has_device_decode(
                 core::ptr::null(),
@@ -2607,7 +2538,10 @@ mod tests {
                 v: stripe.cast::<bch_val>(),
             });
             assert_eq!(
-                stripe_ptrs.end.cast::<u8>().offset_from(stripe_ptrs.start.cast::<u8>()),
+                stripe_ptrs
+                    .end
+                    .cast::<u8>()
+                    .offset_from(stripe_ptrs.start.cast::<u8>()),
                 16
             );
         }
@@ -2713,7 +2647,9 @@ mod tests {
             vec![1, 1, 2, 3, 1, 1, 1, 1, 1]
         );
         unsafe {
-            let mut entry = bch_extent_entry { type_: 1 << BCH_EXTENT_ENTRY_crc64 };
+            let mut entry = bch_extent_entry {
+                type_: 1 << BCH_EXTENT_ENTRY_crc64,
+            };
             assert_eq!(extent_entry_type(&entry), BCH_EXTENT_ENTRY_crc64 as u32);
             assert!(!extent_entry_is_ptr(&entry));
             assert!(extent_entry_is_crc(&entry));
@@ -2736,7 +2672,10 @@ mod tests {
 
             let end = first.add(5);
             let unknown = bch_extent_entry { type_: 0 };
-            assert_eq!(extent_entry_next_safe(core::ptr::null(), &unknown, end), end);
+            assert_eq!(
+                extent_entry_next_safe(core::ptr::null(), &unknown, end),
+                end
+            );
         }
     }
 
@@ -2759,7 +2698,10 @@ mod tests {
             __extent_entry_insert(core::ptr::null(), key, first, &inserted);
             assert_eq!((*key).k.u64s, super::super::bkey::BKEY_U64S + 3);
             assert_eq!((*first).type_, 1 << BCH_EXTENT_ENTRY_ptr);
-            assert_eq!(extent_entry_type(first.cast::<u64>().add(1).cast()), BCH_EXTENT_ENTRY_crc64 as u32);
+            assert_eq!(
+                extent_entry_type(first.cast::<u64>().add(1).cast()),
+                BCH_EXTENT_ENTRY_crc64 as u32
+            );
 
             extent_entry_drop(
                 core::ptr::null(),
@@ -2831,7 +2773,10 @@ mod tests {
                 v: core::ptr::addr_of!((*key).v),
             };
             assert_eq!(bch2_bkey_nr_dirty_ptrs(core::ptr::null(), key_sc), 1);
-            assert_eq!(bch2_bkey_nr_ptrs_fully_allocated(core::ptr::null(), key_sc), 0);
+            assert_eq!(
+                bch2_bkey_nr_ptrs_fully_allocated(core::ptr::null(), key_sc),
+                0
+            );
             assert!(bkey_extent_is_unwritten(core::ptr::null(), key_sc));
             let reservation = bch_reservation {
                 nr_replicas: 3,
@@ -2851,13 +2796,7 @@ mod tests {
                 ),
                 3
             );
-            assert_eq!(
-                bch2_bkey_sectors_compressed(
-                    core::ptr::null(),
-                    key_sc,
-                ),
-                7
-            );
+            assert_eq!(bch2_bkey_sectors_compressed(core::ptr::null(), key_sc,), 7);
         }
     }
 
@@ -2907,7 +2846,10 @@ mod tests {
             let right = right_words.as_mut_ptr().cast::<bkey_i>();
             (*left).k = bkey {
                 size: 2,
-                p: bpos { offset: 2, ..Default::default() },
+                p: bpos {
+                    offset: 2,
+                    ..Default::default()
+                },
                 type_: KEY_TYPE_reservation,
                 ..Default::default()
             };
@@ -2919,33 +2861,45 @@ mod tests {
             core::ptr::addr_of_mut!((*left).v)
                 .cast::<bch_reservation>()
                 .write(bch_reservation {
-                generation: 9,
-                nr_replicas: 2,
-                ..Default::default()
+                    generation: 9,
+                    nr_replicas: 2,
+                    ..Default::default()
                 });
             core::ptr::addr_of_mut!((*right).v)
                 .cast::<bch_reservation>()
                 .write(bch_reservation {
-                generation: 9,
-                nr_replicas: 2,
-                ..Default::default()
+                    generation: 9,
+                    nr_replicas: 2,
+                    ..Default::default()
                 });
             assert!(bch2_reservation_merge(
-                bkey_s { k: &mut (*left).k, v: &mut (*left).v },
-                bkey_s_c { k: &(*right).k, v: &(*right).v },
+                bkey_s {
+                    k: &mut (*left).k,
+                    v: &mut (*left).v
+                },
+                bkey_s_c {
+                    k: &(*right).k,
+                    v: &(*right).v
+                },
             ));
             assert_eq!((*left).k.size, 5);
             assert_eq!(core::ptr::addr_of!((*left).k.p.offset).read_unaligned(), 5);
             core::ptr::addr_of_mut!((*right).v)
                 .cast::<bch_reservation>()
                 .write(bch_reservation {
-                generation: 10,
-                nr_replicas: 2,
-                ..Default::default()
+                    generation: 10,
+                    nr_replicas: 2,
+                    ..Default::default()
                 });
             assert!(!bch2_reservation_merge(
-                bkey_s { k: &mut (*left).k, v: &mut (*left).v },
-                bkey_s_c { k: &(*right).k, v: &(*right).v },
+                bkey_s {
+                    k: &mut (*left).k,
+                    v: &mut (*left).v
+                },
+                bkey_s_c {
+                    k: &(*right).k,
+                    v: &(*right).v
+                },
             ));
         }
     }
@@ -2959,7 +2913,10 @@ mod tests {
             let right = right_words.as_mut_ptr().cast::<bkey_i>();
             (*left).k = bkey {
                 size: u32::MAX,
-                p: bpos { offset: 7, ..Default::default() },
+                p: bpos {
+                    offset: 7,
+                    ..Default::default()
+                },
                 type_: KEY_TYPE_reservation,
                 ..Default::default()
             };
@@ -2971,21 +2928,27 @@ mod tests {
             core::ptr::addr_of_mut!((*left).v)
                 .cast::<bch_reservation>()
                 .write(bch_reservation {
-                generation: 4,
-                nr_replicas: 1,
-                ..Default::default()
-            });
+                    generation: 4,
+                    nr_replicas: 1,
+                    ..Default::default()
+                });
             core::ptr::addr_of_mut!((*right).v)
                 .cast::<bch_reservation>()
                 .write(bch_reservation {
-                generation: 4,
-                nr_replicas: 1,
-                ..Default::default()
-            });
+                    generation: 4,
+                    nr_replicas: 1,
+                    ..Default::default()
+                });
 
             assert!(bch2_reservation_merge(
-                bkey_s { k: &mut (*left).k, v: &mut (*left).v },
-                bkey_s_c { k: &(*right).k, v: &(*right).v },
+                bkey_s {
+                    k: &mut (*left).k,
+                    v: &mut (*left).v
+                },
+                bkey_s_c {
+                    k: &(*right).k,
+                    v: &(*right).v
+                },
             ));
             assert_eq!((*left).k.size, 0);
             assert_eq!(
@@ -3121,7 +3084,10 @@ mod tests {
             (*second).stripe_ptr = bch_extent_stripe_ptr {
                 v: (2 << 13) | (1 << BCH_EXTENT_ENTRY_stripe_ptr) | (1 << 17),
             };
-            assert_eq!(extent_entry_type(second), BCH_EXTENT_ENTRY_stripe_ptr as u32);
+            assert_eq!(
+                extent_entry_type(second),
+                BCH_EXTENT_ENTRY_stripe_ptr as u32
+            );
             let third = first.cast::<u8>().add(16).cast::<bch_extent_entry>();
             (*third).ptr = bch_extent_ptr::default();
             SET_BCH_EXTENT_PTR_TYPE(&mut (*third).ptr, 1 << BCH_EXTENT_ENTRY_ptr);
@@ -3178,15 +3144,8 @@ mod tests {
                 v: core::ptr::addr_of!((*source).v),
             };
             assert!(bch2_bkey_is_incompressible(core::ptr::null(), source_sc));
-            bch2_bkey_propagate_incompressible(
-                core::ptr::null(),
-                dest,
-                source_sc,
-            );
-            let got = bch2_extent_crc_unpack(
-                &(*dest).k,
-                core::ptr::addr_of!((*dest).v).cast(),
-            );
+            bch2_bkey_propagate_incompressible(core::ptr::null(), dest, source_sc);
+            let got = bch2_extent_crc_unpack(&(*dest).k, core::ptr::addr_of!((*dest).v).cast());
             assert_eq!(got.compression_type, BCH_COMPRESSION_TYPE_incompressible);
         }
     }
@@ -3226,7 +3185,10 @@ mod tests {
             compressed.compression_type = BCH_COMPRESSION_TYPE_incompressible;
             assert!(!crc_is_compressed(compressed));
             assert!(!crc_is_encoded(compressed));
-            assert_eq!(bch2_crc_field_size_max[BCH_EXTENT_ENTRY_crc64 as usize], 1 << 9);
+            assert_eq!(
+                bch2_crc_field_size_max[BCH_EXTENT_ENTRY_crc64 as usize],
+                1 << 9
+            );
         }
     }
 
@@ -3254,7 +3216,9 @@ mod tests {
             assert_eq!((*key).k.u64s, super::super::bkey::BKEY_U64S + 1);
             let unpacked = bch2_extent_crc_unpack(
                 &(*key).k,
-                core::ptr::addr_of!((*key).v).cast::<bch_extent_entry>().cast(),
+                core::ptr::addr_of!((*key).v)
+                    .cast::<bch_extent_entry>()
+                    .cast(),
             );
             assert_eq!(unpacked.compressed_size, 4);
             assert_eq!(unpacked.csum_type, crate::checksum::BCH_CSUM_crc32c as u8);
@@ -3479,9 +3443,7 @@ mod tests {
             let crc = words.as_mut_ptr().add(5).cast::<bch_extent_crc32>();
             (*crc).word0 = (1 << BCH_EXTENT_ENTRY_crc32) | (2 << 16);
             let ptr = words.as_mut_ptr().add(6).cast::<bch_extent_ptr>();
-            *ptr = bch_extent_ptr {
-                v: 1 | (4 << 4),
-            };
+            *ptr = bch_extent_ptr { v: 1 | (4 << 4) };
             bch2_cut_front_s(
                 core::ptr::null(),
                 super::super::bkey::SPOS(4, 11, 0),

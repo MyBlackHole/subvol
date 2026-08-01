@@ -164,6 +164,20 @@ pub(crate) unsafe fn bch2_bset_insert(
     if bch2_bkey_pack_key(&mut packed, &(*insert).k, &format) {
         src = &mut packed;
     }
+    let first_key = btree_bkey_first(b, t) as usize;
+    let end_key = btree_bkey_last(b, t) as usize;
+    if (where_ as usize) < first_key || (where_ as usize) > end_key || where_.is_null() {
+        crate::rewrite_log_error!(
+            "bset_insert bad where_: b={b:p} where_={:p} first={:#x} end={:#x} t_do={} t_eo={} src_u64s={} clobber={clobber_u64s}",
+            where_,
+            first_key,
+            end_key,
+            (*t).data_offset,
+            (*t).end_offset,
+            (*src).u64s,
+        );
+        assert!(false);
+    }
 
     if !bkey_deleted(&*(insert.cast::<bkey_packed>())) {
         let bset_idx = t.offset_from((*b).set.as_mut_ptr()) as usize;
@@ -195,6 +209,45 @@ pub(crate) unsafe fn bch2_bset_insert(
 
     if (*src).u64s as u32 != clobber_u64s {
         bch2_bset_fix_lookup_table(b, t, where_, clobber_u64s, (*src).u64s as u32);
+    }
+    verify_bset_key_walk(b, t);
+}
+
+unsafe fn verify_bset_key_walk(b: *const btree, t: *const bset_tree) {
+    let mut p = super::types::btree_bkey_first(b, t);
+    let end = super::types::btree_bkey_last(b, t);
+    let mut n = 0usize;
+    while p < end {
+        let format = (*p).format & 0x7f;
+        if format != super::bkey::KEY_FORMAT_LOCAL_BTREE
+            && format != super::bkey::KEY_FORMAT_CURRENT
+        {
+            crate::rewrite_log_error!(
+                "bset key walk: bad format at node={b:p} key={p:p} off={:#x} u64s={} format={:#x}",
+                (p as usize).wrapping_sub((*b).data as usize),
+                (*p).u64s,
+                (*p).format,
+            );
+            return;
+        }
+        if (*p).u64s < 2 || (*p).u64s > 16 {
+            crate::rewrite_log_error!(
+                "bset key walk: bad u64s at node={b:p} key={p:p} off={:#x} u64s={} format={:#x}",
+                (p as usize).wrapping_sub((*b).data as usize),
+                (*p).u64s,
+                (*p).format,
+            );
+            return;
+        }
+        p = super::bkey::bkey_p_next(p);
+        n += 1;
+    }
+    if p != end {
+        crate::rewrite_log_error!(
+            "bset key walk: mismatch node={b:p} walked={n} keys end_off={:#x} p_off={:#x}",
+            (end as usize).wrapping_sub((*b).data as usize),
+            (p as usize).wrapping_sub((*b).data as usize),
+        );
     }
 }
 

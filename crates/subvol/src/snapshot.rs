@@ -48,36 +48,23 @@ pub unsafe fn snapshot_list_has_ancestor(
     false
 }
 
-pub unsafe fn snapshot_list_add_nodup(
-    _c: *mut bch_fs,
-    s: *mut snapshot_id_list,
-    id: u32,
-) -> i32 {
+pub unsafe fn snapshot_list_add_nodup(_c: *mut bch_fs, s: *mut snapshot_id_list, id: u32) -> i32 {
     if snapshot_list_has_id(s, id) {
         return 0;
     }
     let new_size = (*s).nr.wrapping_add(1);
     if new_size > (*s).size {
         let Some(capacity) = new_size.checked_next_power_of_two() else {
-            crate::rewrite_log_error!(
-                "error reallocating snapshot_id_list (size {})",
-                (*s).size
-            );
+            crate::rewrite_log_error!("error reallocating snapshot_id_list (size {})", (*s).size);
             return -12;
         };
         let Ok(layout) = std::alloc::Layout::array::<u32>(capacity) else {
-            crate::rewrite_log_error!(
-                "error reallocating snapshot_id_list (size {})",
-                (*s).size
-            );
+            crate::rewrite_log_error!("error reallocating snapshot_id_list (size {})", (*s).size);
             return -12;
         };
         let data = std::alloc::alloc(layout).cast::<u32>();
         if data.is_null() {
-            crate::rewrite_log_error!(
-                "error reallocating snapshot_id_list (size {})",
-                (*s).size
-            );
+            crate::rewrite_log_error!("error reallocating snapshot_id_list (size {})", (*s).size);
             return -12;
         }
         if (*s).size != 0 {
@@ -250,7 +237,9 @@ pub fn bch2_snapshot_skiplist_get(c: &bch_fs, mut id: u32) -> u32 {
         .expect("get_random_bytes failed");
     let mut n = u32::from_ne_bytes(random) % snapshot.depth;
     while n != 0 {
-        id = __snapshot_t(&table, id).expect("invalid snapshot node").parent;
+        id = __snapshot_t(&table, id)
+            .expect("invalid snapshot node")
+            .parent;
         n -= 1;
     }
     id
@@ -432,8 +421,7 @@ pub unsafe fn __bch2_key_has_snapshot_overwrites(
         &mut iter,
         btree_id,
         crate::btree::bkey::bpos_predecessor(pos),
-        crate::btree::iter::BTREE_ITER_not_extents
-            | crate::btree::iter::BTREE_ITER_all_snapshots,
+        crate::btree::iter::BTREE_ITER_not_extents | crate::btree::iter::BTREE_ITER_all_snapshots,
     );
     let mut ret = 0;
     loop {
@@ -576,15 +564,24 @@ mod tests {
     fn snapshot_id_list_push_and_merge_follow_darray_growth() {
         unsafe {
             let mut dst = snapshot_id_list::default();
-            assert_eq!(snapshot_list_add_nodup(core::ptr::null_mut(), &mut dst, 3), 0);
-            assert_eq!(snapshot_list_add_nodup(core::ptr::null_mut(), &mut dst, 3), 0);
+            assert_eq!(
+                snapshot_list_add_nodup(core::ptr::null_mut(), &mut dst, 3),
+                0
+            );
+            assert_eq!(
+                snapshot_list_add_nodup(core::ptr::null_mut(), &mut dst, 3),
+                0
+            );
             let mut source_ids = [5u32, 3u32, 8u32];
             let source = snapshot_id_list {
                 nr: source_ids.len(),
                 size: source_ids.len(),
                 data: source_ids.as_mut_ptr(),
             };
-            assert_eq!(snapshot_list_merge(core::ptr::null_mut(), &mut dst, &source), 0);
+            assert_eq!(
+                snapshot_list_merge(core::ptr::null_mut(), &mut dst, &source),
+                0
+            );
             assert_eq!(dst.nr, 3);
             assert_eq!(*dst.data.add(0), 3);
             assert_eq!(*dst.data.add(1), 5);

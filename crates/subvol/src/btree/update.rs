@@ -1496,6 +1496,25 @@ pub unsafe fn bch2_trans_update_ip(
         return bch2_trans_update_extent(trans, iter, k, k_buf_u64s, flags);
     }
     let path = (*trans).paths.add((*iter).path as usize);
+    let (pi, po, ps, i_i, i_o, i_s) = unsafe {
+        (
+            core::ptr::addr_of!((*path).pos.inode).read_unaligned(),
+            core::ptr::addr_of!((*path).pos.offset).read_unaligned(),
+            core::ptr::addr_of!((*path).pos.snapshot).read_unaligned(),
+            core::ptr::addr_of!((*iter).pos.inode).read_unaligned(),
+            core::ptr::addr_of!((*iter).pos.offset).read_unaligned(),
+            core::ptr::addr_of!((*iter).pos.snapshot).read_unaligned(),
+        )
+    };
+    crate::rewrite_log_debug!(
+        "trans_update_ip: iter.path={} iter.pos=({i_i},{i_o},{i_s}) path.pos=({pi},{po},{ps}) nodes_locked={} should_be_locked={} level={} iter_ptr={iter:p} path_ptr={path:p} iter_pos_ptr={:p} path_pos_ptr={:p}",
+        (*iter).path,
+        (*path).nodes_locked,
+        (*path).should_be_locked as u8,
+        (*path).level,
+        core::ptr::addr_of!((*iter).pos),
+        core::ptr::addr_of!((*path).pos),
+    );
     assert_eq!((*path).nodes_locked & 3, BTREE_NODE_INTENT_LOCKED);
     if btree_trans_update_by_path(trans, (*iter).path, k, k_buf_u64s, flags, ip).is_null() {
         -12
@@ -1589,6 +1608,83 @@ pub unsafe fn bch2_btree_node_prep_for_write(
     }
 }
 
+unsafe fn dump_tree(c: *mut crate::btree::types::bch_fs, id: u8) {
+    unsafe fn dump_node(b: *const crate::btree::types::btree, depth: usize, out: &mut Vec<String>) {
+        for bi in 0..(*b).nsets as usize {
+            let bt = (*b).set.as_ptr().add(bi);
+            let mut pk = crate::btree::types::btree_bkey_first(b, bt);
+            let pend = crate::btree::types::btree_bkey_last(b, bt);
+            while pk < pend {
+                if ((*pk).format & 0x7f != super::bkey::KEY_FORMAT_LOCAL_BTREE
+                    && (*pk).format & 0x7f != super::bkey::KEY_FORMAT_CURRENT)
+                    || (*pk).u64s == 0
+                {
+                    let (n_i, n_o, n_s, x_i, x_o, x_s) = unsafe {
+                        (
+                            core::ptr::addr_of!((*(*b).data).min_key.inode).read_unaligned(),
+                            core::ptr::addr_of!((*(*b).data).min_key.offset).read_unaligned(),
+                            core::ptr::addr_of!((*(*b).data).min_key.snapshot).read_unaligned(),
+                            core::ptr::addr_of!((*(*b).data).max_key.inode).read_unaligned(),
+                            core::ptr::addr_of!((*(*b).data).max_key.offset).read_unaligned(),
+                            core::ptr::addr_of!((*(*b).data).max_key.snapshot).read_unaligned(),
+                        )
+                    };
+                    crate::rewrite_log_debug!(
+                        "dump bad key: n={b:p} L{} bt={} bi={bi} off={:#x} u64s={} format={:#x} type={} first={:#x} last={:#x} data_off={} end_off={} nsets={} min=({n_i},{n_o},{n_s}) max=({x_i},{x_o},{x_s})",
+                        (*b).c.level,
+                        (*b).c.btree_id,
+                        (pk as usize).wrapping_sub((*b).data as usize),
+                        (*pk).u64s,
+                        (*pk).format,
+                        (*pk).type_,
+                        (crate::btree::types::btree_bkey_first(b, bt) as usize)
+                            .wrapping_sub((*b).data as usize),
+                        (crate::btree::types::btree_bkey_last(b, bt) as usize)
+                            .wrapping_sub((*b).data as usize),
+                        (*bt).data_offset,
+                        (*bt).end_offset,
+                        (*b).nsets,
+                    );
+                }
+                let pos = super::node_iter::bkey_unpack_pos(b, pk);
+                let (p_inode, p_off, p_snap) = (pos.inode, pos.offset, pos.snapshot);
+                out.push(format!(
+                    "{}n={b:p} L{} {:#x}:({},{},{})u{}t{}",
+                    "  ".repeat(depth),
+                    (*b).c.level,
+                    (pk as usize).wrapping_sub((*b).data as usize),
+                    p_inode,
+                    p_off,
+                    p_snap,
+                    (*pk).u64s,
+                    (*pk).type_,
+                ));
+                pk = super::bkey::bkey_p_next(pk);
+            }
+        }
+        if (*b).c.level != 0 {
+            let mut pk = crate::btree::types::btree_bkey_first(b, (*b).set.as_ptr());
+            let pend = crate::btree::types::btree_bkey_last(b, (*b).set.as_ptr());
+            while pk < pend {
+                let key_u64s = crate::btree::bkey::bkeyp_key_u64s(&(*b).format, &*pk);
+                let child = *pk.cast::<u64>().add(key_u64s as usize) as usize as *mut btree;
+                if !child.is_null() {
+                    dump_node(child, depth + 1, out);
+                }
+                pk = super::bkey::bkey_p_next(pk);
+            }
+        }
+    }
+    let root = crate::btree::types::bch2_btree_id_root_b(c, id as usize);
+    if root.is_null() {
+        crate::rewrite_log_debug!("dump_tree: null root");
+        return;
+    }
+    let mut out = Vec::new();
+    dump_node(root, 0, &mut out);
+    crate::rewrite_log_debug!("dump_tree id={id}: {}", out.join(" | "));
+}
+
 unsafe fn bch2_btree_bset_insert_key_inlined(
     trans: *mut btree_trans,
     path: *mut btree_path,
@@ -1635,6 +1731,39 @@ unsafe fn bch2_btree_bset_insert_key_inlined(
     let clobber_u64s = if k_writeable { (*k).u64s as u32 } else { 0 };
     if bkey_deleted(&*(insert.cast::<bkey_packed>())) {
         if k_writeable {
+            crate::rewrite_log_debug!(
+                "delete at node={b:p} k_off={:#x} k_u64s={} clobber={clobber_u64s}",
+                (k as usize).wrapping_sub((*b).data as usize),
+                (*k).u64s,
+            );
+            let mut dmp = Vec::new();
+            for bi in 0..(*b).nsets as usize {
+                let bt = (*b).set.as_ptr().add(bi);
+                let mut pk = super::types::btree_bkey_first(b, bt);
+                let pend = super::types::btree_bkey_last(b, bt);
+                while pk < pend {
+                    let pos = super::node_iter::bkey_unpack_pos(b, pk);
+                    let (p_inode, p_off, p_snap) = (pos.inode, pos.offset, pos.snapshot);
+                    dmp.push(format!(
+                        "b{bi} {:#x}:({},{},{})u{}d{}",
+                        (pk as usize).wrapping_sub((*b).data as usize),
+                        p_inode,
+                        p_off,
+                        p_snap,
+                        (*pk).u64s,
+                        if bkey_deleted(&*pk) { 1 } else { 0 }
+                    ));
+                    pk = super::bkey::bkey_p_next(pk);
+                }
+            }
+            crate::rewrite_log_debug!(
+                "delete node={b:p} nsets={} live={} keys: {dmp:?}",
+                (*b).nsets,
+                (*b).nr.live_u64s,
+            );
+            if (*trans).c.is_null() == false {
+                dump_tree((*trans).c, (*b).c.btree_id);
+            }
             bch2_bset_delete(b, k, clobber_u64s);
         }
     } else {
@@ -1651,6 +1780,13 @@ unsafe fn bch2_btree_bset_insert_key_inlined(
         if !k_writeable {
             k = bch2_btree_node_iter_bset_pos(node_iter, b, last);
         }
+        crate::rewrite_log_debug!(
+            "insert at node={b:p} k_off={:#x} k_u64s={} k_format={:#x} clobber={clobber_u64s} insert_u64s={}",
+            (k as usize).wrapping_sub((*b).data as usize),
+            (*k).u64s,
+            (*k).format,
+            (*insert).k.u64s,
+        );
         bch2_bset_insert(b, k, insert, clobber_u64s);
     }
 
@@ -1660,6 +1796,18 @@ unsafe fn bch2_btree_bset_insert_key_inlined(
         0
     };
     if clobber_u64s != new_u64s {
+        crate::rewrite_log_debug!(
+            "insert fix node={b:p} id={} level={} clobber={clobber_u64s} new={new_u64s} live_u64s={}",
+            (*b).c.btree_id,
+            (*b).c.level,
+            (*b).nr.live_u64s
+        );
+        let iter_nsets = (*b).nsets as usize;
+        let mut iter_sets = Vec::new();
+        for si in 0..iter_nsets {
+            iter_sets.push(((*node_iter).data[si].k, (*node_iter).data[si].end));
+        }
+        crate::rewrite_log_debug!("insert fix iter nsets={iter_nsets} sets={iter_sets:?}",);
         super::node_iter::bch2_btree_node_iter_fix(
             trans,
             path,
@@ -1948,6 +2096,11 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
         let i = (*trans).updates.add(idx);
         let path = (*trans).paths.add((*i).path as usize);
         let b = (*path).l[(*i).level as usize].b;
+        crate::rewrite_log_debug!(
+            "commit acc idx={idx} type={} u64s={} acc={acc_u64s}",
+            (*(*i).k).k.type_,
+            (*(*i).k).k.u64s
+        );
         #[cfg(debug_assertions)]
         {
             assert!(bpos_eq((*(*i).k).k.p, (*path).pos));
@@ -1974,6 +2127,7 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
                 super::bset_build::compact_mode::COMPACT_ALL,
             )
         {
+            crate::rewrite_log_debug!("commit compacted whiteouts idx={idx}");
             bch2_trans_node_reinit_iter(trans, b);
         }
         let mut old_key = bkey::default();
@@ -1992,6 +2146,10 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
         if !super::interior::bch2_btree_node_insert_fits(b, acc_u64s)
             && super::interior::want_new_bset((*trans).c, b).is_null()
         {
+            crate::rewrite_log_debug!(
+                "commit split_leaf idx={idx} acc={acc_u64s} u64s={}",
+                (*(*i).k).k.u64s
+            );
             let ret = super::interior::bch2_btree_split_leaf(
                 trans,
                 (*i).path,

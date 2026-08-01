@@ -1276,6 +1276,27 @@ pub unsafe fn bch2_btree_path_set_pos(
             (*path).should_be_locked = false;
             return path_idx;
         }
+        let np = *new_pos;
+        let (oi, oo, os, ni, no, ns) = unsafe {
+            (
+                core::ptr::addr_of!(old_pos.inode).read_unaligned(),
+                core::ptr::addr_of!(old_pos.offset).read_unaligned(),
+                core::ptr::addr_of!(old_pos.snapshot).read_unaligned(),
+                core::ptr::addr_of!(np.inode).read_unaligned(),
+                core::ptr::addr_of!(np.offset).read_unaligned(),
+                core::ptr::addr_of!(np.snapshot).read_unaligned(),
+            )
+        };
+        crate::rewrite_log_debug!(
+            "set_pos drop: lvl={level} b={b:p} old=({oi},{oo},{os}) new=({ni},{no},{ns}) in_node={} locked={} seq={}",
+            if !b.is_null() && btree_path_pos_in_node(path, b) { 1 } else { 0 },
+            if !b.is_null() && btree_node_locked(path, level) { 1 } else { 0 },
+            if !b.is_null() {
+                btree_node_lock_seq_matches(path, b, level) as u8
+            } else {
+                0
+            },
+        );
     }
     btree_path_unlock(path);
     (*path).level = 0;
@@ -1364,6 +1385,24 @@ pub unsafe fn bch2_btree_path_peek_slot(path: *mut btree_path, u: *mut bkey) -> 
         } else {
             *u = *(packed as *const bkey);
         }
+        let (up_i, up_o, up_s) = unsafe {
+            (
+                core::ptr::addr_of!((*u).p.inode).read_unaligned(),
+                core::ptr::addr_of!((*u).p.offset).read_unaligned(),
+                core::ptr::addr_of!((*u).p.snapshot).read_unaligned(),
+            )
+        };
+        let (pp_i, pp_o, pp_s) = unsafe {
+            (
+                core::ptr::addr_of!((*path).pos.inode).read_unaligned(),
+                core::ptr::addr_of!((*path).pos.offset).read_unaligned(),
+                core::ptr::addr_of!((*path).pos.snapshot).read_unaligned(),
+            )
+        };
+        crate::rewrite_log_debug!(
+            "peek_slot b={b:p} lvl={level} pk=({up_i},{up_o},{up_s})t{} path_pos=({pp_i},{pp_o},{pp_s})",
+            (*u).type_,
+        );
         if bpos_eq((*u).p, (*path).pos) {
             let value = (packed as *const u64).add(bkeyp_key_u64s(&(*b).format, &*packed) as usize);
             return bkey_s_c {
@@ -1777,6 +1816,14 @@ pub unsafe fn bch2_trans_iter_exit(iter: *mut btree_iter) {
 }
 
 pub unsafe fn bch2_btree_iter_set_pos(iter: *mut btree_iter, mut new_pos: bpos) {
+    let (n_i, n_o, n_s) = unsafe {
+        (
+            core::ptr::addr_of!(new_pos.inode).read_unaligned(),
+            core::ptr::addr_of!(new_pos.offset).read_unaligned(),
+            core::ptr::addr_of!(new_pos.snapshot).read_unaligned(),
+        )
+    };
+    crate::rewrite_log_debug!("set_pos: iter={iter:p} new=({n_i},{n_o},{n_s})");
     if iter.is_null() {
         return;
     }
@@ -2055,8 +2102,8 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
         );
         (*iter).update_path = 0;
     }
+    let mut search_key = (*iter).pos;
     loop {
-        let mut search_key = (*iter).pos;
         if (*iter).flags & BTREE_ITER_is_extents != 0 && !bkey_eq(search_key, POS_MAX) {
             search_key = if (*iter).flags & BTREE_ITER_all_snapshots != 0 {
                 super::bkey::bpos_successor(search_key)
@@ -2073,6 +2120,20 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
         );
         let path = (*trans).paths.add((*iter).path as usize);
         (*path).level = 0;
+        let (q_i, q_o, q_s, s_i, s_o, s_s) = unsafe {
+            (
+                core::ptr::addr_of!((*path).pos.inode).read_unaligned(),
+                core::ptr::addr_of!((*path).pos.offset).read_unaligned(),
+                core::ptr::addr_of!((*path).pos.snapshot).read_unaligned(),
+                core::ptr::addr_of!(search_key.inode).read_unaligned(),
+                core::ptr::addr_of!(search_key.offset).read_unaligned(),
+                core::ptr::addr_of!(search_key.snapshot).read_unaligned(),
+            )
+        };
+        crate::rewrite_log_debug!(
+            "peek_max loop: iter.path={} path.pos=({q_i},{q_o},{q_s}) search=({s_i},{s_o},{s_s})",
+            (*iter).path,
+        );
         let ret = bch2_btree_path_traverse_one(trans, (*iter).path, (*iter).flags);
         if ret != 0 {
             bch2_btree_iter_set_pos(iter, (*iter).pos);
@@ -2105,7 +2166,9 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
                         if bpos_eq((*journal_k).k.p, SPOS_MAX) {
                             return bkey_s_c::default();
                         }
-                        btree_iter_set_pos(iter, bpos_successor((*journal_k).k.p));
+                        /* 对照 bcachefs fs/btree/iter.c:2762-2763:
+                         * 更新 search_key 而非 iter.pos */
+                        search_key = bpos_successor((*journal_k).k.p);
                         continue;
                     }
                     (*iter).k = (*journal_k).k;
@@ -2126,10 +2189,49 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
                 };
             }
             let max = (*(*leaf).data).max_key;
-            if bpos_eq(max, SPOS_MAX) {
+            /* 对照 bcachefs fs/btree/iter.c:2760-2772:
+             * - bkey_le(l->b->key.k.p, *end): max 未超过搜索上限才跳
+             *   下一叶子，否则视为 end of btree
+             * - bpos_lt(l->b->key.k.p, SPOS_MAX): max 是 SPOS_MAX 时
+             *   树已遍历完
+             * - *search_key = bpos_successor(...): 跳叶子必须修改
+             *   循环外的 search_key（bcachefs 原样），不能经
+             *   btree_iter_set_pos（它在非 all_snapshots 模式会把
+             *   snapshot 覆盖回 iter.snapshot，使 successor 原地踏步
+             *   造成死循环）；也不能用 bpos_nosnap_successor
+             *   （offset+1），否则会跳过同 (inode, offset) 区间内
+             *   其它快照的 key */
+            if bpos_cmp(max, *end) > 0 || bpos_cmp(max, SPOS_MAX) >= 0 {
+                let (e_i, e_o, e_s, x_i, x_o, x_s, m_i, m_o, m_s, d_i, d_o, d_s) = unsafe {
+                    (
+                        core::ptr::addr_of!((*path).pos.inode).read_unaligned(),
+                        core::ptr::addr_of!((*path).pos.offset).read_unaligned(),
+                        core::ptr::addr_of!((*path).pos.snapshot).read_unaligned(),
+                        core::ptr::addr_of!((*iter).pos.inode).read_unaligned(),
+                        core::ptr::addr_of!((*iter).pos.offset).read_unaligned(),
+                        core::ptr::addr_of!((*iter).pos.snapshot).read_unaligned(),
+                        core::ptr::addr_of!(max.inode).read_unaligned(),
+                        core::ptr::addr_of!(max.offset).read_unaligned(),
+                        core::ptr::addr_of!(max.snapshot).read_unaligned(),
+                        core::ptr::addr_of!((*end).inode).read_unaligned(),
+                        core::ptr::addr_of!((*end).offset).read_unaligned(),
+                        core::ptr::addr_of!((*end).snapshot).read_unaligned(),
+                    )
+                };
+                crate::rewrite_log_debug!(
+                    "iter-end: max=({m_i},{m_o},{m_s}) end=({d_i},{d_o},{d_s}) path.pos=({e_i},{e_o},{e_s}) iter.pos=({x_i},{x_o},{x_s}) nodes_locked={}",
+                    (*path).nodes_locked,
+                );
+                /* 对照 bcachefs fs/btree/iter.c:2771-2772:
+                 * end 分支调用 bch2_btree_iter_set_pos（iter.h:690，
+                 * 只更新 iter.pos/iter.k，不解锁 path）；
+                 * 不能用 subvol 私有 btree_iter_set_pos（iter.rs:
+                 * 1979），它会 unlock path 并重置 path.pos，
+                 * 导致 peek 后 trans_update 断言 path 锁失败 */
+                bch2_btree_iter_set_pos(iter, SPOS_MAX);
                 return bkey_s_c::default();
             }
-            btree_iter_set_pos(iter, bpos_nosnap_successor(max));
+            search_key = bpos_successor(max);
             continue;
         }
 
@@ -2181,7 +2283,8 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
                     if bpos_eq((*journal_k).k.p, SPOS_MAX) {
                         return bkey_s_c::default();
                     }
-                    btree_iter_set_pos(iter, bpos_successor((*journal_k).k.p));
+                    /* 对照 bcachefs fs/btree/iter.c:2762-2763 */
+                    search_key = bpos_successor((*journal_k).k.p);
                     continue;
                 }
                 (*iter).k = (*journal_k).k;
@@ -2210,7 +2313,10 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
         }
         bch2_btree_trans_peek_updates(trans, iter, &mut ret, *end);
         if !ret.k.is_null() && (*ret.k).type_ == super::bset::KEY_TYPE_deleted {
-            let next = if bpos_eq((*iter).pos, (*ret.k).p) {
+            /* 对照 bcachefs fs/btree/iter.c:2760-2764:
+             * 更新 search_key 而非 iter.pos（iter.pos 的 snapshot
+             * 在非 all_snapshots 模式会覆盖 successor 的 snapshot） */
+            let next = if bpos_eq(search_key, (*ret.k).p) {
                 bpos_successor((*ret.k).p)
             } else {
                 (*ret.k).p
@@ -2218,7 +2324,7 @@ pub unsafe fn bch2_btree_iter_peek_max(iter: *mut btree_iter, end: *const bpos) 
             if bpos_eq(next, SPOS_MAX) {
                 return bkey_s_c::default();
             }
-            btree_iter_set_pos(iter, next);
+            search_key = next;
             continue;
         }
         if !ret.k.is_null() {
@@ -2930,6 +3036,17 @@ pub unsafe fn bch2_btree_iter_advance(iter: *mut btree_iter) -> bool {
             bpos_with_snapshot(bpos_nosnap_successor(pos), (*iter).snapshot)
         };
     }
+    let (pi, po, ps, ni, no, ns) = unsafe {
+        (
+            core::ptr::addr_of!(pos.inode).read_unaligned(),
+            core::ptr::addr_of!(pos.offset).read_unaligned(),
+            core::ptr::addr_of!(pos.snapshot).read_unaligned(),
+            core::ptr::addr_of!(next.inode).read_unaligned(),
+            core::ptr::addr_of!(next.offset).read_unaligned(),
+            core::ptr::addr_of!(next.snapshot).read_unaligned(),
+        )
+    };
+    crate::rewrite_log_debug!("iter advance: ({pi},{po},{ps}) -> ({ni},{no},{ns}) ret={ret}");
     btree_iter_set_pos(iter, next);
     ret
 }
@@ -3528,10 +3645,10 @@ mod tests {
     fn traverses_root_and_advances_across_leaf_nodes() {
         unsafe {
             let mut left = owned_node::leaf(POS_MIN, SPOS(1, 50, 0), &[10, 20]);
-            let mut right = owned_node::leaf(SPOS(1, 51, 0), SPOS_MAX, &[60, 70]);
+            let mut right = owned_node::leaf(SPOS(1, 50, 1), SPOS_MAX, &[60, 70]);
             let mut root = owned_node::interior(&[
                 (&mut *left.node, POS_MIN, SPOS(1, 50, 0)),
-                (&mut *right.node, SPOS(1, 51, 0), SPOS_MAX),
+                (&mut *right.node, SPOS(1, 50, 1), SPOS_MAX),
             ]);
             let mut c = bch_fs::default();
             bch2_btree_id_root_set(&mut c, 0, &mut *root.node);

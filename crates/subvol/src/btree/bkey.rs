@@ -507,6 +507,32 @@ pub fn bch2_bkey_pack_pos_lossy(
 pub fn __bch2_bkey_unpack_key(format: &bkey_format, out: &mut bkey, input: &bkey_packed) {
     assert_eq!(format.nr_fields, BKEY_NR_FIELDS);
     assert!(input.u64s >= format.key_u64s);
+    if input.format & 0x7f != KEY_FORMAT_LOCAL_BTREE {
+        let first_words = unsafe {
+            [
+                (input as *const bkey_packed as *const u64).read_unaligned(),
+                (input as *const bkey_packed as *const u64)
+                    .add(1)
+                    .read_unaligned(),
+                (input as *const bkey_packed as *const u64)
+                    .add(2)
+                    .read_unaligned(),
+                (input as *const bkey_packed as *const u64)
+                    .add(3)
+                    .read_unaligned(),
+            ]
+        };
+        crate::rewrite_log_error!(
+            "unpack_key bad format: input u64s={} format={:#x} key_u64s={} first_words=[{:#x}, {:#x}, {:#x}, {:#x}]",
+            input.u64s,
+            input.format,
+            format.key_u64s,
+            first_words[0],
+            first_words[1],
+            first_words[2],
+            first_words[3],
+        );
+    }
     assert_eq!(input.format & 0x7f, KEY_FORMAT_LOCAL_BTREE);
     let out_u64s = input.u64s as u32 - format.key_u64s as u32 + BKEY_U64S as u32;
     assert!(out_u64s <= u8::MAX as u32);
@@ -810,11 +836,10 @@ pub const fn bpos_min(l: bpos, r: bpos) -> bpos {
 }
 
 pub fn bch2_key_resize(k: &mut bkey, new_size: u32) {
-    k.p.offset = k
-        .p
-        .offset
-        .wrapping_sub(k.size as u64)
-        .wrapping_add(new_size as u64);
+    k.p.offset =
+        k.p.offset
+            .wrapping_sub(k.size as u64)
+            .wrapping_add(new_size as u64);
     k.size = new_size;
 }
 
@@ -914,11 +939,7 @@ pub const fn bch2_bkey_maybe_mergable(l: &bkey, r: &bkey) -> bool {
 }
 
 /// Matches the currently implemented `key_merge` operation in bcachefs.
-pub unsafe fn bch2_bkey_merge(
-    _c: *mut super::types::bch_fs,
-    l: bkey_s,
-    r: bkey_s_c,
-) -> bool {
+pub unsafe fn bch2_bkey_merge(_c: *mut super::types::bch_fs, l: bkey_s, r: bkey_s_c) -> bool {
     if l.k.is_null() || r.k.is_null() {
         return false;
     }

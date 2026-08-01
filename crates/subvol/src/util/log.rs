@@ -1,5 +1,6 @@
 use core::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::OnceLock;
 
 pub const LOG_OFF: u8 = 0;
 pub const LOG_ERROR: u8 = 1;
@@ -8,12 +9,30 @@ pub const LOG_INFO: u8 = 3;
 pub const LOG_DEBUG: u8 = 4;
 
 static LOG_LEVEL: AtomicU8 = AtomicU8::new(LOG_OFF);
+static INIT: OnceLock<()> = OnceLock::new();
+
+fn ensure_init() {
+    let _ = INIT.get_or_init(|| {
+        let value = std::env::var("SUBVOL_REWRITE_LOG")
+            .ok()
+            .or_else(|| std::env::var("SUBVOL_LOG").ok());
+        let level = match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Some("1") | Some("true") | Some("yes") | Some("info") => LOG_INFO,
+            Some("error") => LOG_ERROR,
+            Some("warn") | Some("warning") => LOG_WARN,
+            Some("debug") | Some("verbose") => LOG_DEBUG,
+            _ => LOG_OFF,
+        };
+        set_level(level);
+    });
+}
 
 pub fn set_level(level: u8) {
     LOG_LEVEL.store(level.min(LOG_DEBUG), Ordering::Release);
 }
 
 pub fn level() -> u8 {
+    ensure_init();
     LOG_LEVEL.load(Ordering::Acquire)
 }
 
@@ -22,17 +41,7 @@ pub fn enabled(required: u8) -> bool {
 }
 
 pub fn init_from_env() {
-    let value = std::env::var("SUBVOL_REWRITE_LOG")
-        .ok()
-        .or_else(|| std::env::var("SUBVOL_LOG").ok());
-    let level = match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
-        Some("1") | Some("true") | Some("yes") | Some("info") => LOG_INFO,
-        Some("error") => LOG_ERROR,
-        Some("warn") | Some("warning") => LOG_WARN,
-        Some("debug") | Some("verbose") => LOG_DEBUG,
-        _ => LOG_OFF,
-    };
-    set_level(level);
+    ensure_init();
 }
 
 pub fn emit(level: u8, label: &str, args: fmt::Arguments<'_>) {

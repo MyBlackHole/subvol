@@ -1037,12 +1037,7 @@ pub fn bch2_journal_flush(j: &journal) -> i32 {
                 + crate::btree::types::BKEY_BTREE_PTR_VAL_U64S_MAX);
         let roots_start = JSET_HEADER_U64S + used;
         record.resize(roots_start + reserved, 0);
-        let mut end = unsafe {
-            record
-                .as_mut_ptr()
-                .add(roots_start)
-                .cast::<jset_entry>()
-        };
+        let mut end = unsafe { record.as_mut_ptr().add(roots_start).cast::<jset_entry>() };
         end = unsafe { crate::btree::interior::bch2_btree_roots_to_journal_entries(c, end, 0) };
         let appended = end as usize - (record.as_ptr() as usize + 8 * roots_start);
         assert!(appended <= reserved * core::mem::size_of::<u64>());
@@ -1525,6 +1520,15 @@ pub(crate) fn bch2_journal_restore_for_replay(
     if cur_seq == 0 || cur_seq > JOURNAL_SEQ_MAX {
         return -1;
     }
+    crate::rewrite_log_debug!(
+        "restore_for_replay cur_seq={cur_seq} nrecords={} first_seqs={:?}",
+        records.len(),
+        records
+            .iter()
+            .filter(|r| r.len() >= JSET_HEADER_U64S)
+            .map(|r| r[3])
+            .collect::<Vec<_>>(),
+    );
 
     let mut first_seq = cur_seq;
     let mut previous = 0u64;
@@ -1638,9 +1642,7 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
      * records it hands replay are contiguous; reclaimed records before
      * last_seq may already be gone, so the window may begin past
      * replay_start.  Enforce in-window contiguity only. */
-    let mut expected = selected
-        .first()
-        .map_or(replay_start, |(first, _)| *first);
+    let mut expected = selected.first().map_or(replay_start, |(first, _)| *first);
     for (seq, _) in &selected {
         if *seq != expected {
             return -8;
@@ -1772,6 +1774,18 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
                     }
                     let ret =
                         bch2_journal_replay_key(c, (*entry).btree_id, (*entry).level, key, *seq);
+                    let kp = unsafe { core::ptr::addr_of!((*key).k.p).read_unaligned() };
+                    let (k_i, k_o, k_s) = (
+                        unsafe { core::ptr::addr_of!(kp.inode).read_unaligned() },
+                        unsafe { core::ptr::addr_of!(kp.offset).read_unaligned() },
+                        unsafe { core::ptr::addr_of!(kp.snapshot).read_unaligned() },
+                    );
+                    crate::rewrite_log_debug!(
+                        "replay_key seq={seq} id={} lvl={} p=({k_i},{k_o},{k_s}) u64s={} ret={ret}",
+                        (*entry).btree_id,
+                        (*entry).level,
+                        key_u64s,
+                    );
                     if ret != 0 {
                         return ret;
                     }

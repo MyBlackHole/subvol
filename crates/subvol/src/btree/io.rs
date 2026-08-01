@@ -47,20 +47,14 @@ pub unsafe fn bch2_btree_node_io_lock(b: *mut btree) {
     super::types::set_btree_node_write_in_flight(b);
 }
 
-pub unsafe fn bch2_btree_node_wait_on_read(
-    _trans: *mut super::iter::btree_trans,
-    b: *mut btree,
-) {
+pub unsafe fn bch2_btree_node_wait_on_read(_trans: *mut super::iter::btree_trans, b: *mut btree) {
     assert!(!b.is_null());
     while super::types::btree_node_read_in_flight(b) {
         std::thread::yield_now();
     }
 }
 
-pub unsafe fn bch2_btree_node_wait_on_write(
-    _trans: *mut super::iter::btree_trans,
-    b: *mut btree,
-) {
+pub unsafe fn bch2_btree_node_wait_on_write(_trans: *mut super::iter::btree_trans, b: *mut btree) {
     assert!(!b.is_null());
     while btree_node_write_in_flight(b) {
         std::thread::yield_now();
@@ -105,8 +99,7 @@ pub unsafe fn bch2_btree_node_write_trans(
     if !already_started
         && ((*b).flags & (1usize << BTREE_NODE_dirty) == 0
             || btree_node_write_in_flight(b)
-            || (flags & BTREE_WRITE_only_if_need != 0
-                && !super::types::btree_node_need_write(b))
+            || (flags & BTREE_WRITE_only_if_need != 0 && !super::types::btree_node_need_write(b))
             || super::types::btree_node_never_write(b)
             || super::types::btree_node_write_blocked(b)
             || ((*b).written != 0 && super::types::btree_node_will_make_reachable(b)))
@@ -826,11 +819,11 @@ pub(crate) unsafe fn bch2_btree_node_get_noiter_unlocked(
                 &mut (*c).btree.cache.table,
                 &hash_val as *const u64 as *const _,
             );
-                if !raced.is_null() {
-                    if !super::types::btree_node_accessed(raced.cast()) {
-                        super::types::set_btree_node_accessed(raced.cast());
-                    }
-                    let _ = super::cache::bch2_btree_node_transition_state(
+            if !raced.is_null() {
+                if !super::types::btree_node_accessed(raced.cast()) {
+                    super::types::set_btree_node_accessed(raced.cast());
+                }
+                let _ = super::cache::bch2_btree_node_transition_state(
                     &mut (*c).btree.cache,
                     node,
                     super::types::btree_node_cache_state::BTREE_NODE_CACHE_FREED,
@@ -932,23 +925,15 @@ pub unsafe fn bch2_btree_node_get(
     }
 
     let path_lock = match lock_type {
-        crate::lock::six::six_lock_type::SIX_LOCK_intent => {
-            super::iter::BTREE_NODE_INTENT_LOCKED
-        }
-        crate::lock::six::six_lock_type::SIX_LOCK_read => {
-            super::iter::BTREE_NODE_READ_LOCKED
-        }
-        crate::lock::six::six_lock_type::SIX_LOCK_write => {
-            super::iter::BTREE_NODE_WRITE_LOCKED
-        }
+        crate::lock::six::six_lock_type::SIX_LOCK_intent => super::iter::BTREE_NODE_INTENT_LOCKED,
+        crate::lock::six::six_lock_type::SIX_LOCK_read => super::iter::BTREE_NODE_READ_LOCKED,
+        crate::lock::six::six_lock_type::SIX_LOCK_write => super::iter::BTREE_NODE_WRITE_LOCKED,
     };
     if super::iter::btree_node_lock_type(trans, path, node, level as usize, path_lock) != 0 {
         return core::ptr::null_mut();
     }
 
-    if (*node).c.btree_id != (*path).btree_id
-        || (*node).c.level != level
-    {
+    if (*node).c.btree_id != (*path).btree_id || (*node).c.level != level {
         match lock_type {
             crate::lock::six::six_lock_type::SIX_LOCK_intent => {
                 crate::lock::six::six_unlock_intent(&(*node).c.lock)
@@ -1070,8 +1055,7 @@ pub unsafe fn bch2_btree_root_read(
     }
     core::ptr::copy_nonoverlapping(
         key.cast::<u64>(),
-        (&mut (*super::types::bch2_btree_id_root(c, id as usize)).key
-            as *mut super::bkey::bkey_i)
+        (&mut (*super::types::bch2_btree_id_root(c, id as usize)).key as *mut super::bkey::bkey_i)
             .cast::<u64>(),
         (*key).k.u64s as usize,
     );
@@ -1250,10 +1234,7 @@ mod tests {
         use std::os::unix::fs::FileExt;
 
         unsafe {
-            let path = std::env::temp_dir().join(format!(
-                "subvol-btree-io-{}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir().join(format!("subvol-btree-io-{}", std::process::id()));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -1363,10 +1344,8 @@ mod tests {
         use crate::btree::types::bch_fs;
 
         unsafe {
-            let path = std::env::temp_dir().join(format!(
-                "subvol-btree-root-{}",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("subvol-btree-root-{}", std::process::id()));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -1530,10 +1509,8 @@ mod tests {
         use std::os::unix::fs::FileExt;
 
         unsafe {
-            let path = std::env::temp_dir().join(format!(
-                "subvol-btree-multiset-{}",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("subvol-btree-multiset-{}", std::process::id()));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -1620,8 +1597,7 @@ mod tests {
             assert_eq!((*node_ptr).v.sectors_written, 2);
 
             let mut recovered_words = vec![0u64; 256];
-            let mut recovered_aux =
-                vec![0u64; crate::btree::types::__btree_aux_data_bytes(11) / 8];
+            let mut recovered_aux = vec![0u64; crate::btree::types::__btree_aux_data_bytes(11) / 8];
             let mut recovered = btree::default();
             recovered.data = recovered_words.as_mut_ptr().cast();
             recovered.aux_data = recovered_aux.as_mut_ptr().cast();
