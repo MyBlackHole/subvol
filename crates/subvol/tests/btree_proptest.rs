@@ -75,6 +75,54 @@ fn op_group_strategy() -> impl Strategy<Value = OpGroup> {
     ]
 }
 
+/// 多快照测试的快照 id 池：覆盖 bcachefs 快照 id 分配的关键边界
+/// （fs/snapshots/snapshot.c create_snapids 从 u32::MAX 递减分配）：
+/// - `u32::MAX` 族：首个快照 id 与递减分配
+/// - `127/128/129`：IS_ANCESTOR_BITMAP（128）祖先位图覆盖边界
+/// - `0/3`：小 id（非快照键）
+fn multi_snapshot_pool() -> impl Strategy<Value = u32> {
+    prop::sample::select(vec![
+        0u32,
+        3,
+        127,
+        128,
+        129,
+        u32::MAX - 2,
+        u32::MAX - 1,
+        u32::MAX,
+    ])
+}
+
+/// 多快照操作：小 (inode, offset) 空间（制造同位置多版本共存）×
+/// 大快照 id 空间（跨边界 id）。
+fn multi_snapshot_op_strategy() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        (
+            (1u64..=2, 1u64..=8),
+            multi_snapshot_pool(),
+            value_strategy()
+        )
+            .prop_map(|((i, o), s, v)| Op::Put {
+                inode: i,
+                offset: o,
+                snapshot: s,
+                value: v,
+            }),
+        ((1u64..=2, 1u64..=8), multi_snapshot_pool()).prop_map(|((i, o), s)| Op::Delete {
+            inode: i,
+            offset: o,
+            snapshot: s,
+        }),
+    ]
+}
+
+fn multi_snapshot_op_group_strategy() -> impl Strategy<Value = OpGroup> {
+    prop_oneof![
+        multi_snapshot_op_strategy().prop_map(OpGroup::Single),
+        prop::collection::vec(multi_snapshot_op_strategy(), 2..=6).prop_map(OpGroup::Batch),
+    ]
+}
+
 fn position(inode: u64, offset: u64, snapshot: u32) -> KeyPosition {
     KeyPosition::new(inode, offset, snapshot)
 }
@@ -269,6 +317,53 @@ proptest! {
                         "注入 JournalWrite 后 sync 必须失败 step={step}"
                     );
                 }
+                engine.sync().unwrap();
+                drop(engine);
+                engine = StorageEngine::open_persistent(&dir).unwrap();
+                assert_model(&engine, &model);
+            }
+        }
+        engine.sync().unwrap();
+        drop(engine);
+        let recovered = StorageEngine::open_persistent(&dir).unwrap();
+        assert_model(&recovered, &model);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn multi_snapshot_versions_coexist_and_recover(
+        ops in prop::collection::vec(multi_snapshot_op_group_strategy(), 1..=MAX_OPS),
+        crash_every in 9usize..=17,
+    ) {
+        /* 多快照键空间属性测试（AGENTS.md 交付重点：btree 操作正确性与
+         * journal 持久化恢复）：快照 id 覆盖 u32::MAX 递减分配族与
+         * IS_ANCESTOR_BITMAP 边界，小 (inode, offset) 空间使同一位置
+         * 多快照版本共存。验证：
+         * 1. 各快照版本独立读写（get 精确匹配，无跨快照污染）
+         * 2. scan 全序（KeyPosition Ord = bpos_cmp 的 (inode, offset,
+         *    snapshot) 字典序，bkey.rs:780）
+         * 3. 崩溃恢复（open_persistent）后全部快照版本保留 */
+        let dir = unique_tmp_dir();
+        let mut engine = StorageEngine::create_persistent(&dir).unwrap();
+        let mut model = BTreeMap::new();
+
+        for (step, group) in ops.iter().enumerate() {
+            apply_group(&engine, group).unwrap();
+            for op in ops_of(group) {
+                apply_model(&mut model, op);
+            }
+
+            let probes = step % 4 + 1;
+            for (pos, val) in model.iter().take(probes) {
+                let got = engine.get(BtreeId::DEFAULT, *pos).unwrap();
+                assert_eq!(
+                    got.as_ref().map(BtreeKey::value),
+                    Some(val.as_slice()),
+                    "快照版本读取不一致 step={step} @ {pos:?}"
+                );
+            }
+
+            if step % crash_every == crash_every - 1 {
                 engine.sync().unwrap();
                 drop(engine);
                 engine = StorageEngine::open_persistent(&dir).unwrap();
