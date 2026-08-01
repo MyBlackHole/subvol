@@ -1358,13 +1358,7 @@ unsafe fn scan_raw_locked(fs: &mut bch_fs, btree: u8) -> Result<Vec<RawScannedKe
     bch2_trans_init(&mut trans, fs);
     bch2_trans_begin(&mut trans);
     let mut iter = btree_iter::default();
-    bch2_trans_iter_init(
-        &mut trans,
-        &mut iter,
-        btree,
-        POS_MIN,
-        BTREE_ITER_intent | BTREE_ITER_all_snapshots,
-    );
+    bch2_trans_iter_init(&mut trans, &mut iter, btree, POS_MIN, BTREE_ITER_intent);
     let mut output = Vec::new();
     let mut current = bch2_btree_iter_peek(&mut iter);
     let result = loop {
@@ -1381,7 +1375,18 @@ unsafe fn scan_raw_locked(fs: &mut bch_fs, btree: u8) -> Result<Vec<RawScannedKe
                 break Err(EngineError::Transaction(-1));
             }
             let mut words = vec![0u64; u64s];
-            core::ptr::copy_nonoverlapping(current.k.cast::<u64>(), words.as_mut_ptr(), u64s);
+            core::ptr::copy_nonoverlapping(
+                current.k.cast::<u64>(),
+                words.as_mut_ptr(),
+                BKEY_U64S as usize,
+            );
+            if u64s > BKEY_U64S as usize {
+                core::ptr::copy_nonoverlapping(
+                    current.v.cast::<u64>(),
+                    words.as_mut_ptr().add(BKEY_U64S as usize),
+                    u64s - BKEY_U64S as usize,
+                );
+            }
             output.push(RawScannedKey { btree, words });
         }
         current = bch2_btree_iter_next(&mut iter);

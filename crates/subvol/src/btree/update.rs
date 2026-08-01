@@ -3298,6 +3298,8 @@ mod tests {
             }
             bch2_trans_put(&mut trans);
 
+            assert!(crate::engine::check_extents_to_backpointers(&mut c).is_ok());
+
             let mut check = btree_trans::default();
             bch2_trans_init(&mut check, &mut c);
             bch2_trans_begin(&mut check);
@@ -3316,6 +3318,15 @@ mod tests {
             assert_eq!(bp_value.pos, pos);
             bch2_trans_iter_exit(&mut bp_iter);
             bch2_trans_put(&mut check);
+
+            let mut corrupt = btree_trans::default();
+            bch2_trans_init(&mut corrupt, &mut c);
+            bch2_trans_begin(&mut corrupt);
+            assert_eq!(bch2_btree_delete(&mut corrupt, 4, POS(0, 2), 0), 0);
+            assert_eq!(bch2_trans_commit(&mut corrupt), 0);
+            bch2_trans_put(&mut corrupt);
+            assert!(crate::engine::check_extents_to_backpointers(&mut c).is_err());
+
             bch2_free_super(&mut c.disk_sb);
         }
     }
