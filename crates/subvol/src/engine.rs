@@ -1363,7 +1363,7 @@ unsafe fn scan_raw_locked(fs: &mut bch_fs, btree: u8) -> Result<Vec<RawScannedKe
         &mut iter,
         btree,
         POS_MIN,
-        BTREE_ITER_not_extents | BTREE_ITER_snapshot_field | BTREE_ITER_all_snapshots,
+        BTREE_ITER_intent | BTREE_ITER_all_snapshots,
     );
     let mut output = Vec::new();
     let mut current = bch2_btree_iter_peek(&mut iter);
@@ -1391,7 +1391,7 @@ unsafe fn scan_raw_locked(fs: &mut bch_fs, btree: u8) -> Result<Vec<RawScannedKe
     result.map(|()| output)
 }
 
-unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<(), EngineError> {
+pub(crate) unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<(), EngineError> {
     let mut primary = Vec::new();
     for id in 0..BTREE_ID_NR as u8 {
         if id != 4 && id != 8 {
