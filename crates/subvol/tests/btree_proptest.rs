@@ -14,6 +14,8 @@
 //! 双基准差距项，AGENTS.md 明确要求属性测试验证），不构成运行时逻辑。
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use proptest::prelude::*;
@@ -21,6 +23,41 @@ use subvol::{BtreeId, BtreeKey, EngineError, FaultPoint, KeyPosition, StorageEng
 
 const CASES: u32 = 64;
 const MAX_OPS: usize = 120;
+
+/* 镜像 journal 布局（与 engine.rs 的 JOURNAL_FILE_SECTORS/JOURNAL_BUCKET_SIZE
+ * 常量一致）：4 个 1MB bucket，从镜像 offset 1MB（JOURNAL_BUCKET_START=1）起。 */
+const JOURNAL_BUCKET_START: u64 = 1;
+const JOURNAL_BUCKET_SIZE: u64 = 2_048;
+
+/// 扫描 bucket0 返回 `(最后非零 8 字节块起点, 尾部空白扇区偏移)`：
+/// 两阶段扫描（扇区粒度定位最后非零扇区，再 8 字节粒度细化），
+/// 最后非零块必落在某条记录内（位置字段非零），尾部空白恒在 bucket 末端。
+fn journal_bucket0_scan(file: &File) -> (u64, u64) {
+    let bucket0 = JOURNAL_BUCKET_START * JOURNAL_BUCKET_SIZE * 512;
+    let bucket0_end = bucket0 + JOURNAL_BUCKET_SIZE * 512;
+    let mut probe = [0u8; 512];
+    let mut last_sector = None;
+    let mut off = bucket0;
+    while off < bucket0_end {
+        file.read_exact_at(&mut probe, off).unwrap();
+        if probe.iter().any(|b| *b != 0) {
+            last_sector = Some(off);
+        }
+        off += 512;
+    }
+    let sector = last_sector.expect("bucket0 必须含至少一条记录");
+    let mut last_block = sector;
+    let mut block = [0u8; 8];
+    let mut b = sector;
+    while b < sector + 512 {
+        file.read_exact_at(&mut block, b).unwrap();
+        if block.iter().any(|x| *x != 0) {
+            last_block = b;
+        }
+        b += 8;
+    }
+    (last_block, bucket0_end - 8)
+}
 
 fn key_strategy() -> impl Strategy<Value = (u64, u64, u32)> {
     (1u64..=3, 1u64..=24, 0u32..=2)
@@ -372,6 +409,117 @@ proptest! {
         }
         engine.sync().unwrap();
         drop(engine);
+        let recovered = StorageEngine::open_persistent(&dir).unwrap();
+        assert_model(&recovered, &model);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn journal_corruption_detection_in_random_state(
+        ops in prop::collection::vec(op_group_strategy(), 1..=MAX_OPS),
+    ) {
+        /* journal 损坏注入属性测试（AGENTS.md 交付重点：journal 持久化
+         * 与恢复、损坏检测）：随机操作序列落盘后，确定性注入两类损坏
+         * ——首个记录头部 version 破坏与最后一条记录 payload 校验和破坏
+         * ——恢复（open_persistent）必须拒绝（对齐 bch2_journal_read 的
+         * 校验失败路径，read.c:406 起 csum 校验 / validate.c 结构校验），
+         * 不得静默恢复错误数据；字节修复后必须恢复出完整模型。 */
+        let dir = unique_tmp_dir();
+        let engine = StorageEngine::create_persistent(&dir).unwrap();
+        let mut model = BTreeMap::new();
+        for group in &ops {
+            apply_group(&engine, group).unwrap();
+            for op in ops_of(group) {
+                apply_model(&mut model, op);
+            }
+        }
+        engine.sync().unwrap();
+        drop(engine);
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dir)
+            .unwrap();
+        let bucket0 = JOURNAL_BUCKET_START * JOURNAL_BUCKET_SIZE as u64 * 512;
+
+        /* version_flags 位于 jset 头部 offset 32（csum 16B + magic 8B +
+         * seq 8B），低 32 位为版本号：翻转最低字节后版本必失配 -> -5。 */
+        let mut byte = [0u8; 1];
+        assert_eq!(file.read_at(&mut byte, bucket0 + 32).unwrap(), 1);
+        byte[0] ^= 1;
+        assert_eq!(file.write_at(&byte, bucket0 + 32).unwrap(), 1);
+        let rejected = StorageEngine::open_persistent(&dir);
+        assert!(
+            matches!(rejected, Err(EngineError::Journal(-5))),
+            "version 损坏必须被恢复拒绝"
+        );
+        byte[0] ^= 1;
+        assert_eq!(file.write_at(&byte, bucket0 + 32).unwrap(), 1);
+
+        /* 校验和破坏 -> -6（读扫描即校验）：从最后非零块起逐候选前移，
+         * 直到命中被 csum 覆盖的 payload 块（位置字段必非零且在覆盖内）。 */
+        let (last_nonzero, _) = journal_bucket0_scan(&file);
+        let mut corrupt = last_nonzero;
+        loop {
+            assert!(
+                corrupt >= bucket0,
+                "扫描越界：未找到校验和覆盖的 payload 块"
+            );
+            let mut byte = [0u8; 1];
+            assert_eq!(file.read_at(&mut byte, corrupt).unwrap(), 1);
+            byte[0] ^= 1;
+            assert_eq!(file.write_at(&byte, corrupt).unwrap(), 1);
+            let rejected = StorageEngine::open_persistent(&dir);
+            byte[0] ^= 1;
+            assert_eq!(file.write_at(&byte, corrupt).unwrap(), 1);
+            if matches!(rejected, Err(EngineError::Journal(-6))) {
+                break;
+            }
+            corrupt -= 8;
+        }
+        file.sync_all().unwrap();
+        drop(file);
+
+        /* 字节修复后恢复：模型必须完整一致（损坏拒绝路径不落盘）。 */
+        let recovered = StorageEngine::open_persistent(&dir).unwrap();
+        assert_model(&recovered, &model);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn journal_corruption_benign_tail_ignored(
+        ops in prop::collection::vec(op_group_strategy(), 1..=MAX_OPS),
+    ) {
+        /* journal 空白区损坏不误报属性测试：bucket 尾部（记录从未到达
+         * 的空白扇区）翻转不得破坏恢复——对齐 bcachefs 对空白区的跳过
+         * （read.c:372-383 JOURNAL_ENTRY_NONE -> 跳过），恢复必须成功
+         * 且模型完整一致。 */
+        let dir = unique_tmp_dir();
+        let engine = StorageEngine::create_persistent(&dir).unwrap();
+        let mut model = BTreeMap::new();
+        for group in &ops {
+            apply_group(&engine, group).unwrap();
+            for op in ops_of(group) {
+                apply_model(&mut model, op);
+            }
+        }
+        engine.sync().unwrap();
+        drop(engine);
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dir)
+            .unwrap();
+        let (_, tail_blank) = journal_bucket0_scan(&file);
+        let mut byte = [0u8; 1];
+        assert_eq!(file.read_at(&mut byte, tail_blank).unwrap(), 1);
+        byte[0] ^= 1;
+        assert_eq!(file.write_at(&byte, tail_blank).unwrap(), 1);
+        file.sync_all().unwrap();
+        drop(file);
+
         let recovered = StorageEngine::open_persistent(&dir).unwrap();
         assert_model(&recovered, &model);
         let _ = std::fs::remove_file(&dir);
