@@ -1344,6 +1344,7 @@ unsafe fn configure_persistent_journal(
         return Err(EngineError::Transaction(-1));
     }
 
+    let file_sectors = file.metadata()?.len().div_ceil(512);
     let sb = fs.disk_sb.sb;
     (*sb).version = bcachefs_metadata_version_current;
     (*sb).version_min = bcachefs_metadata_version_current;
@@ -1371,7 +1372,11 @@ unsafe fn configure_persistent_journal(
         .add(core::mem::size_of::<bch_sb_field_members_v2>())
         .cast::<bch_member>() = bch_member {
         uuid: ENGINE_JOURNAL_UUID,
-        nbuckets: JOURNAL_FILE_SECTORS / JOURNAL_BUCKET_SIZE as u64,
+        /* The fixed journal occupies the initial range, but btree-node
+         * slots are appended after it.  Reopening must reconstruct geometry
+         * from the whole device or replay rejects those physical pointers as
+         * out of bounds. */
+        nbuckets: file_sectors.div_ceil(JOURNAL_BUCKET_SIZE as u64),
         first_bucket: 0,
         bucket_size: JOURNAL_BUCKET_SIZE,
         ..Default::default()
