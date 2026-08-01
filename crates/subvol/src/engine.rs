@@ -147,6 +147,13 @@ pub enum FaultPoint {
     JournalWrite,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryFaultPoint {
+    AfterJournalReplay,
+    DuringDerivedRebuild,
+    BeforePublication,
+}
+
 /// A durable journal image captured after successful flushes.  It models the
 /// state a fresh engine receives after a crash; unflushed transaction updates
 /// are intentionally absent.
@@ -709,6 +716,13 @@ impl StorageEngine {
     /// Reconstructs an engine from a crash image captured by
     /// `durable_journal()`.
     pub fn recover(snapshot: &JournalSnapshot) -> Result<Self, EngineError> {
+        Self::recover_with_fault(snapshot, None)
+    }
+
+    pub fn recover_with_fault(
+        snapshot: &JournalSnapshot,
+        fault: Option<RecoveryFaultPoint>,
+    ) -> Result<Self, EngineError> {
         if snapshot.format_version != STORAGE_FORMAT_VERSION {
             return Err(EngineError::UnsupportedFormatVersion(
                 snapshot.format_version,
@@ -730,7 +744,16 @@ impl StorageEngine {
             if ret != 0 {
                 return Err(EngineError::Journal(ret));
             }
-            rebuild_derived_state(&mut **fs)?;
+            if fault == Some(RecoveryFaultPoint::AfterJournalReplay) {
+                return Err(EngineError::Journal(-4));
+            }
+            if fault == Some(RecoveryFaultPoint::DuringDerivedRebuild) {
+                return Err(EngineError::Journal(-4));
+            }
+            rebuild_derived_state(&mut **fs, fault)?;
+            if fault == Some(RecoveryFaultPoint::BeforePublication) {
+                return Err(EngineError::Journal(-4));
+            }
             check_extents_to_backpointers(&mut **fs)?;
         }
         drop(fs);
@@ -971,7 +994,7 @@ impl StorageEngine {
             if ret != 0 {
                 return Err(EngineError::Journal(ret));
             }
-            rebuild_derived_state(&mut **fs)?;
+            rebuild_derived_state(&mut **fs, None)?;
             check_extents_to_backpointers(&mut **fs)?;
         }
         drop(fs);
@@ -1231,7 +1254,10 @@ unsafe fn get_locked(
     result
 }
 
-unsafe fn rebuild_derived_state(fs: &mut bch_fs) -> Result<(), EngineError> {
+unsafe fn rebuild_derived_state(
+    fs: &mut bch_fs,
+    fault: Option<RecoveryFaultPoint>,
+) -> Result<(), EngineError> {
     let sb = fs.disk_sb.sb;
     if sb.is_null() || crate::sb::io::bch2_sb_field_get_id(sb, BCH_SB_FIELD_members_v2).is_null() {
         return Ok(());
@@ -1242,6 +1268,10 @@ unsafe fn rebuild_derived_state(fs: &mut bch_fs) -> Result<(), EngineError> {
         if ret != 0 {
             return Err(EngineError::Transaction(ret));
         }
+    }
+
+    if fault == Some(RecoveryFaultPoint::DuringDerivedRebuild) {
+        return Err(EngineError::Journal(-4));
     }
 
     /* recovery.c's replay has already installed all primary keys with norun.
@@ -1294,6 +1324,9 @@ unsafe fn rebuild_derived_state(fs: &mut bch_fs) -> Result<(), EngineError> {
         bch2_trans_put(&mut trans);
 
         for mut key in keys {
+            if fault == Some(RecoveryFaultPoint::DuringDerivedRebuild) {
+                return Err(EngineError::Journal(-4));
+            }
             let ret = bch2_rebuild_derived_for_key(fs, id, 0, &mut key);
             if ret != 0 {
                 return Err(EngineError::Transaction(ret));
@@ -1789,6 +1822,22 @@ mod tests {
         );
         drop(recovered);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recovery_fault_matrix_never_publishes_success() {
+        let engine = StorageEngine::new().unwrap();
+        let snapshot = engine.durable_journal().unwrap();
+        for fault in [
+            RecoveryFaultPoint::AfterJournalReplay,
+            RecoveryFaultPoint::DuringDerivedRebuild,
+            RecoveryFaultPoint::BeforePublication,
+        ] {
+            assert!(
+                StorageEngine::recover_with_fault(&snapshot, Some(fault)).is_err(),
+                "fault {fault:?} unexpectedly published"
+            );
+        }
     }
 
     #[test]
