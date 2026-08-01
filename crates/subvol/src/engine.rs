@@ -216,12 +216,22 @@ pub struct EngineMetrics {
     pub reclaim: ReclaimStatus,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerivedStateMismatch {
+    InvalidPointer,
+    Generation,
+    DuplicateBackpointer,
+    AllocSet,
+    BackpointerSet,
+}
+
 #[derive(Debug)]
 pub enum EngineError {
     InvalidBtreeId(u8),
     ValueTooLarge(usize),
     UnsupportedFormatVersion(u32),
     Transaction(i32),
+    DerivedState(DerivedStateMismatch),
     Journal(i32),
     ReclaimTimeout,
     Io(io::Error),
@@ -237,6 +247,7 @@ impl fmt::Display for EngineError {
                 write!(f, "unsupported storage format version {version}")
             }
             Self::Transaction(error) => write!(f, "btree transaction failed: {error}"),
+            Self::DerivedState(mismatch) => write!(f, "derived state mismatch: {mismatch:?}"),
             Self::Journal(error) => write!(f, "journal operation failed: {error}"),
             Self::ReclaimTimeout => {
                 f.write_str("background journal reclaim did not finish in time")
@@ -570,6 +581,13 @@ impl StorageEngine {
             bch2_trans_put(&mut trans);
             result
         }
+    }
+
+    /// Validates the primary physical-pointer set against alloc/backpointer
+    /// derived indexes without repairing either tree.
+    pub fn verify_derived_state(&self) -> Result<(), EngineError> {
+        let mut fs = self.lock_fs()?;
+        unsafe { check_extents_to_backpointers(&mut **fs) }
     }
 
     /// Publishes the current journal buffer.  Only records returned by
@@ -1123,6 +1141,7 @@ fn engine_error_code(error: &EngineError) -> i32 {
         EngineError::InvalidBtreeId(_)
         | EngineError::ValueTooLarge(_)
         | EngineError::UnsupportedFormatVersion(_)
+        | EngineError::DerivedState(_)
         | EngineError::Poisoned => -1,
     }
 }
@@ -1427,7 +1446,9 @@ pub(crate) unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<()
                 let member = crate::sb::io::bch2_sb_member_get(fs.disk_sb.sb, dev as usize);
                 if member.bucket_size == 0 {
                     crate::rewrite_log_error!("derived validator: zero bucket size for dev {dev}");
-                    return Err(EngineError::Transaction(-1));
+                    return Err(EngineError::DerivedState(
+                        DerivedStateMismatch::InvalidPointer,
+                    ));
                 }
                 let bucket = offset / member.bucket_size as u64;
                 let sectors = (*key).k.size;
@@ -1438,7 +1459,7 @@ pub(crate) unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<()
                     crate::rewrite_log_error!(
                         "derived validator: generation mismatch dev={dev} bucket={bucket}"
                     );
-                    return Err(EngineError::Transaction(-1));
+                    return Err(EngineError::DerivedState(DerivedStateMismatch::Generation));
                 }
                 alloc.1 = alloc
                     .1
@@ -1456,7 +1477,9 @@ pub(crate) unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<()
                     crate::rewrite_log_error!(
                         "derived validator: duplicate backpointer dev={dev} offset={offset}"
                     );
-                    return Err(EngineError::Transaction(-1));
+                    return Err(EngineError::DerivedState(
+                        DerivedStateMismatch::DuplicateBackpointer,
+                    ));
                 }
             }
             entry = crate::btree::bset::extent_entry_next_safe(fs, entry, ptrs.end);
@@ -1481,7 +1504,7 @@ pub(crate) unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<()
     }
     if actual_alloc != expected_alloc {
         crate::rewrite_log_error!("derived validator: alloc set mismatch");
-        return Err(EngineError::Transaction(-1));
+        return Err(EngineError::DerivedState(DerivedStateMismatch::AllocSet));
     }
 
     let bp_keys = scan_raw_locked(fs, 8)?;
@@ -1509,7 +1532,9 @@ pub(crate) unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<()
     }
     if actual_bp != expected_bp {
         crate::rewrite_log_error!("derived validator: backpointer set mismatch");
-        return Err(EngineError::Transaction(-1));
+        return Err(EngineError::DerivedState(
+            DerivedStateMismatch::BackpointerSet,
+        ));
     }
     Ok(())
 }
