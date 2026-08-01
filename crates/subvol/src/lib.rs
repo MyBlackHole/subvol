@@ -17,3 +17,4 @@ pub use engine::{
     KeyPosition, ReadTransaction, ReclaimStatus, StorageEngine, Transaction,
     STORAGE_FORMAT_VERSION,
 };
+pub use util::log::{emit, LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_OFF, LOG_WARN};

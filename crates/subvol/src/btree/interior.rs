@@ -1510,4 +1510,172 @@ mod tests {
             crate::sb::io::bch2_free_super(&mut c.disk_sb);
         }
     }
+
+    #[test]
+    fn multi_level_split_preserves_parent_pivot_invariants() {
+        /* 多级分裂 pivot/边界不变量（T0168 P1 interior 对齐）：leaf 分裂
+         * 后 parent 放不下继续分裂 parent（interior.rs split loop 对应
+         * bcachefs btree_split 递归 + bch2_btree_insert_node 的 split:
+         * 分支，interior.c:1962/2191/2271），直至新建 root（对应
+         * __btree_root_alloc + bch2_btree_set_root，interior.c:2095）。
+         * 递归验证：节点内 key 严格递增；child 指针 key.p == child
+         * max_key、相邻 child 区间连续无空洞（后继相接）、child 区间
+         * 覆盖 parent 的 [min_key, max_key]；叶子收集 key 全集。 */
+        use crate::btree::bkey::{
+            bkey, bkey_format_key_bits, bkeyp_key_u64s, bpos, bpos_cmp, bpos_eq, bpos_lt,
+            bpos_successor, BKEY_FORMAT_CURRENT, BKEY_U64S, KEY_FORMAT_CURRENT, POS_MIN, SPOS,
+            SPOS_MAX,
+        };
+        use crate::btree::iter::{
+            bch2_btree_iter_peek, bch2_trans_begin, bch2_trans_init, bch2_trans_iter_exit,
+            bch2_trans_iter_init, btree_iter, btree_trans, BTREE_ITER_intent,
+        };
+        use crate::btree::types::{bch2_btree_id_root_set, bch_fs, btree};
+        use crate::btree::update::{bch2_trans_commit, bch2_trans_update};
+
+        unsafe fn verify_subtree(node: *mut btree, out: &mut Vec<u64>) {
+            let mut iter = crate::btree::types::btree_node_iter::default();
+            crate::btree::node_iter::bch2_btree_node_iter_init_from_start(&mut iter, node);
+            let mut prev = None;
+            let mut child_prev_max = None;
+            let mut first_child_min = None;
+            let mut last_child_max = None;
+            loop {
+                let key = crate::btree::node_iter::bch2_btree_node_iter_peek(&mut iter, node);
+                if key.is_null() {
+                    break;
+                }
+                let pos = crate::btree::node_iter::bkey_unpack_pos(node, key);
+                if let Some(p) = prev {
+                    assert!(bpos_lt(p, pos), "keys not strictly increasing");
+                }
+                prev = Some(pos);
+                if (*node).c.level > 0 {
+                    let key_u64s = bkeyp_key_u64s(&(*node).format, &*key);
+                    let child = *key.cast::<u64>().add(key_u64s as usize) as usize as *mut btree;
+                    assert!(!child.is_null());
+                    assert_eq!((*child).c.level, (*node).c.level - 1);
+                    assert!(
+                        bpos_eq((*(*child).data).max_key, pos),
+                        "child pointer key.p != child max_key"
+                    );
+                    let child_min = (*(*child).data).min_key;
+                    let child_max = (*(*child).data).max_key;
+                    if first_child_min.is_none() {
+                        first_child_min = Some(child_min);
+                    }
+                    last_child_max = Some(child_max);
+                    if let Some(prev_max) = child_prev_max {
+                        assert!(
+                            bpos_eq(bpos_successor(prev_max), child_min),
+                            "adjacent child key ranges not contiguous"
+                        );
+                    }
+                    child_prev_max = Some(child_max);
+                    verify_subtree(child, out);
+                } else {
+                    out.push(pos.offset);
+                }
+                crate::btree::node_iter::bch2_btree_node_iter_advance(&mut iter, node);
+            }
+            if (*node).c.level > 0 {
+                assert!(
+                    bpos_eq(first_child_min.unwrap(), (*(*node).data).min_key),
+                    "first child min_key != node min_key"
+                );
+                assert!(
+                    bpos_eq(last_child_max.unwrap(), (*(*node).data).max_key),
+                    "last child max_key != node max_key"
+                );
+            }
+        }
+
+        unsafe {
+            let mut words = vec![0u64; 64];
+            let mut leaf = Box::new(btree::default());
+            leaf.data = words.as_mut_ptr().cast::<disk_btree_node>();
+            leaf.byte_order = 9;
+            leaf.format = BKEY_FORMAT_CURRENT;
+            leaf.nr_key_bits = bkey_format_key_bits(&leaf.format) as u8;
+            leaf.nsets = 1;
+            (*leaf.data).min_key = POS_MIN;
+            (*leaf.data).max_key = SPOS_MAX;
+            let disk_set = words.as_mut_ptr().add(17).cast::<disk_bset>();
+            (*disk_set).u64s = 40;
+            for idx in 0..8 {
+                *words.as_mut_ptr().add(20 + idx * 5).cast::<bkey>() = bkey {
+                    u64s: BKEY_U64S,
+                    format: KEY_FORMAT_CURRENT,
+                    type_: 6,
+                    p: SPOS(1, idx as u64 + 1, 0),
+                    ..Default::default()
+                };
+            }
+            leaf.set[0] = bset_tree {
+                size: 0,
+                extra: BSET_NO_AUX_TREE_VAL,
+                data_offset: 17,
+                aux_data_offset: u16::MAX,
+                end_offset: 60,
+            };
+            leaf.nr.live_u64s = 40;
+            leaf.nr.bset_u64s[0] = 40;
+            leaf.nr.unpacked_keys = 8;
+
+            let mut c = bch_fs::default();
+            assert_eq!(crate::sb::io::bch2_sb_realloc(&mut c.disk_sb, 0), 0);
+            (*c.disk_sb.sb).flags[0] = 1 << 12;
+            bch2_btree_id_root_set(&mut c, 0, &mut *leaf);
+
+            /* 连续插入直至 root 深度 >= 2（触发 leaf → parent → root
+             * 多级级联分裂；200 键 >> 512B 节点容量，同
+             * full_root_leaf_splits_grows_root_and_retries_insert）。 */
+            let mut restart_offsets = Vec::new();
+            for offset in 9..=208u64 {
+                let mut key = crate::btree::bkey::bkey_i {
+                    k: bkey {
+                        u64s: BKEY_U64S,
+                        format: KEY_FORMAT_CURRENT,
+                        type_: 6,
+                        p: SPOS(1, offset, 0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                loop {
+                    let mut trans = btree_trans::default();
+                    bch2_trans_init(&mut trans, &mut c);
+                    let mut iter = btree_iter::default();
+                    bch2_trans_iter_init(&mut trans, &mut iter, 0, key.k.p, BTREE_ITER_intent);
+                    assert!(bch2_btree_iter_peek(&mut iter).k.is_null());
+                    assert_eq!(bch2_trans_update(&mut trans, &mut iter, &mut key, 0), 0);
+                    let ret = bch2_trans_commit(&mut trans);
+                    bch2_trans_iter_exit(&mut iter);
+                    if ret == -4 {
+                        bch2_trans_begin(&mut trans);
+                        restart_offsets.push(offset);
+                        continue;
+                    }
+                    assert_eq!(ret, 0, "insert offset={offset}");
+                    break;
+                }
+            }
+
+            let root = crate::btree::types::bch2_btree_id_root_b(&c, 0);
+            assert!(
+                (*root).c.level >= 2,
+                "expected multi-level split, root level={}",
+                (*root).c.level
+            );
+            assert!(
+                !restart_offsets.is_empty(),
+                "expected split restarts during multi-level growth"
+            );
+
+            let mut seen = Vec::new();
+            verify_subtree(root, &mut seen);
+            assert_eq!(seen, (1..=208u64).collect::<Vec<_>>());
+            crate::sb::io::bch2_free_super(&mut c.disk_sb);
+        }
+    }
 }

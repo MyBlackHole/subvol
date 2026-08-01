@@ -54,28 +54,28 @@ pub fn emit(level: u8, label: &str, args: fmt::Arguments<'_>) {
 #[macro_export]
 macro_rules! rewrite_log_error {
     ($($arg:tt)*) => {
-        $crate::util::log::emit($crate::util::log::LOG_ERROR, "ERROR", format_args!($($arg)*));
+        $crate::emit($crate::LOG_ERROR, "ERROR", format_args!($($arg)*));
     };
 }
 
 #[macro_export]
 macro_rules! rewrite_log_warn {
     ($($arg:tt)*) => {
-        $crate::util::log::emit($crate::util::log::LOG_WARN, "WARN", format_args!($($arg)*));
+        $crate::emit($crate::LOG_WARN, "WARN", format_args!($($arg)*));
     };
 }
 
 #[macro_export]
 macro_rules! rewrite_log_info {
     ($($arg:tt)*) => {
-        $crate::util::log::emit($crate::util::log::LOG_INFO, "INFO", format_args!($($arg)*));
+        $crate::emit($crate::LOG_INFO, "INFO", format_args!($($arg)*));
     };
 }
 
 #[macro_export]
 macro_rules! rewrite_log_debug {
     ($($arg:tt)*) => {
-        $crate::util::log::emit($crate::util::log::LOG_DEBUG, "DEBUG", format_args!($($arg)*));
+        $crate::emit($crate::LOG_DEBUG, "DEBUG", format_args!($($arg)*));
     };
 }
 
