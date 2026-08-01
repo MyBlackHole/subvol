@@ -8,19 +8,19 @@
 
 use std::{
     fmt,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io,
     ops::{Deref, DerefMut},
     path::Path,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::Ordering,
         Arc, Condvar, Mutex, MutexGuard, Weak,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use urcu::{boxed::RcuBox, Rcu, RcuThread};
+use urcu::{Rcu, RcuThread};
 
 use crate::{
     btree::{
@@ -29,7 +29,7 @@ use crate::{
             BKEY_VAL_U64S_MAX, KEY_FORMAT_CURRENT, POS_MIN,
         },
         bset::{KEY_TYPE_cookie, KEY_TYPE_deleted},
-        cache::{bch2_btree_node_write_done_clean, bch2_fs_btree_cache_init},
+        cache::bch2_fs_btree_cache_init,
         interior::{bch2_btree_node_check_topology, bch2_btree_root_alloc_fake},
         iter::{
             bch2_btree_iter_next, bch2_btree_iter_peek, bch2_btree_iter_traverse, bch2_trans_begin,
@@ -37,17 +37,16 @@ use crate::{
             btree_iter, btree_trans, BTREE_ITER_intent, BTREE_ITER_not_extents,
         },
         types::{
-            bch2_btree_id_root_b, bch_fs, btree, clear_btree_node_dirty, clear_btree_node_fake,
-            clear_btree_node_just_written, clear_btree_node_need_rewrite,
-            clear_btree_node_need_write, BTREE_ID_NR,
+            bch2_btree_id_root_b, bch_fs, clear_btree_node_fake, clear_btree_node_need_rewrite,
+            BTREE_ID_NR,
         },
         update::{bch2_trans_commit, bch2_trans_update},
     },
     journal::{
-        bch2_journal_flush, bch2_journal_pin_drop, bch2_journal_read, bch2_journal_replay,
-        bch2_journal_replay_key, bch2_journal_restore_for_replay,
-        bch2_journal_update_last_seq_ondisk, journal_checkpoint_markers, journal_low_on_space,
-        journal_med_on_space, journal_start_info, journal_state_offset,
+        bch2_journal_flush, bch2_journal_flush_pins, bch2_journal_read, bch2_journal_replay,
+        bch2_journal_restore_for_replay, bch2_journal_update_last_seq,
+        bch2_journal_update_last_seq_ondisk, journal_low_on_space, journal_med_on_space,
+        journal_start_info, journal_state_offset,
     },
     sb::{
         bcachefs_metadata_version_current, bch_member, bch_sb_field_journal_v2,
@@ -62,29 +61,18 @@ pub const STORAGE_FORMAT_VERSION: u32 = 2;
 /*
  * Fixed single-version engine layout:
  *
- *   [two checkpoint headers][reserved][four journal buckets][checkpoint data]
+ *   [reserved][four journal buckets]
  *
- * The journal range is intentionally independent of the checkpoint arena.
- * A checkpoint payload is made durable before its alternate header is
- * published; only then may a following journal record advance last_seq.
+ * Durability follows bcachefs' journal semantics: every written jset repeats
+ * the full btree-root set (write.c's bch2_journal_write_prep()), recovery
+ * replays the retained window from last_seq (recovery.c), and reclaim
+ * advances last_seq only after node pins have been flushed.
  */
 const JOURNAL_FILE_SECTORS: u64 = 16_384;
 const JOURNAL_BUCKET_START: u64 = 1;
 const JOURNAL_BUCKETS: u64 = 4;
 const JOURNAL_BUCKET_SIZE: u16 = 2_048;
 const ENGINE_JOURNAL_UUID: [u8; 16] = [0x53; 16];
-const CHECKPOINT_HEADER_BYTES: usize = 4 << 10;
-const CHECKPOINT_HEADER_WORDS: usize = 11;
-const CHECKPOINT_HEADER_SLOTS: usize = 2;
-const CHECKPOINT_DATA_START: u64 = JOURNAL_FILE_SECTORS * 512;
-const CHECKPOINT_ALIGN: u64 = CHECKPOINT_HEADER_BYTES as u64;
-const ENGINE_CHECKPOINT_MAGIC: u64 = 0x5355_4256_4f4c_4350;
-const ENGINE_CHECKPOINT_PAYLOAD_MAGIC: u64 = 0x5355_4256_4f4c_4450;
-const ENGINE_CHECKPOINT_NODE_MAGIC: u64 = 0x5355_4256_4f4c_4e44;
-const CHECKPOINT_PAYLOAD_HEADER_WORDS: usize = 6;
-const CHECKPOINT_ROOT_WORDS: usize = 4;
-const CHECKPOINT_NODE_HEADER_WORDS: usize = 8;
-const CHECKPOINT_NODE_KEY_WORDS: usize = 128;
 const RECLAIM_WORKER_DELAY: Duration = Duration::from_millis(25);
 
 /// A logical btree identifier.  The IDs are engine-local and need not expose
@@ -142,150 +130,45 @@ pub struct BtreeKey {
     value: Vec<u64>,
 }
 
-/*
- * A checkpoint is the engine's durable btree-base image.  Each root names a
- * contiguous immutable run of leaf pages.  The next checkpoint allocates a
- * new page image and publishes it through the alternate header only after all
- * page checksums are stable, matching bcachefs' root publication after node
- * write completion.
- */
+/// Deterministic test fault locations with bcachefs-equivalent retry/write
+/// boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultPoint {
+    /// `trans_maybe_inject_restart()` before commit side effects.
+    TransactionRestart,
+    /// A journal write failure before record publication or sequence advance.
+    JournalWrite,
+}
+
+/// A durable journal image captured after successful flushes.  It models the
+/// state a fresh engine receives after a crash; unflushed transaction updates
+/// are intentionally absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CheckpointRoot {
-    btree: BtreeId,
-    level: u8,
-    first_node: u32,
-    node_count: u32,
+pub struct JournalSnapshot {
+    format_version: u32,
+    records: Vec<Vec<u64>>,
+    next_sequence: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CheckpointNode {
-    btree: BtreeId,
-    level: u8,
-    page: u32,
-    entries: Vec<BtreeKey>,
-}
+impl JournalSnapshot {
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
+    }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct CheckpointImage {
-    sequence: u64,
-    generation: u64,
-    roots: Vec<CheckpointRoot>,
-    nodes: Vec<CheckpointNode>,
-}
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct CheckpointSlot {
-    generation: u64,
-    sequence: u64,
-    offset: u64,
-    bytes: u64,
-    capacity: u64,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct CheckpointState {
-    image: CheckpointImage,
-    slots: [CheckpointSlot; CHECKPOINT_HEADER_SLOTS],
-    active_slot: Option<usize>,
-}
-
-impl CheckpointState {
-    fn next_image(
-        &self,
-        sequence: u64,
-        entries: Vec<(BtreeId, BtreeKey)>,
-    ) -> Result<CheckpointImage, EngineError> {
-        CheckpointImage::from_entries(
-            sequence,
-            self.image.generation.saturating_add(1).max(1),
-            entries,
-        )
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
     }
 }
 
-impl CheckpointImage {
-    fn key_count(&self) -> usize {
-        self.nodes.iter().map(|node| node.entries.len()).sum()
-    }
-
-    fn from_entries(
-        sequence: u64,
-        generation: u64,
-        entries: Vec<(BtreeId, BtreeKey)>,
-    ) -> Result<Self, EngineError> {
-        if sequence == 0 || generation == 0 {
-            return Err(EngineError::Checkpoint(-1));
-        }
-
-        let mut roots = Vec::new();
-        let mut nodes = Vec::new();
-        let mut cursor = 0usize;
-        while cursor < entries.len() {
-            let btree = entries[cursor].0;
-            let first_node =
-                u32::try_from(nodes.len()).map_err(|_| EngineError::Checkpoint(-12))?;
-            let mut node_entries = Vec::new();
-            let mut node_words = 0usize;
-
-            while cursor < entries.len() && entries[cursor].0 == btree {
-                let key = &entries[cursor].1;
-                let key_words = (BKEY_U64S as usize)
-                    .checked_add(key.value().len())
-                    .ok_or(EngineError::Checkpoint(-12))?;
-                if !node_entries.is_empty()
-                    && node_words
-                        .checked_add(key_words)
-                        .ok_or(EngineError::Checkpoint(-12))?
-                        > CHECKPOINT_NODE_KEY_WORDS
-                {
-                    let page =
-                        u32::try_from(nodes.len()).map_err(|_| EngineError::Checkpoint(-12))?;
-                    nodes.push(CheckpointNode {
-                        btree,
-                        level: 0,
-                        page,
-                        entries: core::mem::take(&mut node_entries),
-                    });
-                    node_words = 0;
-                }
-                node_words = node_words
-                    .checked_add(key_words)
-                    .ok_or(EngineError::Checkpoint(-12))?;
-                node_entries.push(key.clone());
-                cursor += 1;
-            }
-
-            if !node_entries.is_empty() {
-                let page = u32::try_from(nodes.len()).map_err(|_| EngineError::Checkpoint(-12))?;
-                nodes.push(CheckpointNode {
-                    btree,
-                    level: 0,
-                    page,
-                    entries: node_entries,
-                });
-            }
-            let node_count = nodes
-                .len()
-                .checked_sub(first_node as usize)
-                .and_then(|count| u32::try_from(count).ok())
-                .ok_or(EngineError::Checkpoint(-12))?;
-            roots.push(CheckpointRoot {
-                btree,
-                level: 0,
-                first_node,
-                node_count,
-            });
-        }
-
-        let image = Self {
-            sequence,
-            generation,
-            roots,
-            nodes,
-        };
-        validate_checkpoint_image(&image)?;
-        Ok(image)
-    }
+/// Durable boundary returned by `sync()` and `Transaction::commit_sync()`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurabilityPoint {
+    pub journal_sequence: u64,
+    pub journal_sequence_ondisk: u64,
 }
 
 impl BtreeKey {
@@ -303,86 +186,6 @@ impl BtreeKey {
     pub fn value(&self) -> &[u64] {
         &self.value
     }
-}
-
-/// Deterministic test fault locations with bcachefs-equivalent retry/write
-/// boundaries.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FaultPoint {
-    /// `trans_maybe_inject_restart()` before commit side effects.
-    TransactionRestart,
-    /// A journal write failure before record publication or sequence advance.
-    JournalWrite,
-    /// Checkpoint payload is durable but its alternate header is not yet
-    /// published, so recovery must remain on the old journal window.
-    CheckpointWrite,
-    /// The checkpoint header is durable, but the following journal anchor
-    /// has not yet been published.
-    CheckpointBarrier,
-}
-
-/// A durable journal image captured after successful flushes.  It models the
-/// state a fresh engine receives after a crash; unflushed transaction updates
-/// are intentionally absent.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct JournalSnapshot {
-    format_version: u32,
-    checkpoint: CheckpointImage,
-    records: Vec<Vec<u64>>,
-    next_sequence: u64,
-}
-
-impl JournalSnapshot {
-    pub const fn format_version(&self) -> u32 {
-        self.format_version
-    }
-
-    pub fn record_count(&self) -> usize {
-        self.records.len()
-    }
-
-    /// Sequence covered by the durable btree-base checkpoint, or zero when
-    /// this image still requires replay from the first journal record.
-    pub const fn checkpoint_sequence(&self) -> u64 {
-        self.checkpoint.sequence
-    }
-
-    pub const fn checkpoint_generation(&self) -> u64 {
-        self.checkpoint.generation
-    }
-
-    pub fn checkpoint_key_count(&self) -> usize {
-        self.checkpoint.key_count()
-    }
-
-    pub fn checkpoint_node_count(&self) -> usize {
-        self.checkpoint.nodes.len()
-    }
-
-    pub const fn next_sequence(&self) -> u64 {
-        self.next_sequence
-    }
-}
-
-/// Immutable root/page descriptor copied out while an RCU read-side section
-/// is active.  It describes the checkpoint generation that a reader observed,
-/// without exposing mutable storage-engine internals.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CheckpointSummary {
-    pub sequence: u64,
-    pub generation: u64,
-    pub root_count: usize,
-    pub node_count: usize,
-    pub key_count: usize,
-}
-
-/// Durable boundary returned by `sync()` and `Transaction::commit_sync()`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DurabilityPoint {
-    pub journal_sequence: u64,
-    pub journal_sequence_ondisk: u64,
-    pub checkpoint_sequence: u64,
-    pub checkpoint_generation: u64,
 }
 
 /// Observable state of the single-consumer background journal reclaimer.
@@ -403,7 +206,6 @@ pub struct EngineMetrics {
     pub journal_last_sequence: u64,
     pub journal_last_sequence_ondisk: u64,
     pub journal_records: usize,
-    pub checkpoint: CheckpointSummary,
     pub reclaim: ReclaimStatus,
 }
 
@@ -414,7 +216,6 @@ pub enum EngineError {
     UnsupportedFormatVersion(u32),
     Transaction(i32),
     Journal(i32),
-    Checkpoint(i32),
     ReclaimTimeout,
     Io(io::Error),
     Poisoned,
@@ -430,7 +231,6 @@ impl fmt::Display for EngineError {
             }
             Self::Transaction(error) => write!(f, "btree transaction failed: {error}"),
             Self::Journal(error) => write!(f, "journal operation failed: {error}"),
-            Self::Checkpoint(error) => write!(f, "checkpoint operation failed: {error}"),
             Self::ReclaimTimeout => {
                 f.write_str("background journal reclaim did not finish in time")
             }
@@ -509,30 +309,19 @@ pub struct ReadTransaction<'engine> {
 }
 
 impl ReadTransaction<'_> {
-    pub fn checkpoint(&self) -> CheckpointSummary {
-        self.rcu_thread.rscs(|rscs| {
-            let image = self.engine.inner.checkpoint_view.read(rscs);
-            checkpoint_summary(&image)
-        })
-    }
-
     pub fn get(
         &self,
         btree: BtreeId,
         position: KeyPosition,
     ) -> Result<Option<BtreeKey>, EngineError> {
         let mut fs = self.engine.lock_fs()?;
-        self.rcu_thread.rscs(|rscs| {
-            let _ = self.engine.inner.checkpoint_view.read(rscs);
-        });
+        self.rcu_thread.rscs(|_| ());
         unsafe { get_locked(&mut **fs, btree, position) }
     }
 
     pub fn scan(&self, btree: BtreeId) -> Result<Vec<BtreeKey>, EngineError> {
         let mut fs = self.engine.lock_fs()?;
-        self.rcu_thread.rscs(|rscs| {
-            let _ = self.engine.inner.checkpoint_view.read(rscs);
-        });
+        self.rcu_thread.rscs(|_| ());
         unsafe { scan_locked(&mut **fs, btree) }
     }
 }
@@ -600,8 +389,6 @@ struct EngineState {
      * are initialized; moving StorageEngine must never invalidate them.
      */
     fs: Mutex<EngineFs>,
-    checkpoint: Mutex<CheckpointState>,
-    checkpoint_view: RcuBox<CheckpointImage>,
     rcu: Rcu,
     reclaim: Arc<ReclaimControl>,
 }
@@ -656,8 +443,6 @@ impl StorageEngine {
         let rcu = Rcu::init();
         let inner = Arc::new(EngineState {
             fs: Mutex::new(EngineFs(fs)),
-            checkpoint: Mutex::new(CheckpointState::default()),
-            checkpoint_view: RcuBox::new(&rcu, CheckpointImage::default()),
             rcu,
             reclaim: Arc::new(ReclaimControl::default()),
         });
@@ -803,26 +588,16 @@ impl StorageEngine {
         self.durability_point()
     }
 
-    /// Writes the current btree state as the durable base, then publishes an
-    /// empty journal anchor after its pins have been released.  This is the
-    /// engine counterpart to bcachefs journal reclaim: data is durable before
-    /// `last_seq` may advance and make earlier journal entries reclaimable.
-    pub fn checkpoint(&self) -> Result<(), EngineError> {
+    /// Reclaims the journal through the durable flush path: flush any pending
+    /// journal entry, force node pins to flush, then advance `last_seq` once
+    /// the records they cover are durable.  This is the engine counterpart to
+    /// bcachefs journal reclaim (reclaim.c): data is durable before
+    /// `last_seq` advances and makes earlier journal entries reclaimable.
+    /// This is the direct-reclaim path used when a caller cannot wait for the
+    /// background single consumer.
+    pub fn reclaim_journal(&self) -> Result<(), EngineError> {
         let mut fs = self.lock_fs()?;
         unsafe { self.checkpoint_locked(&mut **fs) }
-    }
-
-    /// Runs the durable checkpoint path and returns the resulting boundary.
-    pub fn checkpoint_sync(&self) -> Result<DurabilityPoint, EngineError> {
-        self.checkpoint()?;
-        self.durability_point()
-    }
-
-    /// Reclaims the journal through a complete checkpoint.  This is the
-    /// direct-reclaim path used when a caller cannot wait for the background
-    /// single consumer.
-    pub fn reclaim_journal(&self) -> Result<(), EngineError> {
-        self.checkpoint()
     }
 
     /// Kicks the background single-consumer reclaimer and returns its request
@@ -865,15 +640,12 @@ impl StorageEngine {
         Ok(reclaim_status(&state))
     }
 
-    /// Reports the durable journal/checkpoint boundary without issuing I/O.
+    /// Reports the durable journal boundary without issuing I/O.
     pub fn durability_point(&self) -> Result<DurabilityPoint, EngineError> {
         let fs = self.lock_fs()?;
-        let checkpoint = self.lock_checkpoint()?.image.clone();
         Ok(DurabilityPoint {
             journal_sequence: fs.journal.seq.load(Ordering::Acquire),
             journal_sequence_ondisk: fs.journal.seq_ondisk.load(Ordering::Acquire),
-            checkpoint_sequence: checkpoint.sequence,
-            checkpoint_generation: checkpoint.generation,
         })
     }
 
@@ -885,7 +657,6 @@ impl StorageEngine {
             .lock()
             .map_err(|_| EngineError::Poisoned)?
             .len();
-        let checkpoint = self.lock_checkpoint()?.image.clone();
         let reclaim = self.reclaim_status()?;
         Ok(EngineMetrics {
             journal_sequence: fs.journal.seq.load(Ordering::Acquire),
@@ -893,7 +664,6 @@ impl StorageEngine {
             journal_last_sequence: fs.journal.last_seq.load(Ordering::Acquire),
             journal_last_sequence_ondisk: fs.journal.last_seq_ondisk.load(Ordering::Acquire),
             journal_records,
-            checkpoint: checkpoint_summary(&checkpoint),
             reclaim,
         })
     }
@@ -902,10 +672,8 @@ impl StorageEngine {
         let fs = self.lock_fs()?;
         let records = fs.journal.closed.lock().unwrap().clone();
         let next_sequence = fs.journal.seq.load(Ordering::Acquire);
-        let checkpoint = self.lock_checkpoint()?.image.clone();
         Ok(JournalSnapshot {
             format_version: STORAGE_FORMAT_VERSION,
-            checkpoint,
             records,
             next_sequence,
         })
@@ -922,11 +690,6 @@ impl StorageEngine {
 
         let engine = Self::new()?;
         let mut fs = engine.lock_fs()?;
-        let checkpoint = CheckpointState {
-            image: snapshot.checkpoint.clone(),
-            ..Default::default()
-        };
-        validate_checkpoint_recovery(&checkpoint.image, &snapshot.records)?;
         unsafe {
             let ret = bch2_journal_restore_for_replay(
                 &fs.journal,
@@ -936,21 +699,12 @@ impl StorageEngine {
             if ret != 0 {
                 return Err(EngineError::Journal(ret));
             }
-            load_checkpoint_base(&mut **fs, &checkpoint.image)?;
-            fs.journal
-                .checkpoint_seq
-                .store(checkpoint.image.sequence, Ordering::Release);
-            fs.journal
-                .checkpoint_generation
-                .store(checkpoint.image.generation, Ordering::Release);
             let ret = bch2_journal_replay(&mut **fs);
             if ret != 0 {
                 return Err(EngineError::Journal(ret));
             }
         }
         drop(fs);
-        *engine.lock_checkpoint()? = checkpoint.clone();
-        engine.publish_checkpoint_view(&checkpoint.image);
         Ok(engine)
     }
 
@@ -964,14 +718,6 @@ impl StorageEngine {
                 .journal
                 .fault_inject_write_error
                 .store(count, Ordering::Release),
-            FaultPoint::CheckpointWrite => fs
-                .journal
-                .fault_inject_checkpoint_write_error
-                .store(count, Ordering::Release),
-            FaultPoint::CheckpointBarrier => fs
-                .journal
-                .fault_inject_checkpoint_barrier_error
-                .store(count, Ordering::Release),
         }
         Ok(())
     }
@@ -980,19 +726,13 @@ impl StorageEngine {
         self.inner.fs.lock().map_err(|_| EngineError::Poisoned)
     }
 
-    fn lock_checkpoint(&self) -> Result<MutexGuard<'_, CheckpointState>, EngineError> {
-        self.inner
-            .checkpoint
-            .lock()
-            .map_err(|_| EngineError::Poisoned)
-    }
-
     unsafe fn checkpoint_locked(&self, fs: &mut bch_fs) -> Result<(), EngineError> {
-        /* The journal record that precedes the checkpoint is the write-ahead
-         * boundary.  Do not make a base image from updates that have not
-         * reached this successful flush.  When the current entry is already
-         * empty, avoid consuming the last physical journal slot: reclaim.c
-         * may first free the stable prefix and then write the next anchor. */
+        /* The journal record that precedes the reclaim boundary is the
+         * write-ahead guarantee: do not advance last_seq past updates that
+         * have not reached this successful flush.  When the current entry is
+         * already empty, avoid consuming the last physical journal slot:
+         * reclaim.c may first free the stable prefix and then write the
+         * following entry. */
         if journal_state_offset(fs.journal.reservations.load(Ordering::Acquire)) != 0 {
             let ret = bch2_journal_flush(&fs.journal);
             if ret != 0 {
@@ -1001,70 +741,44 @@ impl StorageEngine {
         }
         let sequence = fs.journal.seq_ondisk.load(Ordering::Acquire);
         if sequence == 0 {
-            return Err(EngineError::Checkpoint(-1));
+            return Err(EngineError::Journal(-1));
         }
 
-        let entries = collect_checkpoint_entries(fs)?;
-        let current = self.lock_checkpoint()?.clone();
-        let mut next = CheckpointState {
-            image: current.next_image(sequence, entries)?,
-            slots: current.slots,
-            active_slot: current.active_slot,
-        };
-
-        if fs.disk_sb.s_bdev_file.is_null() {
-            if consume_fault(&fs.journal.fault_inject_checkpoint_write_error) {
-                return Err(EngineError::Checkpoint(-5));
+        /* This is reclaim.c's journal_flush_pins() pass: every node pin up to
+         * the flushed sequence is written back (the pin callbacks take the
+         * node write locks), and bch2_journal_update_last_seq() then releases
+         * the covered records.  The `last_seq` bound below is that completed-
+         * write boundary; advancing last_seq_ondisk past it is what reclaims
+         * the old journal window.  In-memory engines have no device, so node
+         * writeback cannot complete and the boundary never advances. */
+        if !fs.disk_sb.s_bdev_file.is_null() {
+            bch2_journal_flush_pins(&fs.journal, sequence + 1);
+            bch2_journal_update_last_seq(&fs.journal);
+            let last_seq = fs.journal.last_seq.load(Ordering::Acquire);
+            let ret = bch2_journal_update_last_seq_ondisk(&fs.journal, last_seq);
+            if ret != 0 {
+                return Err(EngineError::Journal(ret));
             }
-        } else {
-            write_persistent_checkpoint(fs, &mut next)?;
+            /* Keep the in-memory record mirror equal to the retained
+             * on-disk window: records at or below the advanced boundary are
+             * reclaimed.  A device-less engine keeps every record instead,
+             * because its journal mirror is the only durable source from
+             * which recovery can rebuild the btree. */
+            fs.journal
+                .closed
+                .lock()
+                .unwrap()
+                .retain(|record| record.get(3).is_some_and(|seq| *seq > sequence));
         }
 
-        /* The checkpoint image is now durable (or is the durable in-memory
-         * crash image).  Publish its identity before creating the next jset;
-         * bch2_journal_flush() will propagate it just like btree roots. */
-        fs.journal
-            .checkpoint_seq
-            .store(next.image.sequence, Ordering::Release);
-        fs.journal
-            .checkpoint_generation
-            .store(next.image.generation, Ordering::Release);
-        *self.lock_checkpoint()? = next.clone();
-        self.publish_checkpoint_view(&next.image);
-
-        /* This is the engine's synchronous node-write completion: the base
-         * image contains every live key, so all node pins may be dropped only
-         * after the image publication above. */
-        complete_checkpoint_node_writes(fs);
-
-        /* This is the completed-write accounting boundary in reclaim.c.  The
-         * checkpoint header is already durable, so the old journal prefix can
-         * be discarded before reserving the following anchor if space is
-         * exhausted. */
-        let reclaim_to = sequence.checked_add(1).ok_or(EngineError::Checkpoint(-1))?;
-        let ret = bch2_journal_update_last_seq_ondisk(&fs.journal, reclaim_to);
-        if ret != 0 {
-            return Err(EngineError::Checkpoint(ret));
-        }
-
-        if consume_fault(&fs.journal.fault_inject_checkpoint_barrier_error) {
-            return Err(EngineError::Checkpoint(-5));
-        }
-
-        /* Publish the advanced last_seq and repeated checkpoint anchor in a
-         * following empty jset.  If this write fails, the already durable
-         * base remains safe because recovery replays the still-retained old
-         * journal window. */
+        /* Publish the advanced last_seq and the current root set in a
+         * following empty jset (journal.c's __bch2_journal_meta()): every
+         * written entry repeats all btree roots, so recovery binds to the
+         * newest root set before replaying the still-retained window. */
         let ret = bch2_journal_flush(&fs.journal);
         if ret != 0 {
             return Err(EngineError::Journal(ret));
         }
-
-        fs.journal
-            .closed
-            .lock()
-            .unwrap()
-            .retain(|record| record.get(3).is_some_and(|seq| *seq > sequence));
         Ok(())
     }
 
@@ -1184,7 +898,6 @@ impl StorageEngine {
         };
 
         let mut fs = self.lock_fs()?;
-        let checkpoint;
         unsafe {
             configure_persistent_journal(&mut fs, file)?;
             let mut info = journal_start_info::default();
@@ -1192,30 +905,13 @@ impl StorageEngine {
             if ret != 0 {
                 return Err(EngineError::Journal(ret));
             }
-            checkpoint = read_persistent_checkpoint(&**fs)?;
-            let records = fs.journal.closed.lock().unwrap().clone();
-            validate_checkpoint_recovery(&checkpoint.image, &records)?;
-            load_checkpoint_base(&mut **fs, &checkpoint.image)?;
-            fs.journal
-                .checkpoint_seq
-                .store(checkpoint.image.sequence, Ordering::Release);
-            fs.journal
-                .checkpoint_generation
-                .store(checkpoint.image.generation, Ordering::Release);
             let ret = bch2_journal_replay(&mut **fs);
             if ret != 0 {
                 return Err(EngineError::Journal(ret));
             }
         }
         drop(fs);
-        *self.lock_checkpoint()? = checkpoint.clone();
-        self.publish_checkpoint_view(&checkpoint.image);
         Ok(())
-    }
-
-    fn publish_checkpoint_view(&self, image: &CheckpointImage) {
-        let previous = self.inner.checkpoint_view.update(image.clone());
-        drop(previous);
     }
 
     fn request_reclaim_inner(&self) -> Result<u64, EngineError> {
@@ -1304,7 +1000,6 @@ fn reclaim_worker_loop(engine: Weak<EngineState>, control: Arc<ReclaimControl>) 
         if state.stopping {
             return;
         }
-
         if state.requested <= state.completed {
             let (next, timeout) = match control.wake.wait_timeout(state, RECLAIM_WORKER_DELAY) {
                 Ok(result) => result,
@@ -1376,9 +1071,7 @@ fn background_reclaim_needed(engine: &EngineState) -> bool {
 
 fn engine_error_code(error: &EngineError) -> i32 {
     match error {
-        EngineError::Transaction(error)
-        | EngineError::Journal(error)
-        | EngineError::Checkpoint(error) => *error,
+        EngineError::Transaction(error) | EngineError::Journal(error) => *error,
         EngineError::Io(_) => -5,
         EngineError::ReclaimTimeout => -110,
         EngineError::InvalidBtreeId(_)
@@ -1394,16 +1087,6 @@ fn reclaim_status(state: &ReclaimWorkerState) -> ReclaimStatus {
         completed: state.completed,
         running: state.running,
         last_error: state.last_error,
-    }
-}
-
-fn checkpoint_summary(image: &CheckpointImage) -> CheckpointSummary {
-    CheckpointSummary {
-        sequence: image.sequence,
-        generation: image.generation,
-        root_count: image.roots.len(),
-        node_count: image.nodes.len(),
-        key_count: image.key_count(),
     }
 }
 
@@ -1528,743 +1211,6 @@ unsafe fn scan_locked(fs: &mut bch_fs, btree: BtreeId) -> Result<Vec<BtreeKey>, 
     result.map(|()| output)
 }
 
-unsafe fn collect_checkpoint_entries(
-    fs: &mut bch_fs,
-) -> Result<Vec<(BtreeId, BtreeKey)>, EngineError> {
-    let mut entries = Vec::new();
-    for id in 0..BTREE_ID_NR {
-        let btree = BtreeId(id as u8);
-        for key in scan_locked(fs, btree)? {
-            entries.push((btree, key));
-        }
-    }
-    Ok(entries)
-}
-
-fn validate_checkpoint_image(image: &CheckpointImage) -> Result<(), EngineError> {
-    if image.sequence == 0 {
-        if image.generation != 0 || !image.roots.is_empty() || !image.nodes.is_empty() {
-            return Err(EngineError::Checkpoint(-1));
-        }
-        return Ok(());
-    }
-    if image.generation == 0 {
-        return Err(EngineError::Checkpoint(-1));
-    }
-
-    let mut expected_first_node = 0usize;
-    let mut previous_btree = None;
-    for root in &image.roots {
-        if root.btree.as_u8() as usize >= BTREE_ID_NR
-            || root.level != 0
-            || root.node_count == 0
-            || root.first_node as usize != expected_first_node
-        {
-            return Err(EngineError::Checkpoint(-2));
-        }
-        if previous_btree.is_some_and(|previous| previous >= root.btree.as_u8()) {
-            return Err(EngineError::Checkpoint(-2));
-        }
-        previous_btree = Some(root.btree.as_u8());
-
-        let end = expected_first_node
-            .checked_add(root.node_count as usize)
-            .filter(|end| *end <= image.nodes.len())
-            .ok_or(EngineError::Checkpoint(-2))?;
-        let mut previous_position = None;
-        for (index, node) in image.nodes[expected_first_node..end].iter().enumerate() {
-            if node.btree != root.btree
-                || node.level != root.level
-                || node.page
-                    != u32::try_from(expected_first_node + index)
-                        .map_err(|_| EngineError::Checkpoint(-2))?
-                || node.entries.is_empty()
-            {
-                return Err(EngineError::Checkpoint(-2));
-            }
-            let mut encoded_words = 0usize;
-            for key in &node.entries {
-                if key.value().len() > BKEY_VAL_U64S_MAX as usize {
-                    return Err(EngineError::Checkpoint(-2));
-                }
-                if previous_position.is_some_and(|previous| previous >= key.position()) {
-                    return Err(EngineError::Checkpoint(-2));
-                }
-                previous_position = Some(key.position());
-                encoded_words = encoded_words
-                    .checked_add(BKEY_U64S as usize + key.value().len())
-                    .ok_or(EngineError::Checkpoint(-12))?;
-            }
-            if node.entries.len() > 1 && encoded_words > CHECKPOINT_NODE_KEY_WORDS {
-                return Err(EngineError::Checkpoint(-2));
-            }
-        }
-        expected_first_node = end;
-    }
-    if expected_first_node != image.nodes.len() {
-        return Err(EngineError::Checkpoint(-2));
-    }
-    Ok(())
-}
-
-fn validate_checkpoint_recovery(
-    image: &CheckpointImage,
-    records: &[Vec<u64>],
-) -> Result<(), EngineError> {
-    validate_checkpoint_image(image)?;
-    let markers = journal_checkpoint_markers(records).map_err(EngineError::Journal)?;
-
-    if image.sequence == 0 {
-        if !markers.is_empty() {
-            return Err(EngineError::Checkpoint(-3));
-        }
-        return Ok(());
-    }
-
-    /* A newer marker is a completed checkpoint publication and must match
-     * this base exactly.  Older markers are valid after a crash between a
-     * newer header write and its following journal anchor: replay then still
-     * contains the complete older journal window and is idempotent.  An empty
-     * window is valid too: the durable base itself then represents a clean
-     * journal state. */
-    if let Some((_, sequence, generation)) = markers
-        .into_iter()
-        .filter(|(record_sequence, _, _)| *record_sequence > image.sequence)
-        .max()
-    {
-        if sequence != image.sequence || generation != image.generation {
-            return Err(EngineError::Checkpoint(-3));
-        }
-    }
-    Ok(())
-}
-
-unsafe fn load_checkpoint_base(
-    fs: &mut bch_fs,
-    image: &CheckpointImage,
-) -> Result<(), EngineError> {
-    if image.sequence == 0 {
-        return Ok(());
-    }
-
-    let seq = fs.journal.seq.load(Ordering::Acquire);
-    if seq == 0 {
-        return Err(EngineError::Checkpoint(-1));
-    }
-    for root in &image.roots {
-        let start = root.first_node as usize;
-        let end = start + root.node_count as usize;
-        for node in &image.nodes[start..end] {
-            for key in &node.entries {
-                let mut raw = encode_key(key.position(), key.value(), false);
-                let ret = bch2_journal_replay_key(
-                    fs,
-                    root.btree.as_u8(),
-                    root.level,
-                    raw.as_mut_ptr().cast::<bkey_i>(),
-                    seq,
-                );
-                if ret != 0 {
-                    return Err(EngineError::Transaction(ret));
-                }
-            }
-        }
-    }
-
-    /* The checkpoint already contains these keys.  Clear the pins only after
-     * the complete replay-style construction has succeeded, mirroring a
-     * btree-node write completion before journal reclaim advances last_seq. */
-    complete_checkpoint_node_writes(fs);
-    Ok(())
-}
-
-unsafe fn complete_checkpoint_node_writes(fs: &mut bch_fs) {
-    let nodes = fs.btree.cache.allocations.lock().unwrap().clone();
-    for node in nodes {
-        let node = node as *mut btree;
-        if node.is_null() || (*node).data.is_null() {
-            continue;
-        }
-        bch2_journal_pin_drop(&fs.journal, &mut (*node).writes[0].journal);
-        bch2_journal_pin_drop(&fs.journal, &mut (*node).writes[1].journal);
-        clear_btree_node_dirty(node);
-        clear_btree_node_need_write(node);
-        clear_btree_node_just_written(node);
-        clear_btree_node_need_rewrite(node);
-        bch2_btree_node_write_done_clean(fs, node);
-    }
-}
-
-fn consume_fault(counter: &AtomicU32) -> bool {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            count.checked_sub(1)
-        })
-        .is_ok()
-}
-
-fn append_checkpoint_word(bytes: &mut Vec<u8>, word: u64) {
-    bytes.extend_from_slice(&word.to_le_bytes());
-}
-
-fn checkpoint_node_words(node: &CheckpointNode) -> Result<Vec<u64>, EngineError> {
-    let words = node.entries.iter().try_fold(0usize, |total, key| {
-        total
-            .checked_add(BKEY_U64S as usize + key.value().len())
-            .ok_or(EngineError::Checkpoint(-12))
-    })?;
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(words)
-        .map_err(|_| EngineError::Checkpoint(-12))?;
-    for key in &node.entries {
-        output.extend(encode_key(key.position(), key.value(), false));
-    }
-    Ok(output)
-}
-
-fn checkpoint_node_checksum(
-    btree: BtreeId,
-    level: u8,
-    page: u32,
-    entry_count: u64,
-    words: &[u64],
-) -> Result<crate::btree::bset::bch_csum, EngineError> {
-    let bytes = CHECKPOINT_NODE_HEADER_WORDS
-        .checked_sub(2)
-        .and_then(|header| header.checked_add(words.len()))
-        .and_then(|words| words.checked_mul(core::mem::size_of::<u64>()))
-        .ok_or(EngineError::Checkpoint(-12))?;
-    let mut encoded = Vec::new();
-    encoded
-        .try_reserve_exact(bytes)
-        .map_err(|_| EngineError::Checkpoint(-12))?;
-    append_checkpoint_word(&mut encoded, ENGINE_CHECKPOINT_NODE_MAGIC);
-    append_checkpoint_word(&mut encoded, btree.as_u8() as u64);
-    append_checkpoint_word(&mut encoded, level as u64);
-    append_checkpoint_word(&mut encoded, page as u64);
-    append_checkpoint_word(&mut encoded, entry_count);
-    append_checkpoint_word(
-        &mut encoded,
-        u64::try_from(words.len()).map_err(|_| EngineError::Checkpoint(-12))?,
-    );
-    for word in words {
-        append_checkpoint_word(&mut encoded, *word);
-    }
-    Ok(crate::checksum::bch2_checksum(
-        crate::checksum::BCH_CSUM_xxhash,
-        &encoded,
-    ))
-}
-
-fn checkpoint_payload(image: &CheckpointImage) -> Result<Vec<u8>, EngineError> {
-    validate_checkpoint_image(image)?;
-    let mut node_words = Vec::new();
-    node_words
-        .try_reserve_exact(image.nodes.len())
-        .map_err(|_| EngineError::Checkpoint(-12))?;
-    let mut total_words = CHECKPOINT_PAYLOAD_HEADER_WORDS
-        .checked_add(
-            image
-                .roots
-                .len()
-                .checked_mul(CHECKPOINT_ROOT_WORDS)
-                .ok_or(EngineError::Checkpoint(-12))?,
-        )
-        .ok_or(EngineError::Checkpoint(-12))?;
-    for node in &image.nodes {
-        let words = checkpoint_node_words(node)?;
-        total_words = total_words
-            .checked_add(CHECKPOINT_NODE_HEADER_WORDS)
-            .and_then(|total| total.checked_add(words.len()))
-            .ok_or(EngineError::Checkpoint(-12))?;
-        node_words.push(words);
-    }
-    let bytes = total_words
-        .checked_mul(core::mem::size_of::<u64>())
-        .ok_or(EngineError::Checkpoint(-12))?;
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(bytes)
-        .map_err(|_| EngineError::Checkpoint(-12))?;
-
-    append_checkpoint_word(&mut payload, ENGINE_CHECKPOINT_PAYLOAD_MAGIC);
-    append_checkpoint_word(&mut payload, STORAGE_FORMAT_VERSION as u64);
-    append_checkpoint_word(&mut payload, image.sequence);
-    append_checkpoint_word(&mut payload, image.generation);
-    append_checkpoint_word(
-        &mut payload,
-        u64::try_from(image.roots.len()).map_err(|_| EngineError::Checkpoint(-12))?,
-    );
-    append_checkpoint_word(
-        &mut payload,
-        u64::try_from(image.nodes.len()).map_err(|_| EngineError::Checkpoint(-12))?,
-    );
-    for root in &image.roots {
-        append_checkpoint_word(&mut payload, root.btree.as_u8() as u64);
-        append_checkpoint_word(&mut payload, root.level as u64);
-        append_checkpoint_word(&mut payload, root.first_node as u64);
-        append_checkpoint_word(&mut payload, root.node_count as u64);
-    }
-    for (node, words) in image.nodes.iter().zip(node_words) {
-        let entry_count =
-            u64::try_from(node.entries.len()).map_err(|_| EngineError::Checkpoint(-12))?;
-        let checksum =
-            checkpoint_node_checksum(node.btree, node.level, node.page, entry_count, &words)?;
-        append_checkpoint_word(&mut payload, ENGINE_CHECKPOINT_NODE_MAGIC);
-        append_checkpoint_word(&mut payload, node.btree.as_u8() as u64);
-        append_checkpoint_word(&mut payload, node.level as u64);
-        append_checkpoint_word(&mut payload, node.page as u64);
-        append_checkpoint_word(&mut payload, entry_count);
-        append_checkpoint_word(
-            &mut payload,
-            u64::try_from(words.len()).map_err(|_| EngineError::Checkpoint(-12))?,
-        );
-        append_checkpoint_word(&mut payload, checksum.lo);
-        append_checkpoint_word(&mut payload, checksum.hi);
-        for word in words {
-            append_checkpoint_word(&mut payload, word);
-        }
-    }
-    Ok(payload)
-}
-
-fn checkpoint_payload_word(payload: &[u8], offset: &mut usize) -> Result<u64, EngineError> {
-    let end = offset
-        .checked_add(core::mem::size_of::<u64>())
-        .ok_or(EngineError::Checkpoint(-2))?;
-    let word = payload
-        .get(*offset..end)
-        .ok_or(EngineError::Checkpoint(-2))?;
-    *offset = end;
-    Ok(u64::from_le_bytes(word.try_into().unwrap()))
-}
-
-fn checkpoint_image_from_payload(
-    payload: &[u8],
-    expected_sequence: u64,
-    expected_generation: u64,
-) -> Result<CheckpointImage, EngineError> {
-    if payload.len() % core::mem::size_of::<u64>() != 0 {
-        return Err(EngineError::Checkpoint(-2));
-    }
-    let mut offset = 0usize;
-    if checkpoint_payload_word(payload, &mut offset)? != ENGINE_CHECKPOINT_PAYLOAD_MAGIC
-        || checkpoint_payload_word(payload, &mut offset)? != STORAGE_FORMAT_VERSION as u64
-        || checkpoint_payload_word(payload, &mut offset)? != expected_sequence
-        || checkpoint_payload_word(payload, &mut offset)? != expected_generation
-    {
-        return Err(EngineError::Checkpoint(-2));
-    }
-    let root_count = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
-        .map_err(|_| EngineError::Checkpoint(-2))?;
-    let node_count = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
-        .map_err(|_| EngineError::Checkpoint(-2))?;
-    let remaining_words = (payload.len() - offset) / core::mem::size_of::<u64>();
-    if root_count > remaining_words / CHECKPOINT_ROOT_WORDS {
-        return Err(EngineError::Checkpoint(-2));
-    }
-
-    let mut roots = Vec::new();
-    roots
-        .try_reserve_exact(root_count)
-        .map_err(|_| EngineError::Checkpoint(-12))?;
-    for _ in 0..root_count {
-        let btree_id = checkpoint_payload_word(payload, &mut offset)?;
-        if btree_id > u8::MAX as u64 || btree_id as usize >= BTREE_ID_NR {
-            return Err(EngineError::Checkpoint(-2));
-        }
-        let level = checkpoint_payload_word(payload, &mut offset)?;
-        let first_node = checkpoint_payload_word(payload, &mut offset)?;
-        let root_node_count = checkpoint_payload_word(payload, &mut offset)?;
-        if level > u8::MAX as u64
-            || first_node > u32::MAX as u64
-            || root_node_count > u32::MAX as u64
-        {
-            return Err(EngineError::Checkpoint(-2));
-        }
-        roots.push(CheckpointRoot {
-            btree: BtreeId(btree_id as u8),
-            level: level as u8,
-            first_node: first_node as u32,
-            node_count: root_node_count as u32,
-        });
-    }
-    let remaining_words = (payload.len() - offset) / core::mem::size_of::<u64>();
-    if node_count > remaining_words / CHECKPOINT_NODE_HEADER_WORDS {
-        return Err(EngineError::Checkpoint(-2));
-    }
-
-    let mut nodes = Vec::new();
-    nodes
-        .try_reserve_exact(node_count)
-        .map_err(|_| EngineError::Checkpoint(-12))?;
-    for _ in 0..node_count {
-        if checkpoint_payload_word(payload, &mut offset)? != ENGINE_CHECKPOINT_NODE_MAGIC {
-            return Err(EngineError::Checkpoint(-2));
-        }
-        let btree_id = checkpoint_payload_word(payload, &mut offset)?;
-        let level = checkpoint_payload_word(payload, &mut offset)?;
-        let page = checkpoint_payload_word(payload, &mut offset)?;
-        let entry_count = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
-            .map_err(|_| EngineError::Checkpoint(-2))?;
-        let page_words = usize::try_from(checkpoint_payload_word(payload, &mut offset)?)
-            .map_err(|_| EngineError::Checkpoint(-2))?;
-        let checksum_lo = checkpoint_payload_word(payload, &mut offset)?;
-        let checksum_hi = checkpoint_payload_word(payload, &mut offset)?;
-        if btree_id > u8::MAX as u64
-            || btree_id as usize >= BTREE_ID_NR
-            || level > u8::MAX as u64
-            || page > u32::MAX as u64
-            || entry_count == 0
-            || entry_count > page_words / (BKEY_U64S as usize)
-        {
-            return Err(EngineError::Checkpoint(-2));
-        }
-        if page_words > (payload.len() - offset) / core::mem::size_of::<u64>() {
-            return Err(EngineError::Checkpoint(-2));
-        }
-        let mut words = Vec::new();
-        words
-            .try_reserve_exact(page_words)
-            .map_err(|_| EngineError::Checkpoint(-12))?;
-        for _ in 0..page_words {
-            words.push(checkpoint_payload_word(payload, &mut offset)?);
-        }
-        let checksum = checkpoint_node_checksum(
-            BtreeId(btree_id as u8),
-            level as u8,
-            page as u32,
-            entry_count as u64,
-            &words,
-        )?;
-        if checksum.lo != checksum_lo || checksum.hi != checksum_hi {
-            return Err(EngineError::Checkpoint(-2));
-        }
-
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(entry_count)
-            .map_err(|_| EngineError::Checkpoint(-12))?;
-        let mut word_offset = 0usize;
-        for _ in 0..entry_count {
-            if words.len().saturating_sub(word_offset) < BKEY_U64S as usize {
-                return Err(EngineError::Checkpoint(-2));
-            }
-            let raw = words[word_offset..].as_ptr().cast::<bkey_i>();
-            let key_u64s = unsafe { (*raw).k.u64s as usize };
-            if key_u64s < BKEY_U64S as usize
-                || key_u64s > BKEY_U64S as usize + BKEY_VAL_U64S_MAX as usize
-                || word_offset
-                    .checked_add(key_u64s)
-                    .filter(|end| *end <= words.len())
-                    .is_none()
-            {
-                return Err(EngineError::Checkpoint(-2));
-            }
-            let key = unsafe {
-                if (*raw).k.format != KEY_FORMAT_CURRENT || (*raw).k.type_ != KEY_TYPE_cookie {
-                    return Err(EngineError::Checkpoint(-2));
-                }
-                decode_key(bkey_s_c {
-                    k: &(*raw).k,
-                    v: &(*raw).v,
-                })
-                .map_err(|_| EngineError::Checkpoint(-2))?
-            };
-            entries.push(key);
-            word_offset += key_u64s;
-        }
-        if word_offset != words.len() {
-            return Err(EngineError::Checkpoint(-2));
-        }
-        nodes.push(CheckpointNode {
-            btree: BtreeId(btree_id as u8),
-            level: level as u8,
-            page: page as u32,
-            entries,
-        });
-    }
-    if offset != payload.len() {
-        return Err(EngineError::Checkpoint(-2));
-    }
-
-    let image = CheckpointImage {
-        sequence: expected_sequence,
-        generation: expected_generation,
-        roots,
-        nodes,
-    };
-    validate_checkpoint_image(&image)?;
-    Ok(image)
-}
-
-fn checkpoint_slot_offset(slot: usize) -> u64 {
-    debug_assert!(slot < CHECKPOINT_HEADER_SLOTS);
-    slot as u64 * CHECKPOINT_HEADER_BYTES as u64
-}
-
-fn checkpoint_header_word(header: &[u8], index: usize) -> u64 {
-    let start = index * core::mem::size_of::<u64>();
-    u64::from_le_bytes(
-        header[start..start + core::mem::size_of::<u64>()]
-            .try_into()
-            .unwrap(),
-    )
-}
-
-fn set_checkpoint_header_word(header: &mut [u8], index: usize, value: u64) {
-    let start = index * core::mem::size_of::<u64>();
-    header[start..start + core::mem::size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
-}
-
-fn checkpoint_header(
-    slot: CheckpointSlot,
-    payload_checksum: crate::btree::bset::bch_csum,
-) -> [u8; CHECKPOINT_HEADER_BYTES] {
-    let mut header = [0u8; CHECKPOINT_HEADER_BYTES];
-    set_checkpoint_header_word(&mut header, 0, ENGINE_CHECKPOINT_MAGIC);
-    set_checkpoint_header_word(
-        &mut header,
-        1,
-        STORAGE_FORMAT_VERSION as u64 | (CHECKPOINT_HEADER_WORDS as u64) << 32,
-    );
-    set_checkpoint_header_word(&mut header, 2, slot.generation);
-    set_checkpoint_header_word(&mut header, 3, slot.sequence);
-    set_checkpoint_header_word(&mut header, 4, slot.offset);
-    set_checkpoint_header_word(&mut header, 5, slot.bytes);
-    set_checkpoint_header_word(&mut header, 6, slot.capacity);
-    set_checkpoint_header_word(&mut header, 7, payload_checksum.lo);
-    set_checkpoint_header_word(&mut header, 8, payload_checksum.hi);
-    let checksum = crate::checksum::bch2_checksum(
-        crate::checksum::BCH_CSUM_xxhash,
-        &header[..9 * core::mem::size_of::<u64>()],
-    );
-    set_checkpoint_header_word(&mut header, 9, checksum.lo);
-    set_checkpoint_header_word(&mut header, 10, checksum.hi);
-    header
-}
-
-fn read_exact_at(file: &File, data: &mut [u8], offset: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-
-    let mut read = 0usize;
-    while read < data.len() {
-        let nr = file.read_at(&mut data[read..], offset + read as u64)?;
-        if nr == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "checkpoint read reached end of file",
-            ));
-        }
-        read += nr;
-    }
-    Ok(())
-}
-
-fn write_all_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-
-    let mut written = 0usize;
-    while written < data.len() {
-        let nr = file.write_at(&data[written..], offset + written as u64)?;
-        if nr == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "checkpoint write made no progress",
-            ));
-        }
-        written += nr;
-    }
-    Ok(())
-}
-
-fn checkpoint_align_up(value: u64) -> Result<u64, EngineError> {
-    value
-        .checked_add(CHECKPOINT_ALIGN - 1)
-        .map(|value| value / CHECKPOINT_ALIGN * CHECKPOINT_ALIGN)
-        .ok_or(EngineError::Checkpoint(-12))
-}
-
-fn checkpoint_capacity(bytes: u64) -> Result<u64, EngineError> {
-    bytes
-        .max(CHECKPOINT_ALIGN)
-        .checked_next_power_of_two()
-        .ok_or(EngineError::Checkpoint(-12))
-}
-
-unsafe fn persistent_checkpoint_file(fs: &bch_fs) -> Result<&File, EngineError> {
-    if fs.disk_sb.s_bdev_file.is_null() {
-        return Err(EngineError::Checkpoint(-1));
-    }
-    Ok(&*fs.disk_sb.s_bdev_file.cast::<File>())
-}
-
-unsafe fn read_checkpoint_slot(
-    file: &File,
-    file_len: u64,
-    slot_index: usize,
-) -> Result<Option<(CheckpointSlot, CheckpointImage)>, EngineError> {
-    let mut header = [0u8; CHECKPOINT_HEADER_BYTES];
-    read_exact_at(file, &mut header, checkpoint_slot_offset(slot_index))?;
-    if header.iter().all(|byte| *byte == 0) {
-        return Ok(None);
-    }
-    if checkpoint_header_word(&header, 0) != ENGINE_CHECKPOINT_MAGIC {
-        return Ok(None);
-    }
-    let version_and_words = checkpoint_header_word(&header, 1);
-    let version = version_and_words as u32;
-    let header_words = (version_and_words >> 32) as usize;
-    if version != STORAGE_FORMAT_VERSION {
-        return Err(EngineError::UnsupportedFormatVersion(version));
-    }
-    if header_words != CHECKPOINT_HEADER_WORDS {
-        return Ok(None);
-    }
-    let expected = crate::checksum::bch2_checksum(
-        crate::checksum::BCH_CSUM_xxhash,
-        &header[..9 * core::mem::size_of::<u64>()],
-    );
-    if checkpoint_header_word(&header, 9) != expected.lo
-        || checkpoint_header_word(&header, 10) != expected.hi
-    {
-        return Ok(None);
-    }
-
-    let slot = CheckpointSlot {
-        generation: checkpoint_header_word(&header, 2),
-        sequence: checkpoint_header_word(&header, 3),
-        offset: checkpoint_header_word(&header, 4),
-        bytes: checkpoint_header_word(&header, 5),
-        capacity: checkpoint_header_word(&header, 6),
-    };
-    if slot.generation == 0
-        || slot.sequence == 0
-        || slot.offset < CHECKPOINT_DATA_START
-        || slot.offset % CHECKPOINT_ALIGN != 0
-        || slot.bytes == 0
-        || slot.bytes > slot.capacity
-        || slot.capacity < CHECKPOINT_ALIGN
-        || slot.capacity % CHECKPOINT_ALIGN != 0
-        || slot
-            .offset
-            .checked_add(slot.capacity)
-            .filter(|end| *end <= file_len)
-            .is_none()
-    {
-        return Ok(None);
-    }
-    let payload_len = match usize::try_from(slot.bytes) {
-        Ok(length) => length,
-        Err(_) => return Ok(None),
-    };
-    let mut payload = Vec::new();
-    if payload.try_reserve_exact(payload_len).is_err() {
-        return Ok(None);
-    }
-    payload.resize(payload_len, 0);
-    read_exact_at(file, &mut payload, slot.offset)?;
-    let expected_payload =
-        crate::checksum::bch2_checksum(crate::checksum::BCH_CSUM_xxhash, &payload);
-    if checkpoint_header_word(&header, 7) != expected_payload.lo
-        || checkpoint_header_word(&header, 8) != expected_payload.hi
-    {
-        return Ok(None);
-    }
-    match checkpoint_image_from_payload(&payload, slot.sequence, slot.generation) {
-        Ok(image) => Ok(Some((slot, image))),
-        Err(EngineError::UnsupportedFormatVersion(version)) => {
-            Err(EngineError::UnsupportedFormatVersion(version))
-        }
-        Err(_) => Ok(None),
-    }
-}
-
-unsafe fn read_persistent_checkpoint(fs: &bch_fs) -> Result<CheckpointState, EngineError> {
-    let file = persistent_checkpoint_file(fs)?;
-    let file_len = file.metadata()?.len();
-    if file_len < CHECKPOINT_DATA_START {
-        return Err(EngineError::Checkpoint(-1));
-    }
-
-    let mut state = CheckpointState::default();
-    let mut selected: Option<(usize, CheckpointSlot, CheckpointImage)> = None;
-    for index in 0..CHECKPOINT_HEADER_SLOTS {
-        let Some((slot, image)) = read_checkpoint_slot(file, file_len, index)? else {
-            continue;
-        };
-        state.slots[index] = slot;
-        match &selected {
-            None => selected = Some((index, slot, image)),
-            Some((_, selected_slot, selected_image)) => {
-                if slot.generation == selected_slot.generation && &image != selected_image {
-                    return Err(EngineError::Checkpoint(-3));
-                }
-                if (slot.generation, slot.sequence)
-                    > (selected_slot.generation, selected_slot.sequence)
-                {
-                    selected = Some((index, slot, image));
-                }
-            }
-        }
-    }
-    if let Some((index, _, image)) = selected {
-        state.image = image;
-        state.active_slot = Some(index);
-    }
-    Ok(state)
-}
-
-unsafe fn write_persistent_checkpoint(
-    fs: &mut bch_fs,
-    state: &mut CheckpointState,
-) -> Result<(), EngineError> {
-    let payload = checkpoint_payload(&state.image)?;
-    let payload_len = u64::try_from(payload.len()).map_err(|_| EngineError::Checkpoint(-12))?;
-    let file = persistent_checkpoint_file(fs)?;
-    let target = state
-        .active_slot
-        .map(|active| (active + 1) % CHECKPOINT_HEADER_SLOTS)
-        .unwrap_or(0);
-    let active_offset = state.active_slot.map(|active| state.slots[active].offset);
-    let mut slot = state.slots[target];
-    let reusable = slot.offset >= CHECKPOINT_DATA_START
-        && slot.offset % CHECKPOINT_ALIGN == 0
-        && slot.capacity >= payload_len
-        && Some(slot.offset) != active_offset;
-    if !reusable {
-        let offset = checkpoint_align_up(file.metadata()?.len().max(CHECKPOINT_DATA_START))?;
-        let capacity = checkpoint_capacity(payload_len)?;
-        let end = offset
-            .checked_add(capacity)
-            .ok_or(EngineError::Checkpoint(-12))?;
-        file.set_len(end)?;
-        slot.offset = offset;
-        slot.capacity = capacity;
-    }
-    slot.generation = state.image.generation;
-    slot.sequence = state.image.sequence;
-    slot.bytes = payload_len;
-
-    write_all_at(file, &payload, slot.offset)?;
-    /* The payload must reach stable storage before its alternate header can
-     * make it reachable after a crash. */
-    file.sync_all()?;
-    if consume_fault(&fs.journal.fault_inject_checkpoint_write_error) {
-        return Err(EngineError::Checkpoint(-5));
-    }
-
-    let payload_checksum =
-        crate::checksum::bch2_checksum(crate::checksum::BCH_CSUM_xxhash, &payload);
-    let header = checkpoint_header(slot, payload_checksum);
-    write_all_at(file, &header, checkpoint_slot_offset(target))?;
-    file.sync_all()?;
-    state.slots[target] = slot;
-    state.active_slot = Some(target);
-    Ok(())
-}
-
 unsafe fn configure_persistent_journal(
     fs: &mut bch_fs,
     file: std::fs::File,
@@ -2362,23 +1308,6 @@ mod tests {
         file.sync_all().unwrap();
     }
 
-    fn newest_checkpoint_slot(path: &Path) -> (usize, CheckpointSlot) {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let file_len = file.metadata().unwrap().len();
-        (0..CHECKPOINT_HEADER_SLOTS)
-            .filter_map(|index| unsafe {
-                read_checkpoint_slot(&file, file_len, index)
-                    .unwrap()
-                    .map(|(slot, _)| (index, slot))
-            })
-            .max_by_key(|(_, slot)| (slot.generation, slot.sequence))
-            .expect("checkpoint slot was published")
-    }
-
     #[test]
     fn transaction_restart_retraverses_before_committing_once() {
         let engine = StorageEngine::new().unwrap();
@@ -2473,21 +1402,19 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_reclaims_old_records_and_replays_the_tail() {
+    fn reclaim_releases_old_records_and_replays_the_tail() {
         let engine = StorageEngine::new().unwrap();
         let secondary = BtreeId::new(1).unwrap();
         engine.put(BtreeId::DEFAULT, key(21, &[1, 2])).unwrap();
         engine.put(secondary, key(22, &[3])).unwrap();
         engine.flush_journal().unwrap();
-        assert_eq!(engine.durable_journal().unwrap().checkpoint_sequence(), 0);
 
         engine.reclaim_journal().unwrap();
-        let checkpointed = engine.durable_journal().unwrap();
-        assert_ne!(checkpointed.checkpoint_sequence(), 0);
-        assert_eq!(checkpointed.checkpoint_key_count(), 2);
-        /* The retained record is the empty post-checkpoint anchor, not the
-         * original key-bearing transaction record. */
-        assert_eq!(checkpointed.record_count(), 1);
+        let reclaimed = engine.durable_journal().unwrap();
+        /* A device-less engine keeps every record: its journal mirror is the
+         * only durable source from which recovery can rebuild the btree, so
+         * reclaim publishes the anchor without discarding the window. */
+        assert_eq!(reclaimed.record_count(), 2);
 
         engine.put(BtreeId::DEFAULT, key(23, &[4, 5, 6])).unwrap();
         engine.flush_journal().unwrap();
@@ -2499,128 +1426,6 @@ mod tests {
         assert_eq!(recovered.scan(secondary).unwrap(), vec![key(22, &[3])]);
         recovered.verify(BtreeId::DEFAULT).unwrap();
         recovered.verify(secondary).unwrap();
-
-        /* Once last_seq has advanced, the durable base alone is a valid
-         * clean-recovery state even if no journal anchor remains to replay. */
-        let mut clean = checkpointed.clone();
-        clean.records.clear();
-        let clean_recovered = StorageEngine::recover(&clean).unwrap();
-        assert_eq!(
-            clean_recovered.scan(BtreeId::DEFAULT).unwrap(),
-            vec![key(21, &[1, 2])]
-        );
-        assert_eq!(
-            clean_recovered.scan(secondary).unwrap(),
-            vec![key(22, &[3])]
-        );
-    }
-
-    #[test]
-    fn checkpoint_header_failure_keeps_the_old_journal_window() {
-        let engine = StorageEngine::new().unwrap();
-        engine.put(BtreeId::DEFAULT, key(24, &[7])).unwrap();
-        engine.flush_journal().unwrap();
-        engine.inject_fault(FaultPoint::CheckpointWrite, 1).unwrap();
-        assert!(matches!(
-            engine.checkpoint(),
-            Err(EngineError::Checkpoint(-5))
-        ));
-
-        let image = engine.durable_journal().unwrap();
-        assert_eq!(image.checkpoint_sequence(), 0);
-        assert_eq!(image.record_count(), 1);
-        assert_eq!(
-            StorageEngine::recover(&image)
-                .unwrap()
-                .get(BtreeId::DEFAULT, KeyPosition::new(1, 24, 0))
-                .unwrap(),
-            Some(key(24, &[7]))
-        );
-    }
-
-    #[test]
-    fn persistent_checkpoint_recovers_at_each_publication_cutpoint() {
-        let path = std::env::temp_dir().join(format!(
-            "subvol-engine-checkpoint-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-
-        {
-            let engine = StorageEngine::create_persistent(&path).unwrap();
-            engine.put(BtreeId::DEFAULT, key(25, &[8, 9])).unwrap();
-            engine.flush_journal().unwrap();
-            engine.inject_fault(FaultPoint::CheckpointWrite, 1).unwrap();
-            assert!(matches!(
-                engine.checkpoint(),
-                Err(EngineError::Checkpoint(-5))
-            ));
-        }
-        let after_unpublished_header = StorageEngine::open_persistent(&path).unwrap();
-        assert_eq!(
-            after_unpublished_header
-                .get(BtreeId::DEFAULT, KeyPosition::new(1, 25, 0))
-                .unwrap(),
-            Some(key(25, &[8, 9]))
-        );
-        drop(after_unpublished_header);
-
-        {
-            let engine = StorageEngine::open_persistent(&path).unwrap();
-            engine
-                .inject_fault(FaultPoint::CheckpointBarrier, 1)
-                .unwrap();
-            assert!(matches!(
-                engine.checkpoint(),
-                Err(EngineError::Checkpoint(-5))
-            ));
-            let image = engine.durable_journal().unwrap();
-            assert_ne!(image.checkpoint_sequence(), 0);
-            assert_eq!(
-                StorageEngine::recover(&image)
-                    .unwrap()
-                    .get(BtreeId::DEFAULT, KeyPosition::new(1, 25, 0))
-                    .unwrap(),
-                Some(key(25, &[8, 9]))
-            );
-        }
-        let after_published_header = StorageEngine::open_persistent(&path).unwrap();
-        assert_eq!(
-            after_published_header
-                .get(BtreeId::DEFAULT, KeyPosition::new(1, 25, 0))
-                .unwrap(),
-            Some(key(25, &[8, 9]))
-        );
-        drop(after_published_header);
-
-        {
-            let engine = StorageEngine::open_persistent(&path).unwrap();
-            engine.checkpoint().unwrap();
-            engine.put(BtreeId::DEFAULT, key(26, &[10])).unwrap();
-            engine.flush_journal().unwrap();
-            engine.checkpoint().unwrap();
-        }
-
-        /* A complete checkpoint may reclaim every physical journal record.
-         * The alternate checkpoint header must then bootstrap recovery on its
-         * own, exactly as the written btree base precedes journal replay. */
-        {
-            use std::os::unix::fs::FileExt;
-
-            let file = OpenOptions::new().write(true).open(&path).unwrap();
-            let zeros = vec![0; JOURNAL_BUCKETS as usize * JOURNAL_BUCKET_SIZE as usize * 512];
-            let offset = JOURNAL_BUCKET_START * JOURNAL_BUCKET_SIZE as u64 * 512;
-            assert_eq!(file.write_at(&zeros, offset).unwrap(), zeros.len());
-            file.sync_all().unwrap();
-        }
-        let recovered = StorageEngine::open_persistent(&path).unwrap();
-        assert_eq!(
-            recovered.scan(BtreeId::DEFAULT).unwrap(),
-            vec![key(25, &[8, 9]), key(26, &[10])]
-        );
-        recovered.verify(BtreeId::DEFAULT).unwrap();
-        drop(recovered);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2697,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_checkpoint_recovery_matches_the_model() {
+    fn generated_reclaim_recovery_matches_the_model() {
         for seed in 1..=6u64 {
             let engine = StorageEngine::new().unwrap();
             let mut model = BTreeMap::<KeyPosition, BtreeKey>::new();
@@ -2723,7 +1528,7 @@ mod tests {
                     engine.flush_journal().unwrap();
                 }
                 if step % 16 == 15 {
-                    engine.checkpoint().unwrap();
+                    engine.reclaim_journal().unwrap();
                     let image = engine.durable_journal().unwrap();
                     let recovered = StorageEngine::recover(&image).unwrap();
                     assert_eq!(
@@ -2746,26 +1551,39 @@ mod tests {
 
     #[test]
     fn durability_api_and_metrics_report_the_committed_boundary() {
-        let engine = StorageEngine::new().unwrap();
-        let mut transaction = engine.transaction();
-        transaction.put(BtreeId::DEFAULT, key(401, &[1, 2, 3]));
-        let durable = transaction.commit_sync().unwrap();
-        assert_ne!(durable.journal_sequence_ondisk, 0);
-        assert_eq!(durable.checkpoint_generation, 0);
+        let path = persistent_test_path("durability-reclaim");
+        {
+            let engine = StorageEngine::create_persistent(&path).unwrap();
+            let mut transaction = engine.transaction();
+            transaction.put(BtreeId::DEFAULT, key(401, &[1, 2, 3]));
+            let durable = transaction.commit_sync().unwrap();
+            assert_ne!(durable.journal_sequence_ondisk, 0);
+            /* A synchronous flush writes the committed entry, then rotates
+             * the ring: seq names the next slot, one past the durable
+             * record. */
+            assert_eq!(
+                durable.journal_sequence,
+                durable.journal_sequence_ondisk + 1
+            );
 
-        let before = engine.metrics().unwrap();
-        assert_eq!(before.checkpoint.generation, 0);
-        assert_ne!(before.journal_records, 0);
+            let before = engine.metrics().unwrap();
+            assert_ne!(before.journal_records, 0);
+            assert_eq!(before.journal_sequence, durable.journal_sequence);
 
-        let checkpoint = engine.checkpoint_sync().unwrap();
-        assert_ne!(checkpoint.checkpoint_generation, 0);
-        let after = engine.metrics().unwrap();
+            engine.reclaim_journal().unwrap();
+            let after = engine.metrics().unwrap();
+            assert_ne!(after.journal_last_sequence, 0);
+            assert_eq!(engine.durable_journal().unwrap().record_count(), 1);
+        }
+
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
         assert_eq!(
-            after.checkpoint.generation,
-            checkpoint.checkpoint_generation
+            recovered.scan(BtreeId::DEFAULT).unwrap(),
+            vec![key(401, &[1, 2, 3])]
         );
-        assert_eq!(after.checkpoint.key_count, 1);
-        assert_eq!(engine.durable_journal().unwrap().checkpoint_node_count(), 1);
+        recovered.verify(BtreeId::DEFAULT).unwrap();
+        drop(recovered);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2788,7 +1606,10 @@ mod tests {
         assert!(status.requested > before.requested);
         assert!(status.completed >= status.requested);
         assert_eq!(status.last_error, None);
-        assert_ne!(engine.metrics().unwrap().checkpoint.generation, 0);
+        /* The reclaim pass published an empty anchor that repeats the root
+         * set; a device-less engine keeps both original records too, since
+         * its journal mirror is the only durable recovery source. */
+        assert_eq!(engine.durable_journal().unwrap().record_count(), 3);
         assert_eq!(
             engine.scan(BtreeId::DEFAULT).unwrap(),
             vec![key(410, &[1]), key(411, &[2, 3])]
@@ -2796,84 +1617,12 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_pages_are_cow_and_corrupt_page_falls_back_to_prior_root() {
-        let path = persistent_test_path("checkpoint-cow-pages");
-        {
-            let engine = StorageEngine::create_persistent(&path).unwrap();
-            for batch in 0..2u64 {
-                let mut transaction = engine.transaction();
-                for offset in 0..16u64 {
-                    let offset = batch * 16 + offset;
-                    transaction.put(
-                        BtreeId::DEFAULT,
-                        key(
-                            500 + offset,
-                            &[offset, offset.wrapping_add(1), offset.wrapping_add(2)],
-                        ),
-                    );
-                }
-                transaction.commit().unwrap();
-            }
-            engine.sync().unwrap();
-            let first = engine.checkpoint_sync().unwrap();
-            assert!(first.checkpoint_generation >= 1);
-            assert!(engine.read_transaction().checkpoint().node_count > 1);
-
-            engine
-                .put_sync(BtreeId::DEFAULT, key(900, &[0xfeed, 0xbeef]))
-                .unwrap();
-            engine.checkpoint_sync().unwrap();
-        }
-
-        let (slot_index, slot) = newest_checkpoint_slot(&path);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let mut payload = vec![0; usize::try_from(slot.bytes).unwrap()];
-        read_exact_at(&file, &mut payload, slot.offset).unwrap();
-        let first_page_word = (CHECKPOINT_PAYLOAD_HEADER_WORDS
-            + CHECKPOINT_ROOT_WORDS
-            + CHECKPOINT_NODE_HEADER_WORDS)
-            * core::mem::size_of::<u64>();
-        payload[first_page_word] ^= 0x80;
-
-        /* Rewrite the whole-payload checksum and header: recovery must still
-         * reject the image through the immutable page checksum, then select
-         * the alternate COW root. */
-        let checksum = crate::checksum::bch2_checksum(crate::checksum::BCH_CSUM_xxhash, &payload);
-        write_all_at(&file, &payload, slot.offset).unwrap();
-        write_all_at(
-            &file,
-            &checkpoint_header(slot, checksum),
-            checkpoint_slot_offset(slot_index),
-        )
-        .unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-        clear_journal_region(&path);
-
-        let recovered = StorageEngine::open_persistent(&path).unwrap();
-        assert_eq!(recovered.scan(BtreeId::DEFAULT).unwrap().len(), 32);
-        assert!(recovered
-            .get(BtreeId::DEFAULT, KeyPosition::new(1, 900, 0))
-            .unwrap()
-            .is_none());
-        drop(recovered);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn corrupt_journal_tail_never_overrides_a_valid_checkpoint_base() {
+    fn corrupt_journal_tail_never_survives_recovery() {
         let path = persistent_test_path("corrupt-journal-tail");
         {
             let engine = StorageEngine::create_persistent(&path).unwrap();
             engine.put_sync(BtreeId::DEFAULT, key(600, &[1])).unwrap();
-            engine.checkpoint_sync().unwrap();
-            engine
-                .inject_fault(FaultPoint::CheckpointWrite, u32::MAX)
-                .unwrap();
+            engine.reclaim_journal().unwrap();
             engine.put_sync(BtreeId::DEFAULT, key(601, &[2])).unwrap();
         }
 
@@ -2884,18 +1633,12 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
 
+        /* With the journal storage region erased there is no longer any
+         * durable root set or replay window: the corrupt journal must be
+         * rejected, and an empty journal must not fabricate data. */
         match StorageEngine::open_persistent(&path) {
             Ok(recovered) => {
-                assert_eq!(
-                    recovered
-                        .get(BtreeId::DEFAULT, KeyPosition::new(1, 600, 0))
-                        .unwrap(),
-                    Some(key(600, &[1]))
-                );
-                assert!(recovered
-                    .get(BtreeId::DEFAULT, KeyPosition::new(1, 601, 0))
-                    .unwrap()
-                    .is_none());
+                assert!(recovered.scan(BtreeId::DEFAULT).unwrap().is_empty());
             }
             Err(EngineError::Journal(_)) => {}
             Err(error) => panic!("unexpected corrupted-journal result: {error}"),
@@ -2931,7 +1674,6 @@ mod tests {
             workers.push(std::thread::spawn(move || {
                 for _ in 0..32 {
                     let reader = engine.read_transaction();
-                    let _ = reader.checkpoint();
                     let keys = reader.scan(BtreeId::DEFAULT).unwrap();
                     assert!(keys
                         .windows(2)
@@ -2962,11 +1704,11 @@ mod tests {
             }
             "checkpoint" => {
                 engine.put_sync(BtreeId::DEFAULT, key(702, &[2])).unwrap();
-                engine.checkpoint_sync().unwrap();
+                engine.reclaim_journal().unwrap();
             }
             "tail" => {
                 engine.put_sync(BtreeId::DEFAULT, key(703, &[3])).unwrap();
-                engine.checkpoint_sync().unwrap();
+                engine.reclaim_journal().unwrap();
                 engine.put_sync(BtreeId::DEFAULT, key(704, &[4])).unwrap();
             }
             _ => panic!("unknown crash phase {phase}"),

@@ -28,16 +28,6 @@ pub const BCH_JSET_ENTRY_log: u8 = 9;
 pub const BCH_JSET_ENTRY_log_bkey: u8 = 13;
 pub const JSET_KEYS_U64s: u32 = 1;
 pub const JSET_HEADER_U64S: usize = 7;
-/*
- * bch2_journal_write_prep() appends every live btree root to each written
- * jset.  The storage-engine checkpoint is its durable base equivalent: this
- * marker is appended to every post-checkpoint jset so recovery can bind the
- * retained journal window to the checkpoint image before replaying keys.
- */
-pub const ENGINE_CHECKPOINT_JOURNAL_MAGIC: u64 = 0x5355_4256_4f4c_434b;
-pub const JOURNAL_CHECKPOINT_ENTRY_U64S: usize = 3;
-const JOURNAL_CHECKPOINT_ENTRY_RESERVED_U64S: usize =
-    JSET_KEYS_U64s as usize + JOURNAL_CHECKPOINT_ENTRY_U64S;
 pub const JOURNAL_degraded: usize = 0;
 pub const JOURNAL_replay_done: usize = 1;
 pub const JOURNAL_running: usize = 2;
@@ -259,18 +249,10 @@ pub struct journal {
     pub cur_entry_sectors: AtomicU32,
     pub cur_entry_error: AtomicI32,
     pub reclaim_kicked: AtomicBool,
-    /* Durable checkpoint identity propagated in every post-checkpoint
-     * journal entry, following write.c's root-entry propagation rule. */
-    pub checkpoint_seq: AtomicU64,
-    pub checkpoint_generation: AtomicU64,
     /* Test-only write failure point.  It is consumed before a record is
      * materialized or durable state is advanced, matching write.c's rule
      * that a failed write cannot publish its sequence. */
     pub fault_inject_write_error: AtomicU32,
-    /* These two cutpoints model the checkpoint data-write and the following
-     * journal-root publication boundary independently. */
-    pub fault_inject_checkpoint_write_error: AtomicU32,
-    pub fault_inject_checkpoint_barrier_error: AtomicU32,
 }
 
 impl Default for journal {
@@ -291,9 +273,7 @@ impl Default for journal {
             reservations: AtomicU64::new(state),
             seq: AtomicU64::new(seq),
             cur_entry_u64s: AtomicU32::new(
-                (JOURNAL_ENTRY_SIZE_MAX / core::mem::size_of::<u64>()
-                    - JSET_HEADER_U64S
-                    - JOURNAL_CHECKPOINT_ENTRY_RESERVED_U64S) as u32,
+                (JOURNAL_ENTRY_SIZE_MAX / core::mem::size_of::<u64>() - JSET_HEADER_U64S) as u32,
             ),
             ring,
             closed: Mutex::new(Vec::new()),
@@ -317,18 +297,14 @@ impl Default for journal {
             cur_entry_sectors: AtomicU32::new(0),
             cur_entry_error: AtomicI32::new(0),
             reclaim_kicked: AtomicBool::new(false),
-            checkpoint_seq: AtomicU64::new(0),
-            checkpoint_generation: AtomicU64::new(0),
             fault_inject_write_error: AtomicU32::new(0),
-            fault_inject_checkpoint_write_error: AtomicU32::new(0),
-            fault_inject_checkpoint_barrier_error: AtomicU32::new(0),
         }
     }
 }
 
 fn journal_entry_u64s_for_sectors(sectors: u32) -> u32 {
     (sectors as usize * 512 / core::mem::size_of::<u64>())
-        .saturating_sub(JSET_HEADER_U64S + JOURNAL_CHECKPOINT_ENTRY_RESERVED_U64S)
+        .saturating_sub(JSET_HEADER_U64S)
         .min(JOURNAL_ENTRY_OFFSET_MAX as usize) as u32
 }
 
@@ -1032,30 +1008,50 @@ pub fn bch2_journal_flush(j: &journal) -> i32 {
     record[JSET_HEADER_U64S..].copy_from_slice(&data[..used]);
 
     /*
-     * write.c appends the current root set after transaction reservations
-     * have been materialized.  Do the same for the engine's checkpoint
-     * anchor: it is never charged to a transaction reservation and every
-     * post-checkpoint record repeats it, so the newest replay window carries
-     * the base identity needed before journal-key replay starts.
+     * write.c's bch2_journal_write_prep() appends every live btree root
+     * after transaction reservations have been materialized; root entries
+     * are never charged to a reservation and every written jset repeats the
+     * full root set, so recovery's early replay pass can bind the roots
+     * before journal-key replay starts.  Root entries are only appended for
+     * a journal embedded in a real bch_fs (the same container_of()
+     * derivation update.rs uses in its pin flush callbacks); a journal
+     * without a device has no durable roots to publish.
      */
-    let checkpoint_seq = j.checkpoint_seq.load(Ordering::Acquire);
-    if checkpoint_seq != 0 {
-        let checkpoint_generation = j.checkpoint_generation.load(Ordering::Acquire);
-        let marker_offset = record.len();
-        record.resize(marker_offset + JOURNAL_CHECKPOINT_ENTRY_RESERVED_U64S, 0);
+    let c = if !j.disk_sb.load(Ordering::Acquire).is_null() {
         unsafe {
-            *record.as_mut_ptr().add(marker_offset).cast::<jset_entry>() = jset_entry {
-                u64s: JOURNAL_CHECKPOINT_ENTRY_U64S as u16,
-                btree_id: 0,
-                level: 0,
-                type_: BCH_JSET_ENTRY_log,
-                pad: [0; 3],
-            };
+            (j as *const journal as *const u8)
+                .sub(core::mem::offset_of!(crate::btree::types::bch_fs, journal))
+                as *mut crate::btree::types::bch_fs
         }
-        record[marker_offset + 1] = ENGINE_CHECKPOINT_JOURNAL_MAGIC;
-        record[marker_offset + 2] = checkpoint_seq;
-        record[marker_offset + 3] = checkpoint_generation;
-        record[5] = record[5].saturating_add(JOURNAL_CHECKPOINT_ENTRY_RESERVED_U64S as u64);
+    } else {
+        core::ptr::null_mut()
+    };
+    if !c.is_null() {
+        /* write.c's prep runs under a guaranteed entry budget (bcachefs
+         * charges btree roots against its reserved u64s).  Reserve the
+         * worst-case root set here, materialize it, then trim the record to
+         * what was actually appended. */
+        let reserved = crate::btree::types::BTREE_ID_NR
+            * (JSET_KEYS_U64s as usize
+                + crate::btree::bkey::BKEY_U64S as usize
+                + crate::btree::types::BKEY_BTREE_PTR_VAL_U64S_MAX);
+        let roots_start = JSET_HEADER_U64S + used;
+        record.resize(roots_start + reserved, 0);
+        let mut end = unsafe {
+            record
+                .as_mut_ptr()
+                .add(roots_start)
+                .cast::<jset_entry>()
+        };
+        end = unsafe { crate::btree::interior::bch2_btree_roots_to_journal_entries(c, end, 0) };
+        let appended = end as usize - (record.as_ptr() as usize + 8 * roots_start);
+        assert!(appended <= reserved * core::mem::size_of::<u64>());
+        if appended != 0 {
+            record.truncate(roots_start + appended / core::mem::size_of::<u64>());
+            record[5] = record[5].saturating_add((appended / core::mem::size_of::<u64>()) as u64);
+        } else {
+            record.truncate(roots_start);
+        }
     }
 
     let disk_sb = j.disk_sb.load(Ordering::Acquire);
@@ -1591,58 +1587,6 @@ pub(crate) fn bch2_journal_restore_for_replay(
     0
 }
 
-/*
- * Return checkpoint anchors carried by the already-selected replay window.
- * This is deliberately parsed with the same jset bounds checks as replay:
- * a marker is metadata, not a best-effort hint, because it authorizes
- * recovery to start from an external durable base instead of older keys.
- */
-pub(crate) fn journal_checkpoint_markers(
-    records: &[Vec<u64>],
-) -> Result<Vec<(u64, u64, u64)>, i32> {
-    let mut markers = Vec::new();
-
-    for record in records {
-        if record.len() < JSET_HEADER_U64S
-            || record[2] != JSET_MAGIC
-            || record[3] == 0
-            || record[5] as u32 as usize > record.len() - JSET_HEADER_U64S
-        {
-            return Err(-1);
-        }
-
-        let mut offset = JSET_HEADER_U64S;
-        let end = JSET_HEADER_U64S + record[5] as u32 as usize;
-        while offset < end {
-            let entry = unsafe { record.as_ptr().add(offset).cast::<jset_entry>().read() };
-            let actual = jset_u64s(entry.u64s as u32) as usize;
-            if actual == 0 || offset + actual > end {
-                return Err(-2);
-            }
-
-            if entry.type_ == BCH_JSET_ENTRY_log {
-                let payload = &record[offset + JSET_KEYS_U64s as usize..offset + actual];
-                if payload.first().copied() == Some(ENGINE_CHECKPOINT_JOURNAL_MAGIC) {
-                    if entry.u64s as usize != JOURNAL_CHECKPOINT_ENTRY_U64S {
-                        return Err(-3);
-                    }
-                    let checkpoint_seq = payload[1];
-                    let generation = payload[2];
-                    if checkpoint_seq == 0 || generation == 0 || record[3] <= checkpoint_seq {
-                        return Err(-3);
-                    }
-                    markers.push((record[3], checkpoint_seq, generation));
-                }
-            }
-            offset += actual;
-        }
-    }
-
-    markers.sort_unstable();
-    markers.dedup();
-    Ok(markers)
-}
-
 pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
     (*c).journal
         .flags
@@ -1690,7 +1634,13 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
         .into_iter()
         .filter(|(seq, _)| *seq >= replay_start && *seq <= replay_end)
         .collect();
-    let mut expected = replay_start;
+    /* Journal read walks a physically contiguous bucket range, so the
+     * records it hands replay are contiguous; reclaimed records before
+     * last_seq may already be gone, so the window may begin past
+     * replay_start.  Enforce in-window contiguity only. */
+    let mut expected = selected
+        .first()
+        .map_or(replay_start, |(first, _)| *first);
     for (seq, _) in &selected {
         if *seq != expected {
             return -8;

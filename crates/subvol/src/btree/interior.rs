@@ -234,7 +234,12 @@ pub unsafe fn bch2_btree_set_root_for_read(c: *mut super::types::bch_fs, b: *mut
     }
     {
         let _root_guard = (*c).btree.cache.root_lock.lock().unwrap();
-        super::types::bch2_btree_id_root_set(c, (*b).c.btree_id as usize, b);
+        let id = (*b).c.btree_id as usize;
+        super::types::bch2_btree_id_root_set(c, id, b);
+        let slot = super::types::bch2_btree_id_root(c, id);
+        super::bkey::bkey_copy(&mut (*slot).key, &(*b).key);
+        (*slot).level = (*b).c.level;
+        (*slot).alive = 1;
     }
     super::cache::bch2_recalc_btree_reserve(c);
 }

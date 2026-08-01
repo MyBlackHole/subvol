@@ -13,7 +13,7 @@ mod snapshot;
 mod util;
 
 pub use engine::{
-    BtreeId, BtreeKey, CheckpointSummary, DurabilityPoint, EngineError, EngineMetrics, FaultPoint,
-    JournalSnapshot, KeyPosition, ReadTransaction, ReclaimStatus, StorageEngine, Transaction,
+    BtreeId, BtreeKey, DurabilityPoint, EngineError, EngineMetrics, FaultPoint, JournalSnapshot,
+    KeyPosition, ReadTransaction, ReclaimStatus, StorageEngine, Transaction,
     STORAGE_FORMAT_VERSION,
 };
