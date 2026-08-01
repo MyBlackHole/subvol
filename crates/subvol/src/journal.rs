@@ -875,6 +875,9 @@ pub fn journal_res_get_fast(j: &journal, res: &mut journal_res, flags: u32) -> b
 pub fn bch2_journal_res_get(j: &journal, res: &mut journal_res, u64s: u16, flags: u32) -> i32 {
     assert!(!res.ref_);
     res.u64s = u64s;
+    /* 对齐 journal.c res_get_slowpath() 的 total_wait =
+     * max(max_dev_latency * 2, HZ * 10)：回收无法推进时的等待上限。 */
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if journal_res_get_fast(j, res, flags) {
             return 0;
@@ -888,7 +891,14 @@ pub fn bch2_journal_res_get(j: &journal, res: &mut journal_res, u64s: u16, flags
             if j.nr_direct_reclaim.load(Ordering::Acquire) != reclaimed {
                 continue;
             }
-            return -9;
+            /* 对齐 journal.c res_get_slowpath()：direct reclaim 未推进时
+             * 等待（后台/后续回收让出节点锁）并重试，而非立即失败。 */
+            bch2_journal_update_last_seq(j);
+            if std::time::Instant::now() >= deadline {
+                return -9;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
         }
         let ret = bch2_journal_flush(j);
         if ret == -9 {
@@ -900,6 +910,12 @@ pub fn bch2_journal_res_get(j: &journal, res: &mut journal_res, u64s: u16, flags
             if j.nr_direct_reclaim.load(Ordering::Acquire) != reclaimed {
                 continue;
             }
+            bch2_journal_update_last_seq(j);
+            if std::time::Instant::now() >= deadline {
+                return -9;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
         }
         if ret != 0 {
             return ret;

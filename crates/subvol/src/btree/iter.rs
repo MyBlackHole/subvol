@@ -530,6 +530,41 @@ pub unsafe fn bch2_trans_begin(trans: *mut btree_trans) -> u32 {
     }
     super::update::bch2_trans_reset_updates(trans);
     (*trans).mem_top = 0;
+    if (*trans).restarted == 5 && (*trans).realloc_bytes_required != 0 {
+        /* 对齐 iter.c:3913-3933：restart 原因为 mem_realloced 时消费
+         * realloc_bytes_required 扩容 trans 内存；realloc 失败降级为
+         * 直接分配 BTREE_TRANS_MEM_MAX（对应 mempool 兜底语义），
+         * 兜底也失败则保留原 mem，由下一次 kmalloc 请求重试。 */
+        let new_bytes = (*trans).realloc_bytes_required as usize;
+        (*trans).realloc_bytes_required = 0;
+        let old_bytes = (*trans).mem_bytes as usize;
+        if old_bytes != 0 && !(*trans).mem.is_null() {
+            if let Ok(old_layout) =
+                std::alloc::Layout::from_size_align(old_bytes, core::mem::align_of::<u64>())
+            {
+                let p = std::alloc::realloc((*trans).mem, old_layout, new_bytes);
+                if !p.is_null() {
+                    (*trans).mem = p;
+                    (*trans).mem_bytes = new_bytes as u32;
+                } else if let Ok(max_layout) = std::alloc::Layout::from_size_align(
+                    super::update::BTREE_TRANS_MEM_MAX as usize,
+                    core::mem::align_of::<u64>(),
+                ) {
+                    let q = std::alloc::alloc(max_layout);
+                    if !q.is_null() {
+                        core::ptr::copy_nonoverlapping(
+                            (*trans).mem,
+                            q,
+                            old_bytes.min(super::update::BTREE_TRANS_MEM_MAX as usize),
+                        );
+                        std::alloc::dealloc((*trans).mem, old_layout);
+                        (*trans).mem = q;
+                        (*trans).mem_bytes = super::update::BTREE_TRANS_MEM_MAX as u32;
+                    }
+                }
+            }
+        }
+    }
     (*trans).realloc_bytes_required = 0;
     if (*trans).journal_replay_not_finished
         && (*trans).c != core::ptr::null_mut()

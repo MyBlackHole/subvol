@@ -408,9 +408,11 @@ impl StorageEngine {
                 return Err(EngineError::Transaction(ret));
             }
             (*fs.disk_sb.sb).block_size = 1;
-            /* This is the same node-buffer geometry used by the port's btree
-             * cache and fake-root recovery tests. */
-            (*fs.disk_sb.sb).flags[0] = 1 << 12;
+            /* 4KB node buffer: BCH_SB_BTREE_NODE_SIZE occupies flags[0]
+             * bits 12-27 in units of sectors (bcachefs_format.h:1223,
+             * sb/io.rs:256), and the port's btree cache and fake-root
+             * recovery tests use the same 8-sector geometry. */
+            (*fs.disk_sb.sb).flags[0] = 8 << 12;
 
             let ret = bch2_fs_btree_cache_init(&mut *fs);
             if ret != 0 {
@@ -867,11 +869,26 @@ impl StorageEngine {
                     ret = bch2_trans_commit(&mut trans);
                     crate::rewrite_log_debug!("transaction commit ret={ret}");
                 }
-
-                if ret == -4 {
-                    crate::rewrite_log_debug!(
-                        "transaction restart nr_updates={}",
+                if ret != 0 && ret != -4 {
+                    crate::rewrite_log_error!(
+                        "transaction failed ret={ret} restarted={} req={} mem_bytes={} nr_updates={}",
+                        trans.restarted,
+                        trans.realloc_bytes_required,
+                        trans.mem_bytes,
                         trans.nr_updates
+                    );
+                }
+
+                /* 对齐 commit.c:1319-1320：ENOMEM 与 transaction_restart 同级
+                 * 均纳入重试。restart 必须由 trans_begin 消费
+                 * realloc_bytes_required 扩容后才能成功；真 OOM（首次分配
+                 * 失败，restarted 未设置）保持 -12 硬失败，避免无限重试。 */
+                if ret == -4 || (ret == -12 && trans.restarted != 0) {
+                    crate::rewrite_log_debug!(
+                        "transaction restart nr_updates={} restarted={} req={}",
+                        trans.nr_updates,
+                        trans.restarted,
+                        trans.realloc_bytes_required
                     );
                     /* The local commit/replay loops begin a fresh transaction
                      * before retraversing every iterator path.  Do this while

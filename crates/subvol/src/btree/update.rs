@@ -26,7 +26,7 @@ use crate::lock::six::{
 };
 
 const UPDATE_KEY_OWNED: usize = usize::MAX;
-const BTREE_TRANS_MEM_MAX: u32 = 1 << 16;
+pub(crate) const BTREE_TRANS_MEM_MAX: u32 = 1 << 16;
 
 #[allow(dead_code)]
 unsafe fn need_whiteout_for_snapshot(
@@ -98,6 +98,10 @@ pub unsafe fn __bch2_trans_kmalloc(trans: *mut btree_trans, size: usize, zero: b
     }
     if (*trans).mem_bytes != 0 {
         (*trans).realloc_bytes_required = (top + size) as u32;
+        /* 对齐 iter.c:3798-3800：mem 已存在且需扩容时返回
+         * BCH_ERR_transaction_restart_mem_realloced（restart 类），
+         * 由 bch2_trans_begin 消费 realloc_bytes_required 扩容后重试。 */
+        (*trans).restarted = 5;
         return core::ptr::null_mut();
     }
     let new_bytes = (top + size).next_power_of_two();
@@ -216,6 +220,12 @@ pub unsafe fn bch2_trans_subbuf_reserve(
 ) -> i32 {
     if (*buf).u64s as usize + u64s as usize > (*buf).size as usize {
         if __bch2_trans_subbuf_alloc(trans, buf, u64s).is_null() {
+            /* 对齐 commit.c:1319-1320：扩容请求（kmalloc 设置
+             * restarted）传播为 restart（-4）由 commit 循环重试；
+             * 真 OOM（超 BTREE_TRANS_MEM_MAX 上限）保持 -12 硬失败。 */
+            if (*trans).restarted != 0 {
+                return -4;
+            }
             return -12;
         }
     }
@@ -845,11 +855,15 @@ unsafe fn __btree_node_flush(
     let c = (j.cast::<u8>())
         .sub(core::mem::offset_of!(super::types::bch_fs, journal))
         .cast::<super::types::bch_fs>();
-    if (*b).flags & (1usize << super::io::BTREE_NODE_dirty) == 0
-        || btree_node_write_idx(b) != i
-        || (*pin).seq != seq
-    {
-        return if (*pin).seq == seq { -1 } else { 0 };
+    if (*b).flags & (1usize << super::io::BTREE_NODE_dirty) == 0 {
+        /* 对齐 __btree_node_flush()（fs/btree/commit.c:254）：节点已写完，
+         * 该 pin 视为完成返回 0，flush_pins 继续处理其余 pin。 */
+        return 0;
+    }
+    if btree_node_write_idx(b) != i || (*pin).seq != seq {
+        /* 节点仍 dirty 但 write_idx 已翻转（上次写盘失败）或 pin 已被
+         * 重新 pin：保持 pin 在 unflushed 列表，由后续 reclaim 重试。 */
+        return -1;
     }
 
     let ret = six_lock_read(&(*b).c.lock);
@@ -866,11 +880,13 @@ unsafe fn __btree_node_flush(
         super::io::BTREE_WRITE_only_if_need,
     );
     six_unlock_read(&(*b).c.lock);
-    if (*pin).seq == seq {
-        -1
-    } else {
-        0
+    if (*b).flags & (1usize << super::io::BTREE_NODE_dirty) != 0 {
+        /* 写盘失败（__bch2_btree_node_write 失败时恢复 dirty 标志）：
+         * 返回错误让 flush_pins 中断，pin 保留在 unflushed 列表，下次
+         * reclaim 重试（bcachefs flush 失败同样 break）。 */
+        return -5;
     }
+    0
 }
 
 pub unsafe extern "C" fn bch2_btree_node_flush0(
