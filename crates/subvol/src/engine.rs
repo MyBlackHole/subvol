@@ -1293,11 +1293,17 @@ unsafe fn configure_persistent_journal(
         .cast::<u8>()
         .add(core::mem::size_of::<bch_sb_field_members_v2>())
         .cast::<bch_member>() = bch_member {
+        uuid: ENGINE_JOURNAL_UUID,
         nbuckets: JOURNAL_FILE_SECTORS / JOURNAL_BUCKET_SIZE as u64,
         first_bucket: 0,
         bucket_size: JOURNAL_BUCKET_SIZE,
         ..Default::default()
     };
+
+    /* members-v2 is the persistent geometry authority.  Attach the only
+     * configured device before any future physical-pointer trigger is allowed
+     * to consume that geometry, matching members.h's devs_online predicate. */
+    fs.devs_online.d[0] |= 1;
 
     let journal_u64s = (core::mem::size_of::<bch_sb_field_journal_v2>()
         + core::mem::size_of::<bch_sb_field_journal_v2_entry>())

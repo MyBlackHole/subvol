@@ -1035,6 +1035,41 @@ pub const KEY_TYPE_extent_whiteout: u8 = 36;
 pub const KEY_TYPE_logged_op_stripe_update: u8 = 37;
 pub const KEY_TYPE_MAX: u8 = 38;
 
+/* bcachefs alloc/format.h:bch_alloc_v4 and bcachefs_format.h:bch_backpointer.
+ * These are the single-format on-disk values used by the derived trees. */
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct bch_alloc_v4 {
+    pub v: bch_val,
+    pub journal_seq_nonempty: u64,
+    pub flags: u32,
+    pub gen: u8,
+    pub oldest_gen: u8,
+    pub data_type: u8,
+    pub stripe_redundancy_obsolete: u8,
+    pub dirty_sectors: u32,
+    pub cached_sectors: u32,
+    pub io_time: [u64; 2],
+    pub stripe_refcount: u32,
+    pub nr_external_backpointers: u32,
+    pub journal_seq_empty: u64,
+    pub stripe_sectors: u32,
+    pub pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct bch_backpointer {
+    pub v: bch_val,
+    pub btree_id: u8,
+    pub level: u8,
+    pub data_type: u8,
+    pub bucket_gen: u8,
+    pub flags: u32,
+    pub bucket_len: u32,
+    pub pos: bpos,
+}
+
 /// Matches bcachefs `bch2_bkey_type_flags[]`.
 #[allow(non_upper_case_globals)]
 pub static bch2_bkey_type_flags: [u32; KEY_TYPE_MAX as usize] = [

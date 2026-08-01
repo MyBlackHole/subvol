@@ -3,7 +3,7 @@ use core::cmp::Ordering;
 use super::bkey::{
     bch2_key_resize, bch_val, bkey, bkey_and_val_eq, bkey_bytes, bkey_copy, bkey_deleted,
     bkey_fields_eq, bkey_i, bkey_init, bkey_packed, bkey_s, bkey_s_c, bkey_val_bytes, bpos_cmp,
-    bpos_eq, bpos_gt, bpos_le, bpos_lt, bpos_min, set_bkey_val_bytes, SPOS_MAX,
+    bpos_eq, bpos_gt, bpos_le, bpos_lt, bpos_min, set_bkey_val_bytes, POS, SPOS_MAX,
 };
 use super::bset_update::{bch2_bset_delete, bch2_bset_insert, btree_keys_account_key};
 use super::iter::{
@@ -1987,9 +1987,311 @@ unsafe fn bch2_key_trigger(trans: *mut btree_trans, op: btree_trigger_op) -> i32
     };
     if type_ == crate::snapshot::KEY_TYPE_snapshot {
         crate::snapshot::bch2_mark_snapshot(trans, op)
+    } else if type_ == super::bset::KEY_TYPE_extent
+        || type_ == super::bset::KEY_TYPE_btree_ptr
+        || type_ == super::bset::KEY_TYPE_btree_ptr_v2
+    {
+        bch2_trigger_extent(trans, op)
     } else {
         0
     }
+}
+
+const fn key_trigger_kind(type_: u8) -> u8 {
+    if type_ == crate::snapshot::KEY_TYPE_snapshot {
+        1
+    } else if type_ == super::bset::KEY_TYPE_extent
+        || type_ == super::bset::KEY_TYPE_btree_ptr
+        || type_ == super::bset::KEY_TYPE_btree_ptr_v2
+    {
+        2
+    } else {
+        0
+    }
+}
+
+/* This is alloc/buckets.c's transactional pointer admission boundary.  The
+ * derived alloc/backpointer updates are added by bch2_trigger_extent(); this
+ * helper deliberately keeps the source rule that a missing device is an
+ * insertion error but an old pointer may be removed during recovery. */
+unsafe fn trigger_pointer_validate(
+    trans: *mut btree_trans,
+    ptr: super::bset::bch_extent_ptr,
+    insert: bool,
+) -> i32 {
+    let c = (*trans).c;
+    let dev = super::bset::BCH_EXTENT_PTR_DEV(&ptr) as usize;
+    if dev >= crate::sb::BCH_SB_MEMBERS_MAX || !super::bset::bch2_dev_idx_is_online(c, dev as u32) {
+        return if insert { -1 } else { 1 };
+    }
+
+    let sb = (*c).disk_sb.sb;
+    if sb.is_null() || dev >= (*sb).nr_devices as usize {
+        return if insert { -1 } else { 1 };
+    }
+    if crate::sb::io::bch2_sb_field_get_id(sb, crate::sb::BCH_SB_FIELD_members_v2).is_null() {
+        return if insert { -1 } else { 1 };
+    }
+    let member = crate::sb::io::bch2_sb_member_get(sb, dev);
+    if !crate::sb::bch2_member_alive(&member) || member.bucket_size == 0 {
+        return if insert { -1 } else { 1 };
+    }
+
+    let bucket = super::bset::BCH_EXTENT_PTR_OFFSET(&ptr) / member.bucket_size as u64;
+    let first = member.first_bucket as u64;
+    let valid = bucket >= first && bucket - first < member.nbuckets.wrapping_sub(first);
+    if !valid {
+        return if insert { -1 } else { 1 };
+    }
+    0
+}
+
+unsafe fn trigger_staged_key(
+    trans: *mut btree_trans,
+    btree: u8,
+    pos: super::bkey::bpos,
+) -> *mut bkey_i {
+    for idx in 0..(*trans).nr_updates as usize {
+        let i = (*trans).updates.add(idx);
+        if (*i).btree_id == btree && (*i).level == 0 && bpos_eq((*(*i).k).k.p, pos) {
+            return (*i).k;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn trigger_read_alloc(
+    trans: *mut btree_trans,
+    pos: super::bkey::bpos,
+    out: &mut super::bset::bch_alloc_v4,
+) {
+    let staged = trigger_staged_key(trans, 4, pos);
+    if !staged.is_null()
+        && (*staged).k.type_ == super::bset::KEY_TYPE_alloc_v4
+        && bkey_val_bytes(&(*staged).k) >= core::mem::size_of::<super::bset::bch_alloc_v4>()
+    {
+        *out = core::ptr::read_unaligned(
+            (staged as *const u8)
+                .add(core::mem::size_of::<bkey>())
+                .cast::<super::bset::bch_alloc_v4>(),
+        );
+        return;
+    }
+    let mut iter = btree_iter::default();
+    bch2_trans_iter_init(trans, &mut iter, 4, pos, BTREE_ITER_intent);
+    let found = bch2_btree_iter_peek_slot(&mut iter);
+    if !found.k.is_null()
+        && bpos_eq((*found.k).p, pos)
+        && (*found.k).type_ == super::bset::KEY_TYPE_alloc_v4
+        && bkey_val_bytes(&*found.k) >= core::mem::size_of::<super::bset::bch_alloc_v4>()
+    {
+        *out = core::ptr::read_unaligned(found.v.cast::<super::bset::bch_alloc_v4>());
+    }
+    bch2_trans_iter_exit(&mut iter);
+}
+
+unsafe fn trigger_update_value(
+    trans: *mut btree_trans,
+    btree: u8,
+    pos: super::bkey::bpos,
+    type_: u8,
+    value: *const u8,
+    value_bytes: usize,
+) -> i32 {
+    let mut iter = btree_iter::default();
+    bch2_trans_iter_init(trans, &mut iter, btree, pos, BTREE_ITER_intent);
+    let existing = bch2_btree_iter_peek_slot(&mut iter);
+    if super::bkey::bkey_err(existing) != 0 {
+        bch2_trans_iter_exit(&mut iter);
+        return super::bkey::bkey_err(existing);
+    }
+    let key =
+        bch2_trans_kmalloc(trans, core::mem::size_of::<bkey_i>() + value_bytes).cast::<bkey_i>();
+    if key.is_null() {
+        bch2_trans_iter_exit(&mut iter);
+        return -12;
+    }
+    core::ptr::write_bytes(
+        key.cast::<u8>(),
+        0,
+        core::mem::size_of::<bkey_i>() + value_bytes,
+    );
+    bkey_init(&mut (*key).k);
+    (*key).k.p = pos;
+    (*key).k.type_ = type_;
+    set_bkey_val_bytes(&mut (*key).k, value_bytes as u32);
+    core::ptr::copy_nonoverlapping(
+        value,
+        (key as *mut u8).add(core::mem::size_of::<bkey_i>()),
+        value_bytes,
+    );
+    let ret = bch2_trans_update(trans, &mut iter, key, 0);
+    bch2_trans_iter_exit(&mut iter);
+    ret
+}
+
+unsafe fn trigger_delete_value(trans: *mut btree_trans, btree: u8, pos: super::bkey::bpos) -> i32 {
+    let mut iter = btree_iter::default();
+    bch2_trans_iter_init(trans, &mut iter, btree, pos, BTREE_ITER_intent);
+    let existing = bch2_btree_iter_peek_slot(&mut iter);
+    if super::bkey::bkey_err(existing) != 0 {
+        bch2_trans_iter_exit(&mut iter);
+        return super::bkey::bkey_err(existing);
+    }
+    let key = bch2_trans_kmalloc(trans, core::mem::size_of::<bkey_i>()).cast::<bkey_i>();
+    if key.is_null() {
+        bch2_trans_iter_exit(&mut iter);
+        return -12;
+    }
+    core::ptr::write_bytes(key.cast::<u8>(), 0, core::mem::size_of::<bkey_i>());
+    bkey_init(&mut (*key).k);
+    (*key).k.p = pos;
+    let ret = bch2_trans_update(trans, &mut iter, key, 0);
+    bch2_trans_iter_exit(&mut iter);
+    ret
+}
+
+unsafe fn trigger_pointer_derived(
+    trans: *mut btree_trans,
+    btree: u8,
+    level: u32,
+    k: bkey_s_c,
+    ptr: super::bset::bch_extent_ptr,
+    insert: bool,
+) -> i32 {
+    let c = (*trans).c;
+    let dev = super::bset::BCH_EXTENT_PTR_DEV(&ptr) as u64;
+    let member = crate::sb::io::bch2_sb_member_get((*c).disk_sb.sb, dev as usize);
+    let bucket = super::bset::BCH_EXTENT_PTR_OFFSET(&ptr) / member.bucket_size as u64;
+    let alloc_pos = POS(dev, bucket);
+    let mut alloc = super::bset::bch_alloc_v4::default();
+    trigger_read_alloc(trans, alloc_pos, &mut alloc);
+    let generation = super::bset::BCH_EXTENT_PTR_GEN(&ptr) as u8;
+    if insert && alloc.gen != 0 && alloc.gen != generation {
+        return -1;
+    }
+    if alloc.gen == 0 {
+        alloc.gen = generation;
+    }
+    let sectors = (*k.k).size;
+    if insert {
+        let Some(value) = alloc.dirty_sectors.checked_add(sectors) else {
+            return -1;
+        };
+        alloc.dirty_sectors = value;
+    } else {
+        let Some(value) = alloc.dirty_sectors.checked_sub(sectors) else {
+            return -1;
+        };
+        alloc.dirty_sectors = value;
+    }
+    let ret = trigger_update_value(
+        trans,
+        4,
+        alloc_pos,
+        super::bset::KEY_TYPE_alloc_v4,
+        (&alloc as *const super::bset::bch_alloc_v4).cast(),
+        core::mem::size_of::<super::bset::bch_alloc_v4>(),
+    );
+    if ret != 0 {
+        return ret;
+    }
+
+    /* backpointers.h encodes the physical pointer identity in the key
+     * position and preserves the primary-key owner in the value.  This core
+     * uses its fixed extent_bp_shift of zero, so the physical sector offset
+     * is the stable index position. */
+    let bp_pos = POS(dev, super::bset::BCH_EXTENT_PTR_OFFSET(&ptr));
+    if !insert {
+        return trigger_delete_value(trans, 8, bp_pos);
+    }
+    let bp = super::bset::bch_backpointer {
+        btree_id: btree,
+        level: level as u8,
+        data_type: if level == 0 { 0 } else { 1 },
+        bucket_gen: generation,
+        bucket_len: sectors,
+        pos: (*k.k).p,
+        ..Default::default()
+    };
+    trigger_update_value(
+        trans,
+        8,
+        bp_pos,
+        super::bset::KEY_TYPE_backpointer,
+        (&bp as *const super::bset::bch_backpointer).cast(),
+        core::mem::size_of::<super::bset::bch_backpointer>(),
+    )
+}
+
+unsafe fn trigger_extent_pointers(
+    trans: *mut btree_trans,
+    btree: u8,
+    level: u32,
+    k: bkey_s_c,
+    insert: bool,
+) -> i32 {
+    let ptrs = super::bset::bch2_bkey_ptrs_c(k);
+    let mut entry = ptrs.start;
+    while !entry.is_null() && (entry as usize) < (ptrs.end as usize) {
+        if super::bset::extent_entry_is_ptr(entry) {
+            let ret = trigger_pointer_validate(trans, (*entry).ptr, insert);
+            if ret < 0 {
+                return ret;
+            }
+            if ret > 0 {
+                entry = super::bset::extent_entry_next_safe((*trans).c, entry, ptrs.end);
+                continue;
+            }
+            let ret = trigger_pointer_derived(trans, btree, level, k, (*entry).ptr, insert);
+            if ret != 0 {
+                return ret;
+            }
+        }
+        entry = super::bset::extent_entry_next_safe((*trans).c, entry, ptrs.end);
+    }
+    0
+}
+
+/* Direct translation of alloc/buckets.c:bch2_trigger_extent()'s pointer
+ * comparison and transactional old/new ordering.  Accounting and GC are
+ * intentionally outside this engine core's current scope. */
+unsafe fn bch2_trigger_extent(trans: *mut btree_trans, op: btree_trigger_op) -> i32 {
+    let new_ptrs = super::bset::bch2_bkey_ptrs_c(bkey_s_c {
+        k: op.new.k,
+        v: op.new.v,
+    });
+    let old_ptrs = super::bset::bch2_bkey_ptrs_c(op.old);
+    let new_len = (new_ptrs.end as usize).wrapping_sub(new_ptrs.start as usize);
+    let old_len = (old_ptrs.end as usize).wrapping_sub(old_ptrs.start as usize);
+    if new_len == old_len
+        && (new_len == 0
+            || core::slice::from_raw_parts(new_ptrs.start.cast::<u8>(), new_len)
+                == core::slice::from_raw_parts(old_ptrs.start.cast::<u8>(), old_len))
+    {
+        return 0;
+    }
+    if op.flags & BTREE_TRIGGER_transactional != 0 {
+        if (*op.old.k).type_ != super::bset::KEY_TYPE_deleted {
+            let ret = trigger_extent_pointers(trans, op.btree, op.level, op.old, false);
+            if ret != 0 {
+                return ret;
+            }
+        }
+        if (*op.new.k).type_ != super::bset::KEY_TYPE_deleted {
+            return trigger_extent_pointers(
+                trans,
+                op.btree,
+                op.level,
+                bkey_s_c {
+                    k: op.new.k,
+                    v: op.new.v,
+                },
+                true,
+            );
+        }
+    }
+    0
 }
 
 unsafe fn run_one_mem_trigger(
@@ -2052,6 +2354,112 @@ unsafe fn run_one_mem_trigger(
     0
 }
 
+unsafe fn run_one_trans_trigger(trans: *mut btree_trans, i: *mut btree_insert_entry) -> i32 {
+    if !verify_update_old_key(trans, i) {
+        return -1;
+    }
+    let mut deleted = bkey_i::default();
+    bkey_init(&mut deleted.k);
+    deleted.k.p = (*(*i).k).k.p;
+    let old_k = (*i).old_k;
+    let mut op = btree_trigger_op {
+        btree: (*i).btree_id,
+        level: (*i).level as u32,
+        old: bkey_s_c {
+            k: &old_k,
+            v: (*i).old_v,
+        },
+        new: bkey_s {
+            k: &mut (*(*i).k).k,
+            v: ((*i).k as *mut u64).add(5).cast::<bch_val>(),
+        },
+        new_buf_u64s: (*i).k_buf_u64s as u32,
+        flags: (*i).flags | BTREE_TRIGGER_transactional,
+    };
+    let old_trigger = key_trigger_kind(old_k.type_);
+    let new_type = (*(*i).k).k.type_;
+    let new_trigger = key_trigger_kind(new_type);
+    if !(*i).insert_trigger_run && !(*i).overwrite_trigger_run && old_trigger == new_trigger {
+        (*i).overwrite_trigger_run = true;
+        (*i).insert_trigger_run = true;
+        op.flags |= BTREE_TRIGGER_insert | BTREE_TRIGGER_overwrite;
+    } else if !(*i).overwrite_trigger_run {
+        (*i).overwrite_trigger_run = true;
+        op.flags |= BTREE_TRIGGER_overwrite;
+        op.new = bkey_s {
+            k: &mut deleted.k,
+            v: core::ptr::null_mut(),
+        };
+        op.new_buf_u64s = 0;
+    } else if !(*i).insert_trigger_run {
+        (*i).insert_trigger_run = true;
+        op.flags |= BTREE_TRIGGER_insert;
+        op.old = bkey_s_c {
+            k: &deleted.k,
+            v: core::ptr::null(),
+        };
+    }
+    if old_trigger != 0 || new_trigger != 0 {
+        bch2_key_trigger(trans, op)
+    } else {
+        0
+    }
+}
+
+const fn btree_node_type_has_trans_triggers(type_: u8) -> bool {
+    matches!(type_, 0 | 1 | 2 | 5 | 7 | 8)
+}
+
+unsafe fn bch2_trans_commit_run_triggers(trans: *mut btree_trans) -> i32 {
+    let mut sort_id_start = 0usize;
+    while sort_id_start < (*trans).nr_updates as usize {
+        let sort_id = (*(*trans).updates.add(sort_id_start)).sort_order;
+        let mut trans_trigger_run;
+        let mut idx;
+        loop {
+            trans_trigger_run = false;
+            idx = sort_id_start;
+            while idx < (*trans).nr_updates as usize
+                && (*(*trans).updates.add(idx)).sort_order <= sort_id
+            {
+                let i = (*trans).updates.add(idx);
+                if (*i).sort_order < sort_id {
+                    sort_id_start = idx;
+                    idx += 1;
+                    continue;
+                }
+                if (*i).flags & BTREE_TRIGGER_norun != 0
+                    || !btree_node_type_has_trans_triggers((*i).bkey_type)
+                    || ((*i).insert_trigger_run && (*i).overwrite_trigger_run)
+                {
+                    idx += 1;
+                    continue;
+                }
+                let ret = run_one_trans_trigger(trans, i);
+                if ret != 0 {
+                    return ret;
+                }
+                trans_trigger_run = true;
+                idx += 1;
+            }
+            if !trans_trigger_run {
+                break;
+            }
+        }
+        sort_id_start = idx;
+    }
+    for idx in 0..(*trans).nr_updates as usize {
+        let i = (*trans).updates.add(idx);
+        if (*i).flags & BTREE_TRIGGER_norun == 0
+            && btree_node_type_has_trans_triggers((*i).bkey_type)
+            && (!(*i).insert_trigger_run || !(*i).overwrite_trigger_run)
+        {
+            return -1;
+        }
+    }
+    0
+}
+
 pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
     /* commit.c invokes trans_maybe_inject_restart() before checking whether
      * the transaction has updates, so a retry always follows the same
@@ -2100,6 +2508,11 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
             bch2_trans_reset_updates(trans);
             return 0;
         }
+    }
+
+    let ret = bch2_trans_commit_run_triggers(trans);
+    if ret != 0 {
+        return ret;
     }
 
     /* Multiple inserts might go to same leaf: accumulate space across
@@ -2384,24 +2797,178 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
 mod tests {
     use super::*;
     use crate::btree::bkey::{
-        bkey_bytes, BKEY_FORMAT_CURRENT, BKEY_U64S, KEY_FORMAT_CURRENT, POS_MIN, SPOS, SPOS_MAX,
+        bkey_bytes, bkey_err, BKEY_FORMAT_CURRENT, BKEY_U64S, KEY_FORMAT_CURRENT, POS_MIN, SPOS,
+        SPOS_MAX,
     };
     use crate::btree::bset::{
         bch2_bkey_append_ptr, bch_extent_ptr, bkey_i_to_btree_ptr_v2, bset as disk_bset,
         btree_node as disk_btree_node, SET_BCH_EXTENT_PTR_DEV, SET_BCH_EXTENT_PTR_OFFSET,
+        SET_BCH_EXTENT_PTR_TYPE,
     };
     use crate::btree::iter::{
         bch2_btree_iter_peek, bch2_trans_begin, bch2_trans_init, bch2_trans_iter_exit,
-        bch2_trans_iter_init, BTREE_ITER_intent,
+        bch2_trans_iter_init, bch2_trans_put, BTREE_ITER_intent,
     };
     use crate::btree::node_iter::{
         bch2_btree_node_iter_advance, bch2_btree_node_iter_init_from_start,
         bch2_btree_node_iter_peek, bkey_unpack_pos,
     };
     use crate::btree::types::{
-        bch2_btree_id_root_set, bch_fs, bset_tree, btree_node_iter, BSET_NO_AUX_TREE_VAL,
+        bch2_btree_id_root_set, bch_fs, bset_tree, btree_node_iter, clear_btree_node_fake,
+        clear_btree_node_need_rewrite, BSET_NO_AUX_TREE_VAL, BTREE_ID_NR,
     };
-    use crate::sb::io::{bch2_free_super, bch2_sb_realloc};
+    use crate::sb::io::{bch2_free_super, bch2_sb_field_resize_id, bch2_sb_realloc};
+    use crate::sb::{bch_member, bch_sb_field_members_v2, BCH_SB_FIELD_members_v2};
+
+    unsafe fn pointer_trigger_test_fs() -> bch_fs {
+        let mut c = bch_fs::default();
+        assert_eq!(bch2_sb_realloc(&mut c.disk_sb, 0), 0);
+        (*c.disk_sb.sb).block_size = 1;
+        (*c.disk_sb.sb).flags[0] = 8 << 12;
+        (*c.disk_sb.sb).nr_devices = 1;
+        assert_eq!(crate::btree::cache::bch2_fs_btree_cache_init(&mut c), 0);
+        for id in 0..BTREE_ID_NR {
+            crate::btree::interior::bch2_btree_root_alloc_fake(&mut c, id as u8, 0);
+            let root = crate::btree::types::bch2_btree_id_root_b(&c, id);
+            clear_btree_node_fake(root);
+            clear_btree_node_need_rewrite(root);
+        }
+        let members_u64s = (core::mem::size_of::<bch_sb_field_members_v2>()
+            + core::mem::size_of::<bch_member>())
+        .div_ceil(core::mem::size_of::<u64>()) as u32;
+        let members =
+            bch2_sb_field_resize_id(&mut c.disk_sb, BCH_SB_FIELD_members_v2, members_u64s)
+                .cast::<bch_sb_field_members_v2>();
+        (*members).member_bytes = core::mem::size_of::<bch_member>() as u16;
+        *members
+            .cast::<u8>()
+            .add(core::mem::size_of::<bch_sb_field_members_v2>())
+            .cast::<bch_member>() = bch_member {
+            uuid: [0x51; 16],
+            nbuckets: 64,
+            first_bucket: 0,
+            bucket_size: 16,
+            ..Default::default()
+        };
+        c.devs_online.d[0] = 1;
+        c
+    }
+
+    unsafe fn stage_extent_pointer(
+        trans: *mut btree_trans,
+        pos: super::super::bkey::bpos,
+        ptr_offset: u64,
+        generation: u64,
+        sectors: u32,
+        flags: u32,
+    ) -> i32 {
+        let mut iter = btree_iter::default();
+        bch2_trans_iter_init(trans, &mut iter, 0, pos, BTREE_ITER_intent);
+        let existing = bch2_btree_iter_peek_slot(&mut iter);
+        if bkey_err(existing) != 0 {
+            bch2_trans_iter_exit(&mut iter);
+            return bkey_err(existing);
+        }
+        let key = bch2_trans_kmalloc(trans, core::mem::size_of::<bkey_i>() + 8).cast::<bkey_i>();
+        if key.is_null() {
+            return -12;
+        }
+        core::ptr::write_bytes(key.cast::<u8>(), 0, core::mem::size_of::<bkey_i>() + 8);
+        bkey_init(&mut (*key).k);
+        (*key).k.p = pos;
+        (*key).k.type_ = crate::btree::bset::KEY_TYPE_extent;
+        (*key).k.size = sectors;
+        set_bkey_val_bytes(&mut (*key).k, 8);
+        let ptr = (key as *mut u64)
+            .add(BKEY_U64S as usize)
+            .cast::<bch_extent_ptr>();
+        SET_BCH_EXTENT_PTR_TYPE(&mut *ptr, 1);
+        SET_BCH_EXTENT_PTR_OFFSET(&mut *ptr, ptr_offset);
+        SET_BCH_EXTENT_PTR_DEV(&mut *ptr, 0);
+        crate::btree::bset::SET_BCH_EXTENT_PTR_GEN(&mut *ptr, generation);
+        let ret = bch2_trans_update(trans, &mut iter, key, flags);
+        bch2_trans_iter_exit(&mut iter);
+        ret
+    }
+
+    #[test]
+    fn transactional_pointer_trigger_updates_alloc_and_backpointer_once() {
+        unsafe {
+            let mut c = pointer_trigger_test_fs();
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut c);
+            let pos = SPOS(7, 99, 0);
+            loop {
+                bch2_trans_begin(&mut trans);
+                assert_eq!(stage_extent_pointer(&mut trans, pos, 35, 4, 3, 0), 0);
+                let ret = bch2_trans_commit(&mut trans);
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+
+            let mut check = btree_trans::default();
+            bch2_trans_init(&mut check, &mut c);
+            bch2_trans_begin(&mut check);
+            let mut alloc = crate::btree::bset::bch_alloc_v4::default();
+            trigger_read_alloc(&mut check, POS(0, 2), &mut alloc);
+            assert_eq!(alloc.gen, 4);
+            assert_eq!(alloc.dirty_sectors, 3);
+            let mut bp_iter = btree_iter::default();
+            bch2_trans_iter_init(&mut check, &mut bp_iter, 8, POS(0, 35), BTREE_ITER_intent);
+            let bp = bch2_btree_iter_peek_slot(&mut bp_iter);
+            assert!(!bp.k.is_null());
+            assert_eq!((*bp.k).type_, crate::btree::bset::KEY_TYPE_backpointer);
+            let bp_value =
+                core::ptr::read_unaligned(bp.v.cast::<crate::btree::bset::bch_backpointer>());
+            assert_eq!(bp_value.btree_id, 0);
+            assert_eq!(bp_value.pos, pos);
+            bch2_trans_iter_exit(&mut bp_iter);
+            bch2_trans_put(&mut check);
+            bch2_free_super(&mut c.disk_sb);
+        }
+    }
+
+    #[test]
+    fn norun_pointer_replay_update_never_creates_derived_keys() {
+        unsafe {
+            let mut c = pointer_trigger_test_fs();
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut c);
+            let pos = SPOS(8, 101, 0);
+            loop {
+                bch2_trans_begin(&mut trans);
+                assert_eq!(
+                    stage_extent_pointer(&mut trans, pos, 35, 4, 3, BTREE_TRIGGER_norun),
+                    0
+                );
+                let ret = bch2_trans_commit(&mut trans);
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+
+            let mut check = btree_trans::default();
+            bch2_trans_init(&mut check, &mut c);
+            bch2_trans_begin(&mut check);
+            let mut alloc = crate::btree::bset::bch_alloc_v4::default();
+            trigger_read_alloc(&mut check, POS(0, 2), &mut alloc);
+            assert_eq!(alloc, crate::btree::bset::bch_alloc_v4::default());
+            let mut bp_iter = btree_iter::default();
+            bch2_trans_iter_init(&mut check, &mut bp_iter, 8, POS(0, 35), BTREE_ITER_intent);
+            let bp = bch2_btree_iter_peek_slot(&mut bp_iter);
+            assert!(bp.k.is_null() || !bpos_eq((*bp.k).p, POS(0, 35)) || (*bp.k).type_ == 0);
+            bch2_trans_iter_exit(&mut bp_iter);
+            bch2_trans_put(&mut check);
+            bch2_free_super(&mut c.disk_sb);
+        }
+    }
 
     #[test]
     fn transaction_update_order_keeps_alloc_after_stripes() {

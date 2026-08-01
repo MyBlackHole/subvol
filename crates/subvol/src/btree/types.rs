@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU32, AtomicUsize};
 pub const MAX_BSETS: usize = 3;
 pub const BCH_BKEY_PTRS_MAX: usize = 16;
 pub const BKEY_BTREE_PTR_VAL_U64S_MAX: usize = 15;
-pub const BTREE_ID_NR: usize = 8;
+/* Engine-local extension permitted by the storage-core boundary: alloc keeps
+ * its bcachefs-derived id 4 and the derived backpointer index is id 8. */
+pub const BTREE_ID_NR: usize = 9;
 pub const BTREE_ROOT_LEVEL_BITS: usize = 3;
 pub const BTREE_ROOT_LEVEL_MASK: usize = (1 << BTREE_ROOT_LEVEL_BITS) - 1;
 
