@@ -2062,6 +2062,102 @@ pub(crate) unsafe fn bch2_key_trigger_new(
     )
 }
 
+/* The journal half of interior.c:btree_update_nodes_written_trans().  The
+ * source receives an in-memory bkey_i, whereas a Rust iterator may expose its
+ * header and value separately; copy those two pieces explicitly instead of
+ * assuming a contiguous packed key. */
+unsafe fn trans_journal_bkey_entry(
+    trans: *mut btree_trans,
+    type_: u8,
+    btree: u8,
+    level: u32,
+    key: bkey_s_c,
+) -> i32 {
+    if key.k.is_null()
+        || key.v.is_null()
+        || (*key.k).u64s < super::bkey::BKEY_U64S
+        || level > u8::MAX as u32
+    {
+        return -22;
+    }
+    let u64s = (*key.k).u64s as usize;
+    let entry = bch2_trans_jset_entry_alloc(trans, u64s as u16);
+    if entry.is_null() {
+        return -12;
+    }
+    crate::journal::journal_entry_init(entry, type_, btree, level as u8, u64s as u16);
+    let dst = entry.cast::<u64>().add(1);
+    core::ptr::copy_nonoverlapping(key.k.cast::<u64>(), dst, super::bkey::BKEY_U64S as usize);
+    let val_u64s = u64s - super::bkey::BKEY_U64S as usize;
+    if val_u64s != 0 {
+        core::ptr::copy_nonoverlapping(
+            key.v.cast::<u64>(),
+            dst.add(super::bkey::BKEY_U64S as usize),
+            val_u64s,
+        );
+    }
+    0
+}
+
+/* The transactional publication boundary for a physical interior pointer.
+ * This is the Rust counterpart of interior.c's nodes-written transaction:
+ * callers invoke it only after node IO has produced the physical key.  It
+ * intentionally journals the direct node update, rather than staging a leaf
+ * update and re-running the normal leaf trigger runner. */
+pub(crate) unsafe fn bch2_trans_commit_interior_key(
+    trans: *mut btree_trans,
+    btree: u8,
+    level: u32,
+    old: Option<bkey_s_c>,
+    new: bkey_s,
+    new_buf_u64s: u32,
+    root: bool,
+) -> i32 {
+    if trans.is_null() || new.k.is_null() || new.v.is_null() || (*new.k).u64s as u32 > new_buf_u64s
+    {
+        return -22;
+    }
+    if let Some(old) = old {
+        let ret = bch2_key_trigger_old(trans, btree, level, old, BTREE_TRIGGER_transactional);
+        if ret != 0 {
+            return ret;
+        }
+        let ret = trans_journal_bkey_entry(
+            trans,
+            crate::journal::BCH_JSET_ENTRY_overwrite,
+            btree,
+            level,
+            old,
+        );
+        if ret != 0 {
+            return ret;
+        }
+    }
+
+    let ret = bch2_key_trigger_new(
+        trans,
+        btree,
+        level,
+        new,
+        new_buf_u64s,
+        BTREE_TRIGGER_transactional,
+    );
+    if ret != 0 {
+        return ret;
+    }
+    trans_journal_bkey_entry(
+        trans,
+        if root {
+            crate::journal::BCH_JSET_ENTRY_btree_root
+        } else {
+            crate::journal::BCH_JSET_ENTRY_btree_keys
+        },
+        btree,
+        level,
+        bkey_s_c { k: new.k, v: new.v },
+    )
+}
+
 const fn key_trigger_kind(type_: u8) -> u8 {
     if type_ == crate::snapshot::KEY_TYPE_snapshot {
         1
@@ -3219,6 +3315,93 @@ mod tests {
             trigger_read_alloc(&mut verify, POS(0, 2), &mut alloc);
             assert_eq!(alloc.dirty_sectors, 0);
             bch2_trans_put(&mut verify);
+            bch2_free_super(&mut c.disk_sb);
+        }
+    }
+
+    #[test]
+    fn interior_pointer_commit_journals_primary_and_derived_state_together() {
+        unsafe {
+            let mut c = pointer_trigger_test_fs();
+            let mut words = [0u64; 11];
+            let key = words
+                .as_mut_ptr()
+                .cast::<crate::btree::bset::bkey_i_btree_ptr_v2>();
+            (*key).k = bkey {
+                u64s: 10,
+                format: KEY_FORMAT_CURRENT,
+                type_: crate::btree::bset::KEY_TYPE_btree_ptr_v2,
+                p: SPOS(12, 106, 0),
+                ..Default::default()
+            };
+            bch2_bkey_append_ptr(
+                &c,
+                key.cast::<bkey_i>(),
+                bch_extent_ptr {
+                    v: (48 << 4) | (4 << 56),
+                },
+            );
+
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut c);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = bch2_trans_commit_interior_key(
+                    &mut trans,
+                    3,
+                    2,
+                    None,
+                    bkey_s {
+                        k: &mut (*key).k,
+                        v: core::ptr::addr_of_mut!((*key).v).cast::<bch_val>(),
+                    },
+                    (*key).k.u64s as u32,
+                    false,
+                );
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+
+            let mut check = btree_trans::default();
+            bch2_trans_init(&mut check, &mut c);
+            bch2_trans_begin(&mut check);
+            let mut alloc = crate::btree::bset::bch_alloc_v4::default();
+            trigger_read_alloc(&mut check, POS(0, 3), &mut alloc);
+            assert_eq!(alloc.dirty_sectors, 8);
+            let mut bp_iter = btree_iter::default();
+            bch2_trans_iter_init(&mut check, &mut bp_iter, 8, POS(0, 48), BTREE_ITER_intent);
+            let bp = bch2_btree_iter_peek_slot(&mut bp_iter);
+            assert_eq!((*bp.k).type_, crate::btree::bset::KEY_TYPE_backpointer);
+            bch2_trans_iter_exit(&mut bp_iter);
+            bch2_trans_put(&mut check);
+
+            assert_eq!(crate::journal::bch2_journal_flush(&c.journal), 0);
+            let records = c.journal.closed.lock().unwrap();
+            let record = &records[0];
+            let mut offset = crate::journal::JSET_HEADER_U64S;
+            let end = crate::journal::JSET_HEADER_U64S + record[5] as usize;
+            let mut saw_primary = false;
+            while offset < end {
+                let entry = record
+                    .as_ptr()
+                    .add(offset)
+                    .cast::<crate::journal::jset_entry>();
+                saw_primary |= (*entry).type_ == crate::journal::BCH_JSET_ENTRY_btree_keys
+                    && (*entry).btree_id == 3
+                    && (*entry).level == 2;
+                offset += crate::journal::jset_u64s((*entry).u64s as u32) as usize;
+            }
+            assert!(saw_primary);
+            drop(records);
             bch2_free_super(&mut c.disk_sb);
         }
     }
