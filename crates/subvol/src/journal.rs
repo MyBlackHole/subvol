@@ -1262,6 +1262,70 @@ unsafe fn journal_entry_btree_root_validate(entry: *mut jset_entry) -> i32 {
     0
 }
 
+/* Matches journal_entry_null_range() in fs/journal/validate.c. */
+unsafe fn journal_entry_null_range(mut entry: *mut jset_entry, end: *mut jset_entry) {
+    while entry != end {
+        core::ptr::write_bytes(entry, 0, 1);
+        entry = entry.cast::<u64>().add(jset_u64s(0) as usize).cast();
+    }
+}
+
+/* Matches journal_validate_key() and journal_entry_btree_keys_validate() in
+ * fs/journal/validate.c: a zero-sized or overlong key truncates this entry;
+ * a key in a noncurrent format is removed and the remaining payload is
+ * compacted before journal overlay construction and replay. */
+unsafe fn journal_entry_btree_keys_validate(entry: *mut jset_entry) {
+    let start = entry.cast::<u64>().add(1);
+    let mut key = start.cast::<crate::btree::bkey::bkey_i>();
+
+    loop {
+        let end = start.add((*entry).u64s as usize);
+        if key.cast::<u64>() >= end {
+            return;
+        }
+        if end.offset_from(key.cast::<u64>()) < crate::btree::bkey::BKEY_U64S as isize {
+            (*entry).u64s = key.cast::<u64>().offset_from(start) as u16;
+            journal_entry_null_range(
+                entry
+                    .cast::<u64>()
+                    .add(jset_u64s((*entry).u64s as u32) as usize)
+                    .cast(),
+                end.cast(),
+            );
+            return;
+        }
+        let key_u64s = (*key).k.u64s as usize;
+
+        if key_u64s == 0 || key.cast::<u64>().add(key_u64s) > end {
+            (*entry).u64s = key.cast::<u64>().offset_from(start) as u16;
+            journal_entry_null_range(
+                entry
+                    .cast::<u64>()
+                    .add(jset_u64s((*entry).u64s as u32) as usize)
+                    .cast(),
+                end.cast(),
+            );
+            return;
+        }
+
+        if (*key).k.format != crate::btree::bkey::KEY_FORMAT_CURRENT {
+            let next = key.cast::<u64>().add(key_u64s);
+            core::ptr::copy(next, key.cast(), end.offset_from(next) as usize);
+            (*entry).u64s -= key_u64s as u16;
+            journal_entry_null_range(
+                entry
+                    .cast::<u64>()
+                    .add(jset_u64s((*entry).u64s as u32) as usize)
+                    .cast(),
+                end.cast(),
+            );
+            continue;
+        }
+
+        key = key.cast::<u64>().add(key_u64s).cast();
+    }
+}
+
 pub unsafe fn bch2_journal_read(
     c: *mut crate::btree::types::bch_fs,
     info: *mut journal_start_info,
@@ -1685,6 +1749,9 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
             let actual = jset_u64s((*entry).u64s as u32) as usize;
             if actual == 0 || offset + actual > end {
                 return -2;
+            }
+            if (*entry).type_ == BCH_JSET_ENTRY_btree_keys {
+                journal_entry_btree_keys_validate(entry);
             }
             if (*entry).type_ == BCH_JSET_ENTRY_btree_root {
                 let ret = journal_entry_btree_root_validate(entry);
@@ -3101,6 +3168,137 @@ mod tests {
             assert_eq!(seen, (1..=9).collect::<Vec<_>>());
 
             bch2_free_super(&mut replay.disk_sb);
+        }
+    }
+
+    #[test]
+    fn replay_drops_noncurrent_key_and_keeps_current_neighbor() {
+        use crate::btree::bkey::{bkey, BKEY_U64S, KEY_FORMAT_CURRENT, SPOS};
+        use crate::btree::bset::KEY_TYPE_cookie;
+        use crate::btree::cache::bch2_fs_btree_cache_init;
+        use crate::btree::interior::bch2_btree_root_alloc_fake;
+        use crate::btree::types::{
+            bch2_btree_id_root_b, bch_fs, clear_btree_node_fake, clear_btree_node_need_rewrite,
+            BTREE_ID_NR,
+        };
+        use crate::sb::io::{bch2_free_super, bch2_sb_realloc};
+
+        unsafe {
+            let mut replay = bch_fs::default();
+            assert_eq!(bch2_sb_realloc(&mut replay.disk_sb, 0), 0);
+            (*replay.disk_sb.sb).block_size = 1;
+            (*replay.disk_sb.sb).flags[0] = 8 << 12;
+            assert_eq!(bch2_fs_btree_cache_init(&mut replay), 0);
+            for id in 0..BTREE_ID_NR {
+                bch2_btree_root_alloc_fake(&mut replay, id as u8, 0);
+                let root = bch2_btree_id_root_b(&replay, id);
+                clear_btree_node_fake(root);
+                clear_btree_node_need_rewrite(root);
+            }
+
+            let key_u64s = BKEY_U64S as u32;
+            let entry_u64s = key_u64s * 2;
+            let mut record = vec![0u64; JSET_HEADER_U64S + jset_u64s(entry_u64s) as usize];
+            record[2] = JSET_MAGIC;
+            record[3] = 1;
+            record[5] = jset_u64s(entry_u64s) as u64;
+            record[6] = 1;
+            let entry = record
+                .as_mut_ptr()
+                .add(JSET_HEADER_U64S)
+                .cast::<jset_entry>();
+            journal_entry_init(entry, BCH_JSET_ENTRY_btree_keys, 0, 0, entry_u64s as u16);
+            let bad = entry
+                .cast::<u64>()
+                .add(1)
+                .cast::<crate::btree::bkey::bkey_i>();
+            (*bad).k = bkey {
+                u64s: key_u64s as u8,
+                format: 0,
+                type_: KEY_TYPE_cookie,
+                p: SPOS(1, 9, 0),
+                ..Default::default()
+            };
+            let good = bad
+                .cast::<u64>()
+                .add(key_u64s as usize)
+                .cast::<crate::btree::bkey::bkey_i>();
+            (*good).k = bkey {
+                u64s: key_u64s as u8,
+                format: KEY_FORMAT_CURRENT,
+                type_: KEY_TYPE_cookie,
+                p: SPOS(1, 10, 0),
+                ..Default::default()
+            };
+            replay.journal.closed.lock().unwrap().push(record);
+
+            assert_eq!(bch2_journal_replay(&mut replay), 0);
+            assert_eq!(replay.journal_keys.data.len(), 1);
+            let key = replay.journal_keys.data[0].allocated_k;
+            assert_eq!(core::ptr::addr_of!((*key).k.p.offset).read_unaligned(), 10);
+            bch2_free_super(&mut replay.disk_sb);
+        }
+    }
+
+    #[test]
+    fn replay_truncates_btree_key_entry_at_zero_or_overlong_key() {
+        use crate::btree::bkey::{bkey, BKEY_U64S, KEY_FORMAT_CURRENT, SPOS};
+        use crate::btree::bset::KEY_TYPE_cookie;
+        use crate::btree::cache::bch2_fs_btree_cache_init;
+        use crate::btree::interior::bch2_btree_root_alloc_fake;
+        use crate::btree::types::{
+            bch2_btree_id_root_b, bch_fs, clear_btree_node_fake, clear_btree_node_need_rewrite,
+            BTREE_ID_NR,
+        };
+        use crate::sb::io::{bch2_free_super, bch2_sb_realloc};
+
+        unsafe {
+            for (entry_u64s, key_u64s) in [
+                (1, None),
+                (BKEY_U64S as u32, Some(0)),
+                (BKEY_U64S as u32, Some(BKEY_U64S + 1)),
+            ] {
+                let mut replay = bch_fs::default();
+                assert_eq!(bch2_sb_realloc(&mut replay.disk_sb, 0), 0);
+                (*replay.disk_sb.sb).block_size = 1;
+                (*replay.disk_sb.sb).flags[0] = 8 << 12;
+                assert_eq!(bch2_fs_btree_cache_init(&mut replay), 0);
+                for id in 0..BTREE_ID_NR {
+                    bch2_btree_root_alloc_fake(&mut replay, id as u8, 0);
+                    let root = bch2_btree_id_root_b(&replay, id);
+                    clear_btree_node_fake(root);
+                    clear_btree_node_need_rewrite(root);
+                }
+
+                let mut record = vec![0u64; JSET_HEADER_U64S + jset_u64s(entry_u64s) as usize];
+                record[2] = JSET_MAGIC;
+                record[3] = 1;
+                record[5] = jset_u64s(entry_u64s) as u64;
+                record[6] = 1;
+                let entry = record
+                    .as_mut_ptr()
+                    .add(JSET_HEADER_U64S)
+                    .cast::<jset_entry>();
+                journal_entry_init(entry, BCH_JSET_ENTRY_btree_keys, 0, 0, entry_u64s as u16);
+                let key = entry
+                    .cast::<u64>()
+                    .add(1)
+                    .cast::<crate::btree::bkey::bkey_i>();
+                if let Some(key_u64s) = key_u64s {
+                    (*key).k = bkey {
+                        u64s: key_u64s,
+                        format: KEY_FORMAT_CURRENT,
+                        type_: KEY_TYPE_cookie,
+                        p: SPOS(1, 9, 0),
+                        ..Default::default()
+                    };
+                }
+                replay.journal.closed.lock().unwrap().push(record);
+
+                assert_eq!(bch2_journal_replay(&mut replay), 0);
+                assert!(replay.journal_keys.data.is_empty());
+                bch2_free_super(&mut replay.disk_sb);
+            }
         }
     }
 
