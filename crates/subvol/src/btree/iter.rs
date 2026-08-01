@@ -42,6 +42,19 @@ pub struct btree_trans_subbuf {
     pub size: u16,
 }
 
+/* interior.c's btree_update_node state which must outlive the transaction
+ * restart caused by a split.  The physical key is copied as u64 words: a
+ * bkey_s may expose its header and value through separate allocations. */
+#[derive(Default)]
+pub struct btree_pending_interior_update {
+    pub btree_id: u8,
+    pub level: u32,
+    pub root: bool,
+    pub node: *mut btree,
+    pub old: Option<Vec<u64>>,
+    pub new: Vec<u64>,
+}
+
 pub const BTREE_ITER_slots: u16 = 1 << 0;
 pub const BTREE_ITER_intent: u16 = 1 << 1;
 pub const BTREE_ITER_prefetch: u16 = 1 << 2;
@@ -444,6 +457,7 @@ pub struct btree_trans {
     pub journal_u64s: u32,
     pub extra_journal_u64s: u32,
     pub extra_disk_res: u64,
+    pub pending_interior: Vec<btree_pending_interior_update>,
     pub _paths: [btree_path; BTREE_ITER_INITIAL],
     pub _updates: [btree_insert_entry; BTREE_ITER_INITIAL],
 }
@@ -476,6 +490,7 @@ impl Default for btree_trans {
             journal_u64s: 0,
             extra_journal_u64s: 0,
             extra_disk_res: 0,
+            pending_interior: Vec::new(),
             _paths: core::array::from_fn(|_| btree_path::default()),
             _updates: [btree_insert_entry::default(); BTREE_ITER_INITIAL],
         }

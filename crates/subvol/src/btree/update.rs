@@ -2158,6 +2158,111 @@ pub(crate) unsafe fn bch2_trans_commit_interior_key(
     )
 }
 
+/* Queue the nodes-written publication until the split restart has retraversed
+ * its original update.  This is the Rust ownership form of interior.c's
+ * btree_update::old_nodes/new_nodes handoff. */
+pub(crate) unsafe fn bch2_trans_defer_interior_key(
+    trans: *mut btree_trans,
+    btree: u8,
+    level: u32,
+    old: Option<bkey_s_c>,
+    new: bkey_s,
+    new_buf_u64s: u32,
+    root: bool,
+    node: *mut btree,
+) -> i32 {
+    if trans.is_null() || new.k.is_null() || new.v.is_null() || (*new.k).u64s as u32 > new_buf_u64s
+    {
+        return -22;
+    }
+    unsafe fn copy_key(key: bkey_s_c) -> Option<Vec<u64>> {
+        if key.k.is_null() || key.v.is_null() || (*key.k).u64s < super::bkey::BKEY_U64S {
+            return None;
+        }
+        let u64s = (*key.k).u64s as usize;
+        let mut words = vec![0; u64s];
+        core::ptr::copy_nonoverlapping(
+            key.k.cast::<u64>(),
+            words.as_mut_ptr(),
+            super::bkey::BKEY_U64S as usize,
+        );
+        core::ptr::copy_nonoverlapping(
+            key.v.cast::<u64>(),
+            words.as_mut_ptr().add(super::bkey::BKEY_U64S as usize),
+            u64s - super::bkey::BKEY_U64S as usize,
+        );
+        Some(words)
+    }
+    let Some(new) = copy_key(bkey_s_c { k: new.k, v: new.v }) else {
+        return -22;
+    };
+    let old = match old {
+        Some(old) => match copy_key(old) {
+            Some(old) => Some(old),
+            None => return -22,
+        },
+        None => None,
+    };
+    (*trans)
+        .pending_interior
+        .push(super::iter::btree_pending_interior_update {
+            btree_id: btree,
+            level,
+            root,
+            node,
+            old,
+            new,
+        });
+    0
+}
+
+unsafe fn bch2_trans_commit_pending_interior(trans: *mut btree_trans) -> i32 {
+    if (*trans).pending_interior.is_empty() {
+        return 0;
+    }
+    let mut pending = core::mem::take(&mut (*trans).pending_interior);
+    for update in pending.iter_mut() {
+        /* New nodes are written before their parent/root pointer is made
+         * journal-visible.  A completed first write is not repeated after an
+         * ENOMEM transaction restart. */
+        if !update.node.is_null()
+            && !(*(*trans).c).disk_sb.s_bdev_file.is_null()
+            && (*update.node).written == 0
+        {
+            let ret = super::io::__bch2_btree_node_write(&mut (*(*trans).c).disk_sb, update.node);
+            if ret != 0 {
+                (*trans).pending_interior = pending;
+                return ret;
+            }
+        }
+        let new = update.new.as_mut_ptr().cast::<bkey_i>();
+        let old = update.old.as_ref().map(|old| bkey_s_c {
+            k: old.as_ptr().cast::<bkey>(),
+            v: old
+                .as_ptr()
+                .add(super::bkey::BKEY_U64S as usize)
+                .cast::<bch_val>(),
+        });
+        let ret = bch2_trans_commit_interior_key(
+            trans,
+            update.btree_id,
+            update.level,
+            old,
+            bkey_s {
+                k: &mut (*new).k,
+                v: core::ptr::addr_of_mut!((*new).v).cast::<bch_val>(),
+            },
+            (*new).k.u64s as u32,
+            update.root,
+        );
+        if ret != 0 {
+            (*trans).pending_interior = pending;
+            return ret;
+        }
+    }
+    0
+}
+
 const fn key_trigger_kind(type_: u8) -> u8 {
     if type_ == crate::snapshot::KEY_TYPE_snapshot {
         1
@@ -2744,6 +2849,10 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
      * the transaction has updates, so a retry always follows the same
      * bch2_trans_begin() lifecycle as a naturally restarted transaction. */
     let ret = super::iter::bch2_trans_maybe_inject_restart(trans);
+    if ret != 0 {
+        return ret;
+    }
+    let ret = bch2_trans_commit_pending_interior(trans);
     if ret != 0 {
         return ret;
     }
@@ -3346,18 +3455,23 @@ mod tests {
             bch2_trans_init(&mut trans, &mut c);
             loop {
                 bch2_trans_begin(&mut trans);
-                let ret = bch2_trans_commit_interior_key(
-                    &mut trans,
-                    3,
-                    2,
-                    None,
-                    bkey_s {
-                        k: &mut (*key).k,
-                        v: core::ptr::addr_of_mut!((*key).v).cast::<bch_val>(),
-                    },
-                    (*key).k.u64s as u32,
-                    false,
-                );
+                let ret = if trans.pending_interior.is_empty() {
+                    bch2_trans_defer_interior_key(
+                        &mut trans,
+                        3,
+                        2,
+                        None,
+                        bkey_s {
+                            k: &mut (*key).k,
+                            v: core::ptr::addr_of_mut!((*key).v).cast::<bch_val>(),
+                        },
+                        (*key).k.u64s as u32,
+                        false,
+                        core::ptr::null_mut(),
+                    )
+                } else {
+                    0
+                };
                 let ret = if ret == 0 {
                     bch2_trans_commit(&mut trans)
                 } else {
