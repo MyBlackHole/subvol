@@ -81,6 +81,35 @@ fn op_group_strategy() -> impl Strategy<Value = OpGroup> {
     ]
 }
 
+/// 分裂压力测试的键空间：4×2048×3=24576 唯一键，远超单节点容量
+/// （4KB 节点最多 ~118 个最小键），随机段任意写入都会经过分裂路径。
+fn split_key_strategy() -> impl Strategy<Value = (u64, u64, u32)> {
+    (1u64..=4, 1u64..=2048, 0u32..=2)
+}
+
+fn split_op_strategy() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        (split_key_strategy(), value_strategy()).prop_map(|((i, o, s), v)| Op::Put {
+            inode: i,
+            offset: o,
+            snapshot: s,
+            value: v,
+        }),
+        split_key_strategy().prop_map(|(i, o, s)| Op::Delete {
+            inode: i,
+            offset: o,
+            snapshot: s,
+        }),
+    ]
+}
+
+fn split_op_group_strategy() -> impl Strategy<Value = OpGroup> {
+    prop_oneof![
+        split_op_strategy().prop_map(OpGroup::Single),
+        prop::collection::vec(split_op_strategy(), 2..=6).prop_map(OpGroup::Batch),
+    ]
+}
+
 /// 多快照测试的快照 id 池：覆盖 bcachefs 快照 id 分配的关键边界
 /// （fs/snapshots/snapshot.c create_snapids 从 u32::MAX 递减分配）：
 /// - `u32::MAX` 族：首个快照 id 与递减分配
@@ -316,6 +345,51 @@ proptest! {
                     after >= before,
                     "reclaim 使 last_seq_ondisk 倒退: {before} -> {after}"
                 );
+            }
+
+            if step % crash_every == crash_every - 1 {
+                engine.sync().unwrap();
+                drop(engine);
+                engine = StorageEngine::open_persistent(&dir).unwrap();
+                assert_model(&engine, &model);
+            }
+        }
+        engine.sync().unwrap();
+        drop(engine);
+        let recovered = StorageEngine::open_persistent(&dir).unwrap();
+        assert_model(&recovered, &model);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn split_stress_preserves_model(
+        ops in prop::collection::vec(split_op_group_strategy(), 1000..=2000),
+        crash_every in 300usize..=800,
+    ) {
+        /* 多级分裂压力验证（T0168 P1 interior 对齐前置）：节点容量实测
+         * 上界（BCH_SB_BTREE_NODE_SIZE=8 扇区=4KB，sb/io.rs flags[0]=
+         * 8<<12；max_u64s ≈ 470、最小键 4 u64s → 单节点最多 ~118 键）。
+         * 阶段 1 确定性预写 2000 唯一键（> 上界 10 倍以上）必然触发多次
+         * leaf split + root 分裂，深度 ≥ 2、内部节点存在。bcachefs 语义：
+         * 分裂失败路径 trans_restart(BCH_ERR_transaction_restart_split_race)
+         * （fs/btree/interior.c:2271）重试——崩溃窗口内分裂/重试不得丢键。 */
+        let dir = unique_tmp_dir();
+        let mut engine = StorageEngine::create_persistent(&dir).unwrap();
+        let mut model = BTreeMap::new();
+
+        /* 阶段 1：确定性分裂预写（inode=1、offset 1..=2000、snapshot=0）。 */
+        for offset in 1..=2000u64 {
+            let k = BtreeKey::new(position(1, offset, 0), vec![1]).unwrap();
+            engine.put(BtreeId::DEFAULT, k.clone()).unwrap();
+            model.insert(k.position(), k.value().to_vec());
+        }
+        assert_model(&engine, &model);
+
+        /* 阶段 2：随机压力 + 崩溃恢复（同 crash 测试框架）。 */
+        for (step, group) in ops.iter().enumerate() {
+            apply_group(&engine, group).unwrap();
+            for op in ops_of(group) {
+                apply_model(&mut model, op);
             }
 
             if step % crash_every == crash_every - 1 {
