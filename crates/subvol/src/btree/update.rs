@@ -1998,6 +1998,70 @@ unsafe fn bch2_key_trigger(trans: *mut btree_trans, op: btree_trigger_op) -> i32
     }
 }
 
+/* bkey_methods.h:bch2_key_trigger_old().  Interior-node writeback is not a
+ * leaf btree transaction update, so it must enter the same dispatch through
+ * this explicit old-key boundary once a node has a physical pointer. */
+pub(crate) unsafe fn bch2_key_trigger_old(
+    trans: *mut btree_trans,
+    btree: u8,
+    level: u32,
+    old: bkey_s_c,
+    flags: u32,
+) -> i32 {
+    if old.k.is_null() {
+        return -22;
+    }
+    let mut deleted = bkey_i::default();
+    bkey_init(&mut deleted.k);
+    deleted.k.p = (*old.k).p;
+    bch2_key_trigger(
+        trans,
+        btree_trigger_op {
+            btree,
+            level,
+            old,
+            new: bkey_s {
+                k: &mut deleted.k,
+                v: core::ptr::null_mut(),
+            },
+            new_buf_u64s: deleted.k.u64s as u32,
+            flags: BTREE_TRIGGER_overwrite | flags,
+        },
+    )
+}
+
+/* bkey_methods.h:bch2_key_trigger_new().  Kept separate from the leaf
+ * runner so interior.c's old/new writeback ordering remains observable. */
+pub(crate) unsafe fn bch2_key_trigger_new(
+    trans: *mut btree_trans,
+    btree: u8,
+    level: u32,
+    new: bkey_s,
+    new_buf_u64s: u32,
+    flags: u32,
+) -> i32 {
+    if new.k.is_null() {
+        return -22;
+    }
+    let mut deleted = bkey_i::default();
+    bkey_init(&mut deleted.k);
+    deleted.k.p = (*new.k).p;
+    bch2_key_trigger(
+        trans,
+        btree_trigger_op {
+            btree,
+            level,
+            old: bkey_s_c {
+                k: &deleted.k,
+                v: core::ptr::null(),
+            },
+            new,
+            new_buf_u64s,
+            flags: BTREE_TRIGGER_insert | flags,
+        },
+    )
+}
+
 const fn key_trigger_kind(type_: u8) -> u8 {
     if type_ == crate::snapshot::KEY_TYPE_snapshot {
         1
@@ -2174,7 +2238,13 @@ unsafe fn trigger_pointer_derived(
     if alloc.gen == 0 {
         alloc.gen = generation;
     }
-    let sectors = (*k.k).size;
+    /* alloc/backpointers.h:bch2_extent_ptr_to_bp() uses the fixed btree
+     * node allocation for an interior pointer, not the key's logical size. */
+    let sectors = if level != 0 {
+        crate::sb::io::BCH_SB_BTREE_NODE_SIZE(&*(*c).disk_sb.sb) as u32
+    } else {
+        (*k.k).size
+    };
     if insert {
         let Some(value) = alloc.dirty_sectors.checked_add(sectors) else {
             return -1;
@@ -3041,6 +3111,114 @@ mod tests {
             assert_eq!(bp_value.pos, pos);
             bch2_trans_iter_exit(&mut bp_iter);
             bch2_trans_put(&mut check);
+            bch2_free_super(&mut c.disk_sb);
+        }
+    }
+
+    #[test]
+    fn explicit_interior_pointer_old_new_triggers_update_derived_state() {
+        unsafe {
+            let mut c = pointer_trigger_test_fs();
+            let mut words = [0u64; 11];
+            let key = words
+                .as_mut_ptr()
+                .cast::<crate::btree::bset::bkey_i_btree_ptr_v2>();
+            (*key).k = bkey {
+                u64s: 10,
+                format: KEY_FORMAT_CURRENT,
+                type_: crate::btree::bset::KEY_TYPE_btree_ptr_v2,
+                p: SPOS(11, 105, 0),
+                ..Default::default()
+            };
+            bch2_bkey_append_ptr(
+                &c,
+                key.cast::<bkey_i>(),
+                bch_extent_ptr {
+                    v: (35 << 4) | (4 << 56),
+                },
+            );
+
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut c);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = bch2_key_trigger_new(
+                    &mut trans,
+                    3,
+                    2,
+                    bkey_s {
+                        k: &mut (*key).k,
+                        v: core::ptr::addr_of_mut!((*key).v).cast::<bch_val>(),
+                    },
+                    (*key).k.u64s as u32,
+                    BTREE_TRIGGER_transactional,
+                );
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+
+            let mut check = btree_trans::default();
+            bch2_trans_init(&mut check, &mut c);
+            bch2_trans_begin(&mut check);
+            let mut alloc = crate::btree::bset::bch_alloc_v4::default();
+            trigger_read_alloc(&mut check, POS(0, 2), &mut alloc);
+            assert_eq!(alloc.dirty_sectors, 8);
+            let mut bp_iter = btree_iter::default();
+            bch2_trans_iter_init(&mut check, &mut bp_iter, 8, POS(0, 35), BTREE_ITER_intent);
+            let bp = bch2_btree_iter_peek_slot(&mut bp_iter);
+            let bp_value =
+                core::ptr::read_unaligned(bp.v.cast::<crate::btree::bset::bch_backpointer>());
+            assert_eq!(bp_value.btree_id, 3);
+            assert_eq!(bp_value.level, 2);
+            assert_eq!(bp_value.data_type, 1);
+            assert_eq!(bp_value.bucket_len, 8);
+            assert_eq!(bp_value.pos, SPOS(11, 105, 0));
+            bch2_trans_iter_exit(&mut bp_iter);
+            bch2_trans_put(&mut check);
+
+            let mut remove = btree_trans::default();
+            bch2_trans_init(&mut remove, &mut c);
+            loop {
+                bch2_trans_begin(&mut remove);
+                let ret = bch2_key_trigger_old(
+                    &mut remove,
+                    3,
+                    2,
+                    bkey_s_c {
+                        k: &(*key).k,
+                        v: core::ptr::addr_of!((*key).v).cast::<bch_val>(),
+                    },
+                    BTREE_TRIGGER_transactional,
+                );
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut remove)
+                } else {
+                    ret
+                };
+                if ret == -12 && remove.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut remove);
+
+            let mut verify = btree_trans::default();
+            bch2_trans_init(&mut verify, &mut c);
+            bch2_trans_begin(&mut verify);
+            let mut alloc = crate::btree::bset::bch_alloc_v4::default();
+            trigger_read_alloc(&mut verify, POS(0, 2), &mut alloc);
+            assert_eq!(alloc.dirty_sectors, 0);
+            bch2_trans_put(&mut verify);
             bch2_free_super(&mut c.disk_sb);
         }
     }
