@@ -284,6 +284,55 @@ proptest! {
     }
 
     #[test]
+    fn reclaim_after_checkpoint_preserves_model(
+        ops in prop::collection::vec(op_group_strategy(), 1..=MAX_OPS),
+        reclaim_every in 3usize..=6,
+        crash_every in 9usize..=17,
+    ) {
+        /* journal reclaim 压力验证（T0169 回归保障）：随机操作流中周期性
+         * 显式触发 reclaim_journal()（直接路径 checkpoint：flush pins →
+         * 推进 last_seq，对齐 fs/journal/reclaim.c），再叠加崩溃恢复。
+         * bcachefs 语义：恢复仅重放 last_seq 之后窗口（recovery.c:763
+         * journal_replay_seq_start = last_seq），早于 last_seq 的数据由
+         * checkpoint 落盘的设备 btree 提供——裁剪推进过度会丢键，恢复后
+         * 模型对照必须精确一致。 */
+        let dir = unique_tmp_dir();
+        let mut engine = StorageEngine::create_persistent(&dir).unwrap();
+        let mut model = BTreeMap::new();
+
+        for (step, group) in ops.iter().enumerate() {
+            apply_group(&engine, group).unwrap();
+            for op in ops_of(group) {
+                apply_model(&mut model, op);
+            }
+
+            if step % reclaim_every == reclaim_every - 1 {
+                /* 裁剪生效断言：reclaim 后 last_seq_ondisk 单调不倒退
+                 * （无覆盖数据时不变，故用 >=）。 */
+                let before = engine.metrics().unwrap().journal_last_sequence_ondisk;
+                engine.reclaim_journal().unwrap();
+                let after = engine.metrics().unwrap().journal_last_sequence_ondisk;
+                assert!(
+                    after >= before,
+                    "reclaim 使 last_seq_ondisk 倒退: {before} -> {after}"
+                );
+            }
+
+            if step % crash_every == crash_every - 1 {
+                engine.sync().unwrap();
+                drop(engine);
+                engine = StorageEngine::open_persistent(&dir).unwrap();
+                assert_model(&engine, &model);
+            }
+        }
+        engine.sync().unwrap();
+        drop(engine);
+        let recovered = StorageEngine::open_persistent(&dir).unwrap();
+        assert_model(&recovered, &model);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
     fn fault_injection_preserves_model_and_recovery(
         ops in prop::collection::vec(op_group_strategy(), 1..=MAX_OPS),
         crash_every in 7usize..=13,
