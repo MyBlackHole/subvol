@@ -1638,6 +1638,16 @@ unsafe fn bch2_btree_bset_insert_key_inlined(
             bch2_bset_delete(b, k, clobber_u64s);
         }
     } else {
+        /* commit.c bch2_trans_commit_write_locked's EBUG_ON
+         * (fs/btree/commit.c:189-195): the insert must fit the remaining
+         * key space of the node, otherwise bch2_bset_insert memcpys past
+         * the bset into the heap. */
+        assert!(
+            (*insert).k.u64s as usize <= super::interior::bch2_btree_keys_u64s_remaining(b),
+            "bch2_trans_commit insert overflow: insert {} u64s, node has {} remaining",
+            (*insert).k.u64s,
+            super::interior::bch2_btree_keys_u64s_remaining(b)
+        );
         if !k_writeable {
             k = bch2_btree_node_iter_bset_pos(node_iter, b, last);
         }

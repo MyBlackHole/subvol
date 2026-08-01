@@ -1691,6 +1691,26 @@ mod tests {
     }
 
     #[test]
+    fn single_transaction_many_keys_into_one_leaf_splits_without_overflowing() {
+        /* D1 回归：同 leaf 多 update 的空间占用未累加（bcachefs
+         * commit.c:1083-1097 有 `u64s += i->k->k.u64s`），单事务内连续
+         * 键写满 512B 初始节点时 bch2_bset_insert 的 copy_nonoverlapping
+         * 会越过 bset 尾部写坏堆（ASAN 可复现）；修复后按 acc_u64s
+         * 检查并触发 split/grow。 */
+        let engine = StorageEngine::new().unwrap();
+        let mut transaction = engine.transaction();
+        for offset in 1..=32u64 {
+            transaction.put(
+                BtreeId::DEFAULT,
+                BtreeKey::new(KeyPosition::new(1, offset, 0), vec![offset; 4]).unwrap(),
+            );
+        }
+        transaction.commit().unwrap();
+        assert_eq!(engine.scan(BtreeId::DEFAULT).unwrap().len(), 32);
+        engine.verify(BtreeId::DEFAULT).unwrap();
+    }
+
+    #[test]
     fn process_crash_child() {
         let Ok(path) = std::env::var("SUBVOL_ENGINE_CRASH_PATH") else {
             return;
