@@ -7,12 +7,13 @@ use super::bkey::{
 };
 use super::bset_update::{bch2_bset_delete, bch2_bset_insert, btree_keys_account_key};
 use super::iter::{
-    bch2_btree_iter_advance, bch2_btree_iter_peek_max, bch2_btree_iter_peek_prev,
-    bch2_btree_iter_peek_slot, bch2_btree_iter_set_pos, bch2_trans_iter_exit, bch2_trans_iter_init,
-    btree_insert_entry, btree_iter, btree_path, btree_path_idx_t, btree_trans,
-    btree_trans_commit_hook, btree_trans_subbuf, BTREE_ITER_all_snapshots, BTREE_ITER_cached,
-    BTREE_ITER_intent, BTREE_ITER_nofilter_whiteouts, BTREE_ITER_nopreserve,
-    BTREE_ITER_not_extents, BTREE_ITER_INITIAL, BTREE_NODE_INTENT_LOCKED,
+    bch2_btree_iter_advance, bch2_btree_iter_next, bch2_btree_iter_peek, bch2_btree_iter_peek_max,
+    bch2_btree_iter_peek_prev, bch2_btree_iter_peek_slot, bch2_btree_iter_set_pos,
+    bch2_trans_iter_exit, bch2_trans_iter_init, btree_insert_entry, btree_iter, btree_path,
+    btree_path_idx_t, btree_trans, btree_trans_commit_hook, btree_trans_subbuf,
+    BTREE_ITER_all_snapshots, BTREE_ITER_cached, BTREE_ITER_intent, BTREE_ITER_nofilter_whiteouts,
+    BTREE_ITER_nopreserve, BTREE_ITER_not_extents, BTREE_ITER_snapshot_field, BTREE_ITER_INITIAL,
+    BTREE_NODE_INTENT_LOCKED,
 };
 use super::node_iter::{
     bch2_btree_node_iter_bset_pos, bch2_btree_node_iter_peek_all, bkey_unpack_pos,
@@ -2294,6 +2295,118 @@ unsafe fn bch2_trigger_extent(trans: *mut btree_trans, op: btree_trigger_op) -> 
     0
 }
 
+/* recovery.c replays primary keys with BTREE_TRIGGER_norun and then runs its
+ * explicit reconstruction passes.  This is the corresponding reconstruction
+ * entry point: it never rewrites the primary key.  The recovered primary
+ * state remains the authority; alloc/backpointer are overwritten from it. */
+pub(crate) unsafe fn bch2_rebuild_derived_for_key(
+    c: *mut super::types::bch_fs,
+    btree: u8,
+    level: u32,
+    key_words: &mut [u64],
+) -> i32 {
+    if key_words.len() < super::bkey::BKEY_U64S as usize {
+        return -1;
+    }
+    let key = key_words.as_mut_ptr().cast::<bkey_i>();
+    let type_ = (*key).k.type_;
+    if type_ != super::bset::KEY_TYPE_extent
+        && type_ != super::bset::KEY_TYPE_btree_ptr
+        && type_ != super::bset::KEY_TYPE_btree_ptr_v2
+    {
+        return 0;
+    }
+
+    let mut trans = btree_trans::default();
+    super::iter::bch2_trans_init(&mut trans, c);
+    loop {
+        super::iter::bch2_trans_begin(&mut trans);
+        let mut deleted = bkey_i::default();
+        bkey_init(&mut deleted.k);
+        deleted.k.p = (*key).k.p;
+        let ret = bch2_trigger_extent(
+            &mut trans,
+            btree_trigger_op {
+                btree,
+                level,
+                old: bkey_s_c {
+                    k: &deleted.k,
+                    v: core::ptr::null(),
+                },
+                new: bkey_s {
+                    k: &mut (*key).k,
+                    v: (key as *mut u64).add(5).cast::<bch_val>(),
+                },
+                new_buf_u64s: (*key).k.u64s as u32,
+                flags: BTREE_TRIGGER_transactional | BTREE_TRIGGER_insert,
+            },
+        );
+        let ret = if ret == 0 {
+            bch2_trans_commit(&mut trans)
+        } else {
+            ret
+        };
+        if ret == -12 && trans.realloc_bytes_required != 0 {
+            continue;
+        }
+        super::iter::bch2_trans_put(&mut trans);
+        return ret;
+    }
+}
+
+pub(crate) unsafe fn bch2_clear_derived_tree(c: *mut super::types::bch_fs, btree: u8) -> i32 {
+    let mut read = btree_trans::default();
+    super::iter::bch2_trans_init(&mut read, c);
+    super::iter::bch2_trans_begin(&mut read);
+    let mut iter = btree_iter::default();
+    bch2_trans_iter_init(
+        &mut read,
+        &mut iter,
+        btree,
+        super::bkey::POS_MIN,
+        BTREE_ITER_not_extents | BTREE_ITER_all_snapshots | BTREE_ITER_snapshot_field,
+    );
+    let mut positions = Vec::new();
+    let mut current = bch2_btree_iter_peek(&mut iter);
+    while !current.k.is_null() {
+        let error = super::bkey::bkey_err(current);
+        if error != 0 {
+            bch2_trans_iter_exit(&mut iter);
+            super::iter::bch2_trans_put(&mut read);
+            return error;
+        }
+        if (*current.k).type_ != super::bset::KEY_TYPE_deleted {
+            positions.push((*current.k).p);
+        }
+        current = bch2_btree_iter_next(&mut iter);
+    }
+    bch2_trans_iter_exit(&mut iter);
+    super::iter::bch2_trans_put(&mut read);
+
+    for pos in positions {
+        let mut trans = btree_trans::default();
+        super::iter::bch2_trans_init(&mut trans, c);
+        loop {
+            super::iter::bch2_trans_begin(&mut trans);
+            let ret = bch2_btree_delete(&mut trans, btree, pos, 0);
+            let ret = if ret == 0 {
+                bch2_trans_commit(&mut trans)
+            } else {
+                ret
+            };
+            if ret == -12 && trans.realloc_bytes_required != 0 {
+                continue;
+            }
+            super::iter::bch2_trans_put(&mut trans);
+            if ret != 0 {
+                return ret;
+            }
+            break;
+        }
+    }
+    0
+}
+
 unsafe fn run_one_mem_trigger(
     trans: *mut btree_trans,
     i: *mut btree_insert_entry,
@@ -2965,6 +3078,60 @@ mod tests {
             let bp = bch2_btree_iter_peek_slot(&mut bp_iter);
             assert!(bp.k.is_null() || !bpos_eq((*bp.k).p, POS(0, 35)) || (*bp.k).type_ == 0);
             bch2_trans_iter_exit(&mut bp_iter);
+            bch2_trans_put(&mut check);
+            bch2_free_super(&mut c.disk_sb);
+        }
+    }
+
+    #[test]
+    fn explicit_rebuild_restores_derived_state_from_primary_pointer() {
+        unsafe {
+            let mut c = pointer_trigger_test_fs();
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut c);
+            let pos = SPOS(9, 103, 0);
+            loop {
+                bch2_trans_begin(&mut trans);
+                assert_eq!(stage_extent_pointer(&mut trans, pos, 35, 4, 3, 0), 0);
+                let ret = bch2_trans_commit(&mut trans);
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+
+            let mut read = btree_trans::default();
+            bch2_trans_init(&mut read, &mut c);
+            bch2_trans_begin(&mut read);
+            let mut iter = btree_iter::default();
+            bch2_trans_iter_init(&mut read, &mut iter, 0, pos, BTREE_ITER_intent);
+            let primary = bch2_btree_iter_peek(&mut iter);
+            assert!(!primary.k.is_null());
+            assert_eq!((*primary.k).type_, crate::btree::bset::KEY_TYPE_extent);
+            let mut words = vec![0u64; (*primary.k).u64s as usize];
+            let copied = words.as_mut_ptr().cast::<bkey_i>();
+            (*copied).k = *primary.k;
+            core::ptr::copy_nonoverlapping(
+                primary.v.cast::<u64>(),
+                (copied as *mut u64).add(BKEY_U64S as usize),
+                words.len() - BKEY_U64S as usize,
+            );
+            bch2_trans_iter_exit(&mut iter);
+            bch2_trans_put(&mut read);
+
+            assert_eq!(bch2_clear_derived_tree(&mut c, 4), 0);
+            assert_eq!(bch2_clear_derived_tree(&mut c, 8), 0);
+            assert_eq!(bch2_rebuild_derived_for_key(&mut c, 0, 0, &mut words), 0);
+
+            let mut check = btree_trans::default();
+            bch2_trans_init(&mut check, &mut c);
+            bch2_trans_begin(&mut check);
+            let mut alloc = crate::btree::bset::bch_alloc_v4::default();
+            trigger_read_alloc(&mut check, POS(0, 2), &mut alloc);
+            assert_eq!(alloc.gen, 4);
+            assert_eq!(alloc.dirty_sectors, 3);
             bch2_trans_put(&mut check);
             bch2_free_super(&mut c.disk_sb);
         }

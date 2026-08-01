@@ -38,7 +38,10 @@ use crate::{
             bch2_btree_id_root_b, bch_fs, clear_btree_node_fake, clear_btree_node_need_rewrite,
             BTREE_ID_NR,
         },
-        update::{bch2_trans_commit, bch2_trans_update},
+        update::{
+            bch2_clear_derived_tree, bch2_rebuild_derived_for_key, bch2_trans_commit,
+            bch2_trans_update,
+        },
     },
     journal::{
         bch2_journal_flush, bch2_journal_flush_pins, bch2_journal_read, bch2_journal_replay,
@@ -703,6 +706,7 @@ impl StorageEngine {
             if ret != 0 {
                 return Err(EngineError::Journal(ret));
             }
+            rebuild_derived_state(&mut **fs)?;
         }
         drop(fs);
         Ok(engine)
@@ -942,6 +946,7 @@ impl StorageEngine {
             if ret != 0 {
                 return Err(EngineError::Journal(ret));
             }
+            rebuild_derived_state(&mut **fs)?;
         }
         drop(fs);
         Ok(())
@@ -1197,6 +1202,78 @@ unsafe fn get_locked(
     bch2_trans_iter_exit(&mut iter);
     bch2_trans_put(&mut trans);
     result
+}
+
+unsafe fn rebuild_derived_state(fs: &mut bch_fs) -> Result<(), EngineError> {
+    let sb = fs.disk_sb.sb;
+    if sb.is_null() || crate::sb::io::bch2_sb_field_get_id(sb, BCH_SB_FIELD_members_v2).is_null() {
+        return Ok(());
+    }
+
+    for id in [4u8, 8u8] {
+        let ret = bch2_clear_derived_tree(fs, id);
+        if ret != 0 {
+            return Err(EngineError::Transaction(ret));
+        }
+    }
+
+    /* recovery.c's replay has already installed all primary keys with norun.
+     * Copy each visible primary key before dropping its read iterator, then
+     * feed it to the explicit derived-state reconstruction transaction. */
+    for id in 0..BTREE_ID_NR as u8 {
+        if id == 4 || id == 8 {
+            continue;
+        }
+        let mut trans = btree_trans::default();
+        bch2_trans_init(&mut trans, fs);
+        bch2_trans_begin(&mut trans);
+        let mut iter = btree_iter::default();
+        bch2_trans_iter_init(
+            &mut trans,
+            &mut iter,
+            id,
+            POS_MIN,
+            BTREE_ITER_not_extents | BTREE_ITER_snapshot_field | BTREE_ITER_all_snapshots,
+        );
+        let mut keys = Vec::new();
+        let mut current = bch2_btree_iter_peek(&mut iter);
+        while !current.k.is_null() {
+            let error = bkey_err(current);
+            if error != 0 {
+                bch2_trans_iter_exit(&mut iter);
+                bch2_trans_put(&mut trans);
+                return Err(EngineError::Transaction(error));
+            }
+            if (*current.k).type_ != KEY_TYPE_deleted {
+                let u64s = (*current.k).u64s as usize;
+                if u64s < BKEY_U64S as usize {
+                    bch2_trans_iter_exit(&mut iter);
+                    bch2_trans_put(&mut trans);
+                    return Err(EngineError::Transaction(-1));
+                }
+                let mut copied = vec![0u64; u64s];
+                let key = copied.as_mut_ptr().cast::<bkey_i>();
+                (*key).k = *current.k;
+                core::ptr::copy_nonoverlapping(
+                    current.v.cast::<u64>(),
+                    (key as *mut u64).add(BKEY_U64S as usize),
+                    u64s - BKEY_U64S as usize,
+                );
+                keys.push(copied);
+            }
+            current = bch2_btree_iter_next(&mut iter);
+        }
+        bch2_trans_iter_exit(&mut iter);
+        bch2_trans_put(&mut trans);
+
+        for mut key in keys {
+            let ret = bch2_rebuild_derived_for_key(fs, id, 0, &mut key);
+            if ret != 0 {
+                return Err(EngineError::Transaction(ret));
+            }
+        }
+    }
+    Ok(())
 }
 
 unsafe fn scan_locked(fs: &mut bch_fs, btree: BtreeId) -> Result<Vec<BtreeKey>, EngineError> {
