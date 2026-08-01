@@ -3103,4 +3103,96 @@ mod tests {
             bch2_free_super(&mut replay.disk_sb);
         }
     }
+
+    #[test]
+    fn flush_returns_shutdown_at_seq_overflow() {
+        /* 对齐 journal.c:442：journal_cur_seq >= JOURNAL_SEQ_MAX 时
+         * emergency read-only（返回 shutdown 类错误），而非环回。
+         * JOURNAL_SEQ_MAX = (1<<56)-1（journal/types.h:18），
+         * 溢出即拒绝推进 seq。flush 的 old_idx 来自 reservations 状态
+         * （default() 为 idx=1），同步 ring[1].seq 满足 1007 行断言。 */
+        let j = journal::default();
+        j.seq.store(JOURNAL_SEQ_MAX, Ordering::Release);
+        j.ring[1].seq.store(JOURNAL_SEQ_MAX, Ordering::Release);
+        assert_eq!(bch2_journal_flush(&j), -2);
+        assert_eq!(j.seq.load(Ordering::Acquire), JOURNAL_SEQ_MAX);
+    }
+
+    #[test]
+    fn journal_read_rejects_seq_above_max() {
+        /* 恢复路径对超上限 seq 的拒绝（journal.rs:1349 同条件组：
+         * seq == 0 或 seq > JOURNAL_SEQ_MAX 均返回 -5）。在 bucket
+         * 起始写一条 seq = JOURNAL_SEQ_MAX + 1 的记录，read 应拒绝。 */
+        use crate::btree::types::bch_fs;
+        use crate::sb::io::{bch2_free_super, bch2_sb_field_resize_id, bch2_sb_realloc};
+        use crate::sb::{
+            bch_member, bch_sb_field_journal_v2, bch_sb_field_journal_v2_entry,
+            bch_sb_field_members_v2, BCH_SB_FIELD_journal_v2, BCH_SB_FIELD_members_v2,
+        };
+        use std::os::unix::fs::FileExt;
+
+        unsafe {
+            let path = std::env::temp_dir().join(format!(
+                "subvol-journal-seq-overflow-{}",
+                std::process::id()
+            ));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(128 * 512).unwrap();
+
+            let mut c = bch_fs::default();
+            c.disk_sb.s_bdev_file = Box::into_raw(Box::new(file.try_clone().unwrap())).cast();
+            assert_eq!(bch2_sb_realloc(&mut c.disk_sb, 0), 0);
+            (*c.disk_sb.sb).version = crate::sb::bcachefs_metadata_version_current;
+            (*c.disk_sb.sb).uuid = [0x42; 16];
+            (*c.disk_sb.sb).dev_idx = 0;
+            (*c.disk_sb.sb).nr_devices = 1;
+            (*c.disk_sb.sb).block_size = 1;
+
+            let members_u64s = (core::mem::size_of::<bch_sb_field_members_v2>()
+                + core::mem::size_of::<bch_member>())
+            .div_ceil(8) as u32;
+            let members =
+                bch2_sb_field_resize_id(&mut c.disk_sb, BCH_SB_FIELD_members_v2, members_u64s)
+                    .cast::<bch_sb_field_members_v2>();
+            (*members).member_bytes = core::mem::size_of::<bch_member>() as u16;
+            *members
+                .cast::<u8>()
+                .add(core::mem::size_of::<bch_sb_field_members_v2>())
+                .cast::<bch_member>() = bch_member {
+                nbuckets: 64,
+                first_bucket: 8,
+                bucket_size: 2,
+                ..Default::default()
+            };
+
+            let journal = bch2_sb_field_resize_id(&mut c.disk_sb, BCH_SB_FIELD_journal_v2, 3)
+                .cast::<bch_sb_field_journal_v2>();
+            *journal
+                .cast::<u8>()
+                .add(core::mem::size_of::<bch_sb_field_journal_v2>())
+                .cast::<bch_sb_field_journal_v2_entry>() =
+                bch_sb_field_journal_v2_entry { start: 32, nr: 4 };
+
+            let uuid_lo = u64::from_le_bytes((&[0x42u8; 16])[..8].try_into().unwrap());
+            let mut disk = vec![0u64; 16];
+            disk[2] = uuid_lo ^ JSET_MAGIC;
+            disk[3] = JOURNAL_SEQ_MAX + 1;
+            disk[4] = crate::sb::bcachefs_metadata_version_current as u64
+                | (crate::checksum::BCH_CSUM_xxhash as u64) << 32;
+            let bytes = core::slice::from_raw_parts(disk.as_ptr().cast::<u8>(), disk.len() * 8);
+            assert_eq!(file.write_at(bytes, 32 * 2 * 512).unwrap(), disk.len() * 8);
+
+            let mut start = journal_start_info::default();
+            assert_eq!(bch2_journal_read(&mut c, &mut start), -5);
+            assert_eq!(start.cur_seq, 0);
+
+            bch2_free_super(&mut c.disk_sb);
+        }
+    }
 }
