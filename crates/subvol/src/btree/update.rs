@@ -3321,6 +3321,41 @@ mod tests {
     }
 
     #[test]
+    fn pointer_insert_rejects_unavailable_or_invalid_member_without_derived_updates() {
+        unsafe {
+            for invalid_member in 0..4 {
+                let mut c = pointer_trigger_test_fs();
+                let members =
+                    crate::sb::io::bch2_sb_field_get_id(c.disk_sb.sb, BCH_SB_FIELD_members_v2)
+                        .cast::<bch_sb_field_members_v2>();
+                let member = members
+                    .cast::<u8>()
+                    .add(core::mem::size_of::<bch_sb_field_members_v2>())
+                    .cast::<bch_member>();
+                match invalid_member {
+                    0 => c.devs_online.d[0] = 0,
+                    1 => (*member).uuid = [0; 16],
+                    2 => (*member).bucket_size = 0,
+                    3 => (*member).nbuckets = 2,
+                    _ => unreachable!(),
+                }
+
+                let mut trans = btree_trans::default();
+                bch2_trans_init(&mut trans, &mut c);
+                bch2_trans_begin(&mut trans);
+                assert_eq!(
+                    stage_extent_pointer(&mut trans, SPOS(7, invalid_member, 0), 35, 4, 3, 0),
+                    0
+                );
+                assert_eq!(bch2_trans_commit(&mut trans), -1);
+                assert_eq!(trans.nr_updates, 1);
+                bch2_trans_put(&mut trans);
+                bch2_free_super(&mut c.disk_sb);
+            }
+        }
+    }
+
+    #[test]
     fn explicit_interior_pointer_old_new_triggers_update_derived_state() {
         unsafe {
             let mut c = pointer_trigger_test_fs();
