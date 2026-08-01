@@ -7,6 +7,7 @@
 //! core, not a filesystem-compatibility layer.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::OpenOptions,
     io,
@@ -25,7 +26,12 @@ use crate::{
             bkey, bkey_err, bkey_i, bkey_s_c, bkey_val_u64s, bpos, bpos_eq, BKEY_U64S,
             BKEY_VAL_U64S_MAX, KEY_FORMAT_CURRENT, POS_MIN,
         },
-        bset::{KEY_TYPE_cookie, KEY_TYPE_deleted},
+        bset::{
+            bch2_bkey_ptrs_c, bch_alloc_v4, bch_backpointer, extent_entry_is_ptr,
+            KEY_TYPE_alloc_v4, KEY_TYPE_backpointer, KEY_TYPE_btree_ptr, KEY_TYPE_btree_ptr_v2,
+            KEY_TYPE_cookie, KEY_TYPE_deleted, KEY_TYPE_extent, BCH_EXTENT_PTR_DEV,
+            BCH_EXTENT_PTR_GEN, BCH_EXTENT_PTR_OFFSET,
+        },
         cache::bch2_fs_btree_cache_init,
         interior::{bch2_btree_node_check_topology, bch2_btree_root_alloc_fake},
         iter::{
@@ -707,6 +713,7 @@ impl StorageEngine {
                 return Err(EngineError::Journal(ret));
             }
             rebuild_derived_state(&mut **fs)?;
+            check_extents_to_backpointers(&mut **fs)?;
         }
         drop(fs);
         Ok(engine)
@@ -947,6 +954,7 @@ impl StorageEngine {
                 return Err(EngineError::Journal(ret));
             }
             rebuild_derived_state(&mut **fs)?;
+            check_extents_to_backpointers(&mut **fs)?;
         }
         drop(fs);
         Ok(())
@@ -1334,6 +1342,171 @@ unsafe fn scan_locked(fs: &mut bch_fs, btree: BtreeId) -> Result<Vec<BtreeKey>, 
     bch2_trans_iter_exit(&mut iter);
     bch2_trans_put(&mut trans);
     result.map(|()| output)
+}
+
+struct RawScannedKey {
+    btree: u8,
+    words: Vec<u64>,
+}
+
+/* recovery.c's explicit allocation/backpointer checks walk the primary
+ * btrees independently of the derived indexes.  Keep that same separation
+ * here: the validator receives an owned copy of each primary key and never
+ * mutates the tree while it compares the derived state. */
+unsafe fn scan_raw_locked(fs: &mut bch_fs, btree: u8) -> Result<Vec<RawScannedKey>, EngineError> {
+    let mut trans = btree_trans::default();
+    bch2_trans_init(&mut trans, fs);
+    bch2_trans_begin(&mut trans);
+    let mut iter = btree_iter::default();
+    bch2_trans_iter_init(
+        &mut trans,
+        &mut iter,
+        btree,
+        POS_MIN,
+        BTREE_ITER_not_extents | BTREE_ITER_snapshot_field | BTREE_ITER_all_snapshots,
+    );
+    let mut output = Vec::new();
+    let mut current = bch2_btree_iter_peek(&mut iter);
+    let result = loop {
+        let error = bkey_err(current);
+        if error != 0 {
+            break Err(EngineError::Transaction(error));
+        }
+        if current.k.is_null() {
+            break Ok(());
+        }
+        if (*current.k).type_ != KEY_TYPE_deleted {
+            let u64s = (*current.k).u64s as usize;
+            if u64s < BKEY_U64S as usize {
+                break Err(EngineError::Transaction(-1));
+            }
+            let mut words = vec![0u64; u64s];
+            core::ptr::copy_nonoverlapping(current.k.cast::<u64>(), words.as_mut_ptr(), u64s);
+            output.push(RawScannedKey { btree, words });
+        }
+        current = bch2_btree_iter_next(&mut iter);
+    };
+    bch2_trans_iter_exit(&mut iter);
+    bch2_trans_put(&mut trans);
+    result.map(|()| output)
+}
+
+unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<(), EngineError> {
+    let mut primary = Vec::new();
+    for id in 0..BTREE_ID_NR as u8 {
+        if id != 4 && id != 8 {
+            primary.extend(scan_raw_locked(fs, id)?);
+        }
+    }
+
+    let mut expected_alloc: BTreeMap<(u64, u64), (u8, u32)> = BTreeMap::new();
+    let mut expected_bp: BTreeMap<(u64, u64), (u8, u8, u8, u8, u32, bpos)> = BTreeMap::new();
+    for raw in primary {
+        let key = raw.words.as_ptr().cast::<bkey_i>();
+        let type_ = (*key).k.type_;
+        if type_ != KEY_TYPE_extent && type_ != KEY_TYPE_btree_ptr && type_ != KEY_TYPE_btree_ptr_v2
+        {
+            continue;
+        }
+        let ptrs = bch2_bkey_ptrs_c(bkey_s_c {
+            k: &(*key).k,
+            v: (key as *const u64).add(BKEY_U64S as usize).cast(),
+        });
+        let mut entry = ptrs.start;
+        while !entry.is_null() && (entry as usize) < (ptrs.end as usize) {
+            if extent_entry_is_ptr(entry) {
+                let ptr = (*entry).ptr;
+                let dev = BCH_EXTENT_PTR_DEV(&ptr);
+                let offset = BCH_EXTENT_PTR_OFFSET(&ptr);
+                let generation = BCH_EXTENT_PTR_GEN(&ptr) as u8;
+                let member = crate::sb::io::bch2_sb_member_get(fs.disk_sb.sb, dev as usize);
+                if member.bucket_size == 0 {
+                    crate::rewrite_log_error!("derived validator: zero bucket size for dev {dev}");
+                    return Err(EngineError::Transaction(-1));
+                }
+                let bucket = offset / member.bucket_size as u64;
+                let sectors = (*key).k.size;
+                let alloc = expected_alloc
+                    .entry((dev, bucket))
+                    .or_insert((generation, 0));
+                if alloc.0 != generation {
+                    crate::rewrite_log_error!(
+                        "derived validator: generation mismatch dev={dev} bucket={bucket}"
+                    );
+                    return Err(EngineError::Transaction(-1));
+                }
+                alloc.1 = alloc
+                    .1
+                    .checked_add(sectors)
+                    .ok_or(EngineError::Transaction(-1))?;
+                let bp = (
+                    raw.btree,
+                    0,
+                    if type_ == KEY_TYPE_extent { 0 } else { 1 },
+                    generation,
+                    sectors,
+                    (*key).k.p,
+                );
+                if expected_bp.insert((dev, offset), bp).is_some() {
+                    crate::rewrite_log_error!(
+                        "derived validator: duplicate backpointer dev={dev} offset={offset}"
+                    );
+                    return Err(EngineError::Transaction(-1));
+                }
+            }
+            entry = crate::btree::bset::extent_entry_next_safe(fs, entry, ptrs.end);
+        }
+    }
+
+    let alloc_keys = scan_raw_locked(fs, 4)?;
+    let mut actual_alloc = BTreeMap::new();
+    for raw in alloc_keys {
+        let key = raw.words.as_ptr().cast::<bkey_i>();
+        if (*key).k.type_ != KEY_TYPE_alloc_v4 || raw.words.len() < BKEY_U64S as usize + 1 {
+            continue;
+        }
+        let value = (key as *const u8)
+            .add(core::mem::size_of::<bkey>())
+            .cast::<bch_alloc_v4>();
+        let alloc = core::ptr::read_unaligned(value);
+        actual_alloc.insert(
+            ((*key).k.p.inode, (*key).k.p.offset),
+            (alloc.gen, alloc.dirty_sectors),
+        );
+    }
+    if actual_alloc != expected_alloc {
+        crate::rewrite_log_error!("derived validator: alloc set mismatch");
+        return Err(EngineError::Transaction(-1));
+    }
+
+    let bp_keys = scan_raw_locked(fs, 8)?;
+    let mut actual_bp = BTreeMap::new();
+    for raw in bp_keys {
+        let key = raw.words.as_ptr().cast::<bkey_i>();
+        if (*key).k.type_ != KEY_TYPE_backpointer {
+            continue;
+        }
+        let value = (key as *const u8)
+            .add(core::mem::size_of::<bkey>())
+            .cast::<bch_backpointer>();
+        let bp = core::ptr::read_unaligned(value);
+        actual_bp.insert(
+            ((*key).k.p.inode, (*key).k.p.offset),
+            (
+                bp.btree_id,
+                bp.level,
+                bp.data_type,
+                bp.bucket_gen,
+                bp.bucket_len,
+                bp.pos,
+            ),
+        );
+    }
+    if actual_bp != expected_bp {
+        crate::rewrite_log_error!("derived validator: backpointer set mismatch");
+        return Err(EngineError::Transaction(-1));
+    }
+    Ok(())
 }
 
 unsafe fn configure_persistent_journal(
