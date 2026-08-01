@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use proptest::prelude::*;
-use subvol::{BtreeId, BtreeKey, KeyPosition, StorageEngine};
+use subvol::{BtreeId, BtreeKey, EngineError, FaultPoint, KeyPosition, StorageEngine};
 
 const CASES: u32 = 64;
 const MAX_OPS: usize = 120;
@@ -216,6 +216,59 @@ proptest! {
                  * 从设备恢复（bcachefs 语义：设备 btree + journal 窗口，
                  * 对齐 read_btree_roots + bch2_journal_read），恢复后的
                  * scan 必须与模型完全一致。 */
+                engine.sync().unwrap();
+                drop(engine);
+                engine = StorageEngine::open_persistent(&dir).unwrap();
+                assert_model(&engine, &model);
+            }
+        }
+        engine.sync().unwrap();
+        drop(engine);
+        let recovered = StorageEngine::open_persistent(&dir).unwrap();
+        assert_model(&recovered, &model);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn fault_injection_preserves_model_and_recovery(
+        ops in prop::collection::vec(op_group_strategy(), 1..=MAX_OPS),
+        crash_every in 7usize..=13,
+    ) {
+        /* 故障注入验证（AGENTS.md 交付重点）：随机操作序列中注入
+         * TransactionRestart（事务重试）与 JournalWrite（写盘失败），
+         * 引擎必须通过重试保持模型一致，且最终成功落盘后设备恢复
+         * （open_persistent）与模型完全一致。注入次数由 step/组形状
+         * 确定性派生，保证可复现。 */
+        let dir = unique_tmp_dir();
+        let mut engine = StorageEngine::create_persistent(&dir).unwrap();
+        let mut model = BTreeMap::new();
+
+        for (step, group) in ops.iter().enumerate() {
+            let restarts = (step * 7 + ops_of(group).len() + ops.len()) % 4;
+            if restarts > 0 {
+                engine
+                    .inject_fault(FaultPoint::TransactionRestart, restarts as u32)
+                    .unwrap();
+            }
+            apply_group(&engine, group).unwrap();
+            for op in ops_of(group) {
+                apply_model(&mut model, op);
+            }
+
+            if step % crash_every == crash_every - 1 {
+                /* 写盘失败注入：sync 必须返回 Journal(-5)，随后重试必须
+                 * 成功；失败 flush 不得污染后续状态（write.c 写失败语义
+                 * 在引擎中为可重试）。 */
+                let write_failures = (step * 3 + ops_of(group).len() + 1) % 3;
+                for _ in 0..write_failures {
+                    engine
+                        .inject_fault(FaultPoint::JournalWrite, 1)
+                        .unwrap();
+                    assert!(
+                        matches!(engine.sync(), Err(EngineError::Journal(-5))),
+                        "注入 JournalWrite 后 sync 必须失败 step={step}"
+                    );
+                }
                 engine.sync().unwrap();
                 drop(engine);
                 engine = StorageEngine::open_persistent(&dir).unwrap();
