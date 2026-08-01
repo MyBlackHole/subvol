@@ -1827,7 +1827,14 @@ mod tests {
     #[test]
     fn recovery_fault_matrix_never_publishes_success() {
         let engine = StorageEngine::new().unwrap();
+        let mut tx = engine.transaction();
+        tx.put(BtreeId::DEFAULT, key(41, &[7, 8, 9]));
+        tx.commit_sync().unwrap();
         let snapshot = engine.durable_journal().unwrap();
+        StorageEngine::recover(&snapshot)
+            .unwrap()
+            .verify_derived_state()
+            .unwrap();
         for fault in [
             RecoveryFaultPoint::AfterJournalReplay,
             RecoveryFaultPoint::DuringDerivedRebuild,
