@@ -1928,6 +1928,12 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
         }
     }
 
+    /* Multiple inserts might go to same leaf: accumulate space across
+     * adjacent updates targeting the same node, matching bcachefs
+     * commit.c bch2_trans_commit_write_locked (u64s += i->k->k.u64s
+     * per same leaf). */
+    let mut acc_u64s: u32 = 0;
+    let mut last_leaf: *mut btree = core::ptr::null_mut();
     for idx in 0..(*trans).nr_updates as usize {
         let i = (*trans).updates.add(idx);
         let path = (*trans).paths.add((*i).path as usize);
@@ -1968,7 +1974,12 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
             } else {
                 (*(*i).k).k.u64s as u32
             };
-        if !super::interior::bch2_btree_node_insert_fits(b, required_u64s)
+        if last_leaf.is_null() || last_leaf != b {
+            acc_u64s = 0;
+        }
+        acc_u64s += required_u64s;
+        last_leaf = b;
+        if !super::interior::bch2_btree_node_insert_fits(b, acc_u64s)
             && super::interior::want_new_bset((*trans).c, b).is_null()
         {
             let ret = super::interior::bch2_btree_split_leaf(

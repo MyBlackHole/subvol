@@ -410,8 +410,81 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         super::node_iter::bch2_btree_node_iter_advance(&mut iter, src);
     }
     if nr_keys[0] == 0 || nr_keys[1] == 0 {
-        crate::rewrite_log_error!("btree split rejected: unable to form two non-empty leaves");
-        return -6;
+        /* 节点内容不足以形成两个非空叶子（空/过稀疏节点）：bcachefs 节点
+         * 容量由 superblock 固定（BCH_SB_BTREE_NODE_SIZE，256KB 量级），
+         * 空节点上的事务不会触发 btree_node_full；subvol 小节点配置
+         * （512B）下单事务可超出节点容量。此处扩容节点（byte_order + 1）
+         * 使容量满足本次事务，等效 bcachefs 固定节点容量的保证，
+         * 随后 restart 重试（bcachefs btree_split 的 BUG_ON 路径
+         * fs/btree/interior.c 假定分裂总能成功）。 */
+        crate::rewrite_log_debug!(
+            "btree split rejected: unable to form two non-empty leaves, growing leaf byte_order={}",
+            (*src).byte_order
+        );
+        if (*src).byte_order >= 16 {
+            crate::rewrite_log_error!("btree split rejected: leaf byte_order limit exceeded");
+            return -12;
+        }
+        let old_order = (*src).byte_order;
+        let new_order = old_order + 1;
+        let new_data = std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(
+            1usize << new_order,
+            core::mem::align_of::<u64>(),
+        ))
+        .cast::<u64>();
+        let new_aux = std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(
+            super::types::__btree_aux_data_bytes(new_order as u32),
+            core::mem::align_of::<u64>(),
+        ))
+        .cast::<u64>();
+        if new_data.is_null() || new_aux.is_null() {
+            if !new_data.is_null() {
+                std::alloc::dealloc(
+                    new_data.cast(),
+                    std::alloc::Layout::from_size_align_unchecked(
+                        1usize << new_order,
+                        core::mem::align_of::<u64>(),
+                    ),
+                );
+            }
+            if !new_aux.is_null() {
+                std::alloc::dealloc(
+                    new_aux.cast(),
+                    std::alloc::Layout::from_size_align_unchecked(
+                        super::types::__btree_aux_data_bytes(new_order as u32),
+                        core::mem::align_of::<u64>(),
+                    ),
+                );
+            }
+            crate::rewrite_log_error!("btree split rejected: leaf grow allocation failed");
+            return -12;
+        }
+        core::ptr::copy_nonoverlapping(
+            (*src).data.cast::<u64>(),
+            new_data,
+            (1usize << old_order) / 8,
+        );
+        let cache_owned = (*c)
+            .btree
+            .cache
+            .allocations
+            .lock()
+            .unwrap()
+            .contains(&(src as usize));
+        if cache_owned {
+            super::cache::bch2_btree_node_data_free(src);
+        }
+        (*src).data = new_data.cast::<super::bset::btree_node>();
+        (*src).aux_data = new_aux.cast();
+        (*src).byte_order = new_order;
+        /* The copied bset_tree entries carry aux-tree state that points
+         * into the freed old aux buffer; force a rebuild into the new
+         * aux buffer (bch2_btree_build_aux_tree() skips trees that
+         * already carry a tree type). */
+        super::bset_build::bch2_bset_set_no_aux_tree(src, (*src).set.as_mut_ptr());
+        super::bset_build::bch2_btree_build_aux_trees(src);
+        (*trans).restarted = 4;
+        return -4;
     }
 
     super::bkey::bch2_bkey_format_add_pos(&mut states[0], (*(*src).data).min_key);
@@ -442,6 +515,29 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         (*node).c.level = level;
         (*node).c.btree_id = (*src).c.btree_id;
         (*node).version_ondisk = crate::sb::bcachefs_metadata_version_current;
+        /* Split nodes inherit the source node's capacity: bcachefs node
+         * size is fixed by the superblock (BCH_SB_BTREE_NODE_SIZE), so a
+         * split never changes node capacity.  subvol nodes grow on demand
+         * (see the grow path below), so children must inherit the grown
+         * size or a small split target would immediately overflow. */
+        if (*node).byte_order < (*src).byte_order {
+            let target_order = (*src).byte_order;
+            let new_data = std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(
+                1usize << target_order,
+                core::mem::align_of::<u64>(),
+            ))
+            .cast::<u64>();
+            let new_aux = std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(
+                super::types::__btree_aux_data_bytes(target_order as u32),
+                core::mem::align_of::<u64>(),
+            ))
+            .cast::<u64>();
+            assert!(!new_data.is_null() && !new_aux.is_null());
+            super::cache::bch2_btree_node_data_free(node);
+            (*node).data = new_data.cast::<super::bset::btree_node>();
+            (*node).aux_data = new_aux.cast();
+            (*node).byte_order = target_order;
+        }
         super::bset_build::bch2_bset_init_first(node, &mut (*(*node).data).keys);
         super::bset_build::bch2_btree_build_aux_trees(node);
         node
