@@ -1428,6 +1428,8 @@ impl StorageEngine {
     /// (interior.c:3345 `bch2_btree_node_rewrite_key`): the node is located
     /// at `key.position` and rewritten only when its `btree_ptr_v2.seq`
     /// matches, otherwise `Transaction(-2)` (ENOENT) is returned.
+    /// `level` is the target node's level (leaf == 0, unlike `rewrite_node`
+    /// whose level counts the pointer key level).
     pub fn rewrite_node_key(
         &self,
         btree: BtreeId,
@@ -2082,10 +2084,10 @@ unsafe fn rewrite_node_locked(
     position: KeyPosition,
 ) -> Result<(), EngineError> {
     /* interior.c:3373 bch2_btree_node_rewrite_pos() 语义：定位到
-     * position 处的节点并重写。调用层的 level 表示"目标节点层数"，
-     * 内部路径停在 level-1 层（bcachefs 的 level+1/min_level=level-1
-     * 遍历约定），因此 level == 0 是调用方错误（BUG_ON(!level)，
-     * 由公共入口保证）。 */
+     * position 处的节点并重写。调用层的 level 表示"指针键所在层"
+     * （目标节点层 + 1，move.c:321 同款），内部路径停在 level-1 层
+     * （bcachefs 的 CLASS depth=level-1 遍历约定），因此 level == 0
+     * 是调用方错误（BUG_ON(!level)，由公共入口保证）。 */
     let mut trans = btree_trans::default();
     bch2_trans_init(&mut trans, fs);
     bch2_trans_begin(&mut trans);
@@ -2123,7 +2125,10 @@ unsafe fn rewrite_node_key_locked(
 ) -> Result<(), EngineError> {
     /* interior.c:3345 bch2_btree_node_rewrite_key() 语义：仅当
      * 定位节点的指针键 hash 与给定键匹配时才重写，否则 -ENOENT。
-     * 与 rewrite_node_locked 相同，level 为目标节点层数。 */
+     * 注意与 rewrite_node_locked 的 level 语义不同：rewrite_key
+     * 的 level 即"目标节点层数"（async 传 b->c.level，read.c:1243
+     * 传 scrub->level - 1），CLASS depth=level；因此叶节点
+     * level == 0 合法，无 BUG_ON(!level)。 */
     let mut trans = btree_trans::default();
     bch2_trans_init(&mut trans, fs);
     bch2_trans_begin(&mut trans);
@@ -2135,7 +2140,7 @@ unsafe fn rewrite_node_key_locked(
         btree.as_u8(),
         key.position().raw(),
         crate::btree::bset::BTREE_MAX_DEPTH,
-        level - 1,
+        level,
         crate::btree::iter::BTREE_ITER_intent,
     );
     let b = crate::btree::iter::bch2_btree_iter_peek_node(&mut iter);
@@ -5865,7 +5870,7 @@ mod tests {
             )
         };
         assert!(matches!(
-            engine.rewrite_node_key(BtreeId::DEFAULT, 1, &stale_key),
+            engine.rewrite_node_key(BtreeId::DEFAULT, 0, &stale_key),
             Err(EngineError::Transaction(-2))
         ));
         let seq_before = unsafe {
@@ -5873,7 +5878,7 @@ mod tests {
             (*(*find_node_at_level(fs, 0, target_pos.raw())).data).keys.seq
         };
         engine
-            .rewrite_node_key(BtreeId::DEFAULT, 1, &live_key)
+            .rewrite_node_key(BtreeId::DEFAULT, 0, &live_key)
             .unwrap();
         let seq_after = unsafe {
             let fs = &mut *engine.lock_fs().unwrap();
