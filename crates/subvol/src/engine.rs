@@ -2242,6 +2242,9 @@ mod tests {
             engine.reclaim_bucket(KeyPosition::new(0, 8, 0)),
             Err(EngineError::Transaction(-1))
         ));
+        engine
+            .inject_fault(FaultPoint::TransactionRestart, 1)
+            .unwrap();
         assert_eq!(
             engine.allocate_bucket(0).unwrap(),
             KeyPosition::new(0, 4, 0)
@@ -2256,6 +2259,9 @@ mod tests {
             KeyPosition::new(0, 4, 0)
         );
 
+        engine.inject_fault(FaultPoint::JournalWrite, 1).unwrap();
+        assert!(engine.flush_journal().is_err());
+        assert!(engine.verify_bucket_indexes().is_ok());
         engine.flush_journal().unwrap();
         drop(engine);
         let recovered = StorageEngine::open_persistent(&path).unwrap();
