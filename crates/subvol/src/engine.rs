@@ -5001,10 +5001,108 @@ mod tests {
                 engine.reclaim_journal().unwrap();
                 engine.put_sync(BtreeId::DEFAULT, key(704, &[4])).unwrap();
             }
+            "cc-flush-before" => {
+                concurrent_crash_child(Arc::new(engine), Path::new(&ready), "cc-flush-before");
+            }
+            "cc-flush-after" => {
+                concurrent_crash_child(Arc::new(engine), Path::new(&ready), "cc-flush-after");
+            }
+            "cc-mid-write" => {
+                concurrent_crash_child(Arc::new(engine), Path::new(&ready), "cc-mid-write");
+            }
             _ => panic!("unknown crash phase {phase}"),
         }
         fs::write(ready, b"durable-before-abort").unwrap();
         std::process::abort();
+    }
+
+    /// T0201: concurrent writers (btree put + alloc mix) with a one-shot
+    /// restart injection, then the caller aborts at the chosen crash
+    /// point.  The crash point is synchronized by `ready`:
+    /// - cc-flush-before: all writers finish their rounds, the process
+    ///   aborts before any flush — the journal holds unflushed
+    ///   transaction records that recovery must drop (journal replay only
+    ///   re-applies durable records).
+    /// - cc-flush-after: all writers finish and the journal is flushed
+    ///   before the abort — every committed transaction is durable and
+    ///   must survive recovery.
+    /// - cc-mid-write: the main thread returns after the first round's
+    ///   barrier slack without joining the writers, so the abort lands
+    ///   while writers are still mid-round; some transactions are
+    ///   unflushed and must be dropped, the rest must survive.
+    fn concurrent_crash_child(engine: Arc<StorageEngine>, ready: &Path, mode: &str) {
+        /* 4 free buckets (4..=7) so the 4 writers' start barrier allocates
+         * one bucket each without contention, then recycles (T0199 pattern) */
+        for offset in 4..=7 {
+            add_free_bucket(&engine, offset);
+        }
+        /* Barrier(5): 4 writers + the main thread, which participates in
+         * every barrier so the round boundaries are deterministic (the
+         * T0199 rule: barrier participants must match waiters). */
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let mut workers = Vec::new();
+        for writer in 0..4u64 {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for round in 0..3u64 {
+                    /* btree writer: journal transaction on the default tree */
+                    engine
+                        .put(
+                            BtreeId::DEFAULT,
+                            BtreeKey::new(
+                                KeyPosition::new(writer + 1, round + 1, 0),
+                                vec![writer, round],
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    /* alloc writer: allocate/reclaim round on the fixed
+                     * 8-bucket geometry (free buckets 4..=7); the second
+                     * reclaim returns the freespace key so the 3 free
+                     * buckets cycle across all 4 writers x 3 rounds
+                     * without exhausting (same pattern as T0199
+                     * concurrent_writers_with_restart_injection_converge) */
+                    let position = engine.allocate_bucket(0).unwrap();
+                    engine.reclaim_bucket(position).unwrap();
+                    engine.reclaim_bucket(position).unwrap();
+                    barrier.wait();
+                }
+            }));
+        }
+        engine
+            .inject_fault(FaultPoint::TransactionRestart, 8)
+            .unwrap();
+        match mode {
+            "cc-flush-after" => {
+                for _ in 0..4 {
+                    barrier.wait();
+                }
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+                engine.flush_journal().unwrap();
+            }
+            "cc-mid-write" => {
+                /* wait through the start barrier and the first round's
+                 * end barrier: all writers are then provably inside the
+                 * second round; return without joining so the abort
+                 * terminates the process mid-write */
+                for _ in 0..2 {
+                    barrier.wait();
+                }
+            }
+            "cc-flush-before" => {
+                for _ in 0..4 {
+                    barrier.wait();
+                }
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            }
+            _ => panic!("unknown concurrent crash mode {mode}"),
+        }
     }
 
     fn run_crash_child(path: &Path, phase: &str) {
@@ -5038,6 +5136,36 @@ mod tests {
             let recovered = StorageEngine::open_persistent(&path).unwrap();
             assert_eq!(recovered.scan(BtreeId::DEFAULT).unwrap(), expected);
             recovered.verify(BtreeId::DEFAULT).unwrap();
+            drop(recovered);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn persistent_concurrent_crash_recovery_converges() {
+        /* T0201: concurrent writers + deterministic crash point + recovery.
+         * Each crash point must recover to a consistent image: replay only
+         * re-applies durable journal records (unflushed transactions are
+         * dropped), derived state rebuilds from the alloc tree, verify_all
+         * passes, no open-bucket leak, and the btree keys are readable.
+         * flush-after additionally asserts every committed key survives;
+         * flush-before / mid-write assert only eventual consistency (some
+         * transactions were unflushed and must be dropped). */
+        for phase in ["cc-flush-before", "cc-flush-after", "cc-mid-write"] {
+            let path = persistent_test_path(&format!("concurrent-crash-{phase}"));
+            run_crash_child(&path, phase);
+            let recovered = StorageEngine::open_persistent(&path).unwrap();
+            recovered.verify_all().unwrap();
+            assert_eq!(recovered.open_bucket_count().unwrap(), 0);
+            let keys = recovered.scan(BtreeId::DEFAULT).unwrap();
+            assert!(keys
+                .windows(2)
+                .all(|pair| pair[0].position() < pair[1].position()));
+            if phase == "cc-flush-after" {
+                /* flush-after: every committed transaction is durable, so
+                 * all 12 writer keys (4 writers x 3 rounds) survive */
+                assert_eq!(keys.len(), 12);
+            }
             drop(recovered);
             fs::remove_file(path).unwrap();
         }
