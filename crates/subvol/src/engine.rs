@@ -615,6 +615,7 @@ impl StorageEngine {
         let mut fs = self.lock_fs()?;
         unsafe {
             let mut alloc_free = BTreeSet::new();
+            let mut expected_index = BTreeSet::new();
             for raw in scan_raw_locked(&mut **fs, 4)? {
                 let key = raw.words.as_ptr().cast::<bkey_i>();
                 if (*key).k.type_ != KEY_TYPE_alloc_v4 {
@@ -626,16 +627,23 @@ impl StorageEngine {
                 let alloc = core::ptr::read_unaligned(value);
                 if alloc.data_type == BCH_DATA_FREE {
                     alloc_free.insert(((*key).k.p.inode, (*key).k.p.offset));
+                    let indexed = alloc_freespace_pos((*key).k.p, &alloc);
+                    expected_index.insert((indexed.inode, indexed.offset));
                 }
             }
             let mut indexed = BTreeSet::new();
             for raw in scan_raw_locked(&mut **fs, BTREE_ID_FREESPACE)? {
                 let key = raw.words.as_ptr().cast::<bkey_i>();
                 if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set {
-                    indexed.insert(((*key).k.p.inode, (*key).k.p.offset & ((1u64 << 56) - 1)));
+                    indexed.insert(((*key).k.p.inode, (*key).k.p.offset));
                 }
             }
-            if alloc_free != indexed {
+            if alloc_free.len() != indexed.len()
+                || expected_index != indexed
+                || indexed
+                    .iter()
+                    .any(|(dev, offset)| !alloc_free.contains(&(*dev, offset & ((1u64 << 56) - 1))))
+            {
                 return Err(EngineError::DerivedState(
                     DerivedStateMismatch::FreespaceSet,
                 ));
