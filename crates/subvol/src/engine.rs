@@ -965,6 +965,34 @@ impl StorageEngine {
         }
     }
 
+    /// Re-discovers persisted need_discard entries after a process-style
+    /// restart and queues them without duplicating already discovered work.
+    pub fn discover_discard_buckets(&self) -> Result<usize, EngineError> {
+        let mut fs = self.lock_fs()?;
+        let mut positions = Vec::new();
+        unsafe {
+            for raw in scan_raw_locked(&mut **fs, BTREE_ID_NEED_DISCARD)? {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set {
+                    positions.push(((*key).k.p.inode, (*key).k.p.offset));
+                }
+            }
+        }
+        drop(fs);
+        let mut inflight = self
+            .inner
+            .discard_inflight
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?;
+        let mut inserted = 0;
+        for position in positions {
+            if inflight.insert(position) {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+
     /// Publishes the current journal buffer.  Only records returned by
     /// `durable_journal()` after this succeeds can survive a crash.
     pub fn flush_journal(&self) -> Result<(), EngineError> {
@@ -2556,6 +2584,23 @@ mod tests {
         engine.run_discard_worker_once().unwrap();
         assert!(engine.verify_bucket_indexes().is_ok());
         drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn discard_worker_rediscovers_need_discard_after_restart() {
+        let (engine, path) = prepared_bucket_engine("discard-restart", 4);
+        let position = KeyPosition::new(0, 4, 0);
+        engine.allocate_bucket(0).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        engine.flush_journal().unwrap();
+        drop(engine);
+
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        assert_eq!(recovered.discover_discard_buckets().unwrap(), 1);
+        recovered.run_discard_worker_once().unwrap();
+        assert!(recovered.verify_bucket_indexes().is_ok());
+        drop(recovered);
         fs::remove_file(path).unwrap();
     }
 
