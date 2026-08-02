@@ -688,29 +688,35 @@ impl StorageEngine {
                 alloc.data_type = BCH_DATA_BTREE;
                 let mut trans = btree_trans::default();
                 bch2_trans_init(&mut trans, &mut **fs);
-                bch2_trans_begin(&mut trans);
-                let ret = trigger_update_value(
-                    &mut trans,
-                    4,
-                    (*key).k.p,
-                    KEY_TYPE_alloc_v4,
-                    (&alloc as *const bch_alloc_v4).cast(),
-                    core::mem::size_of::<bch_alloc_v4>(),
-                );
-                let ret = if ret == 0 {
-                    bch2_btree_bit_mod(
+                let ret = loop {
+                    bch2_trans_begin(&mut trans);
+                    let ret = trigger_update_value(
                         &mut trans,
-                        BTREE_ID_FREESPACE,
-                        alloc_freespace_pos((*key).k.p, &old_alloc),
-                        false,
-                    )
-                } else {
-                    ret
-                };
-                let ret = if ret == 0 {
-                    bch2_trans_commit(&mut trans)
-                } else {
-                    ret
+                        4,
+                        (*key).k.p,
+                        KEY_TYPE_alloc_v4,
+                        (&alloc as *const bch_alloc_v4).cast(),
+                        core::mem::size_of::<bch_alloc_v4>(),
+                    );
+                    let ret = if ret == 0 {
+                        bch2_btree_bit_mod(
+                            &mut trans,
+                            BTREE_ID_FREESPACE,
+                            alloc_freespace_pos((*key).k.p, &old_alloc),
+                            false,
+                        )
+                    } else {
+                        ret
+                    };
+                    let ret = if ret == 0 {
+                        bch2_trans_commit(&mut trans)
+                    } else {
+                        ret
+                    };
+                    if ret == -12 && trans.realloc_bytes_required != 0 {
+                        continue;
+                    }
+                    break ret;
                 };
                 bch2_trans_put(&mut trans);
                 if ret != 0 {
@@ -777,33 +783,39 @@ impl StorageEngine {
                 }
                 let mut trans = btree_trans::default();
                 bch2_trans_init(&mut trans, &mut **fs);
-                bch2_trans_begin(&mut trans);
-                let ret = trigger_update_value(
-                    &mut trans,
-                    4,
-                    (*key).k.p,
-                    KEY_TYPE_alloc_v4,
-                    (&alloc as *const bch_alloc_v4).cast(),
-                    core::mem::size_of::<bch_alloc_v4>(),
-                );
-                let ret = if ret == 0 {
-                    if alloc.data_type == BCH_DATA_FREE {
-                        bch2_btree_bit_mod(
-                            &mut trans,
-                            BTREE_ID_FREESPACE,
-                            alloc_freespace_pos((*key).k.p, &alloc),
-                            true,
-                        )
+                let ret = loop {
+                    bch2_trans_begin(&mut trans);
+                    let ret = trigger_update_value(
+                        &mut trans,
+                        4,
+                        (*key).k.p,
+                        KEY_TYPE_alloc_v4,
+                        (&alloc as *const bch_alloc_v4).cast(),
+                        core::mem::size_of::<bch_alloc_v4>(),
+                    );
+                    let ret = if ret == 0 {
+                        if alloc.data_type == BCH_DATA_FREE {
+                            bch2_btree_bit_mod(
+                                &mut trans,
+                                BTREE_ID_FREESPACE,
+                                alloc_freespace_pos((*key).k.p, &alloc),
+                                true,
+                            )
+                        } else {
+                            0
+                        }
                     } else {
-                        0
+                        ret
+                    };
+                    let ret = if ret == 0 {
+                        bch2_trans_commit(&mut trans)
+                    } else {
+                        ret
+                    };
+                    if ret == -12 && trans.realloc_bytes_required != 0 {
+                        continue;
                     }
-                } else {
-                    ret
-                };
-                let ret = if ret == 0 {
-                    bch2_trans_commit(&mut trans)
-                } else {
-                    ret
+                    break ret;
                 };
                 bch2_trans_put(&mut trans);
                 return if ret == 0 {
