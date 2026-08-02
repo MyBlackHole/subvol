@@ -2127,6 +2127,49 @@ mod tests {
         (engine, path)
     }
 
+    fn set_bucket_journal_seq(engine: &StorageEngine, position: bpos, seq: u64) {
+        unsafe {
+            let mut fs = engine.lock_fs().unwrap();
+            let mut alloc = None;
+            for raw in scan_raw_locked(&mut **fs, 4).unwrap() {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == KEY_TYPE_alloc_v4 && (*key).k.p == position {
+                    let value = (key as *const u8)
+                        .add(core::mem::size_of::<bkey>())
+                        .cast::<bch_alloc_v4>();
+                    alloc = Some(core::ptr::read_unaligned(value));
+                    break;
+                }
+            }
+            let mut alloc = alloc.expect("test bucket alloc exists");
+            alloc.journal_seq_empty = seq;
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut **fs);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    position,
+                    KEY_TYPE_alloc_v4,
+                    (&alloc as *const bch_alloc_v4).cast(),
+                    core::mem::size_of::<bch_alloc_v4>(),
+                );
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+        }
+    }
+
     #[test]
     fn transaction_restart_retraverses_before_committing_once() {
         let engine = StorageEngine::new().unwrap();
@@ -2293,6 +2336,20 @@ mod tests {
         assert!(engine.verify_bucket_indexes().is_ok());
         engine.reclaim_bucket(KeyPosition::new(0, 4, 0)).unwrap();
         assert!(engine.verify_bucket_indexes().is_ok());
+        set_bucket_journal_seq(&engine, crate::btree::bkey::POS(0, 4), 2);
+        {
+            let fs = engine.lock_fs().unwrap();
+            fs.journal.last_seq_ondisk.store(1, Ordering::Release);
+        }
+        assert!(matches!(
+            engine.reclaim_bucket(KeyPosition::new(0, 4, 0)),
+            Err(EngineError::Transaction(-11))
+        ));
+        assert!(engine.verify_bucket_indexes().is_ok());
+        {
+            let fs = engine.lock_fs().unwrap();
+            fs.journal.last_seq_ondisk.store(2, Ordering::Release);
+        }
         engine.reclaim_bucket(KeyPosition::new(0, 4, 0)).unwrap();
         assert!(engine.verify_bucket_indexes().is_ok());
         assert_eq!(
