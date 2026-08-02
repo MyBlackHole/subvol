@@ -2004,6 +2004,7 @@ unsafe fn configure_persistent_journal(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use std::{
         collections::BTreeMap,
         fs,
@@ -2033,6 +2034,54 @@ mod tests {
         let offset = JOURNAL_BUCKET_START * JOURNAL_BUCKET_SIZE as u64 * 512;
         assert_eq!(file.write_at(&zeros, offset).unwrap(), zeros.len());
         file.sync_all().unwrap();
+    }
+
+    fn prepared_bucket_engine(label: &str, bucket: u64) -> (StorageEngine, PathBuf) {
+        let path = persistent_test_path(label);
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        unsafe {
+            let mut fs = engine.lock_fs().unwrap();
+            let position = crate::btree::bkey::POS(0, bucket);
+            let alloc = bch_alloc_v4::default();
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut **fs);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    position,
+                    KEY_TYPE_alloc_v4,
+                    (&alloc as *const bch_alloc_v4).cast(),
+                    core::mem::size_of::<bch_alloc_v4>(),
+                );
+                let ret = if ret == 0 {
+                    bch2_btree_bit_mod(
+                        &mut trans,
+                        BTREE_ID_FREESPACE,
+                        alloc_freespace_pos(position, &alloc),
+                        true,
+                    )
+                } else {
+                    ret
+                };
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+        }
+        (engine, path)
     }
 
     #[test]
@@ -2181,51 +2230,7 @@ mod tests {
 
     #[test]
     fn public_bucket_api_runs_allocate_reclaim_and_reuse_sequence() {
-        let path = persistent_test_path("bucket-api");
-        let file = fs::File::create(&path).unwrap();
-        file.set_len(32 * 1024 * 1024).unwrap();
-        drop(file);
-        let engine = StorageEngine::create_persistent(&path).unwrap();
-
-        unsafe {
-            let mut fs = engine.lock_fs().unwrap();
-            let position = crate::btree::bkey::POS(0, 4);
-            let alloc = bch_alloc_v4::default();
-            let mut trans = btree_trans::default();
-            bch2_trans_init(&mut trans, &mut **fs);
-            loop {
-                bch2_trans_begin(&mut trans);
-                let ret = trigger_update_value(
-                    &mut trans,
-                    4,
-                    position,
-                    KEY_TYPE_alloc_v4,
-                    (&alloc as *const bch_alloc_v4).cast(),
-                    core::mem::size_of::<bch_alloc_v4>(),
-                );
-                let ret = if ret == 0 {
-                    bch2_btree_bit_mod(
-                        &mut trans,
-                        BTREE_ID_FREESPACE,
-                        alloc_freespace_pos(position, &alloc),
-                        true,
-                    )
-                } else {
-                    ret
-                };
-                let ret = if ret == 0 {
-                    bch2_trans_commit(&mut trans)
-                } else {
-                    ret
-                };
-                if ret == -12 && trans.realloc_bytes_required != 0 {
-                    continue;
-                }
-                assert_eq!(ret, 0);
-                break;
-            }
-            bch2_trans_put(&mut trans);
-        }
+        let (engine, path) = prepared_bucket_engine("bucket-api", 4);
 
         assert!(matches!(
             engine.allocate_bucket(1),
@@ -2251,6 +2256,46 @@ mod tests {
 
         drop(engine);
         fs::remove_file(path).unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            max_shrink_iters: 64,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn public_bucket_api_operation_model_stays_consistent(
+            operations in prop::collection::vec(0u8..3, 1..=30),
+        ) {
+            let (engine, path) = prepared_bucket_engine("bucket-api-prop", 4);
+            let position = KeyPosition::new(0, 4, 0);
+            let mut state = 0u8; // free, btree-owned, need-discard
+            for operation in operations {
+                match operation {
+                    0 => {
+                        let result = engine.allocate_bucket(0);
+                        if state == 0 {
+                            prop_assert_eq!(result.unwrap(), position);
+                            state = 1;
+                        } else {
+                            prop_assert!(result.is_err());
+                        }
+                    }
+                    1 => {
+                        prop_assert!(engine.reclaim_bucket(position).is_ok());
+                        state = if state == 2 { 0 } else { 2 };
+                    }
+                    _ => {
+                        prop_assert!(engine.reclaim_bucket(KeyPosition::new(0, 8, 0)).is_err());
+                    }
+                }
+                prop_assert!(engine.verify_bucket_indexes().is_ok());
+            }
+            drop(engine);
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
