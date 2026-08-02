@@ -3384,6 +3384,39 @@ mod tests {
             );
             bch2_trans_iter_exit(&mut iter);
             bch2_trans_put(&mut verify);
+
+            let mut owned = alloc;
+            owned.data_type = 3;
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut c);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    bucket,
+                    crate::btree::bset::KEY_TYPE_alloc_v4,
+                    (&owned as *const crate::btree::bset::bch_alloc_v4).cast(),
+                    core::mem::size_of::<crate::btree::bset::bch_alloc_v4>(),
+                );
+                let ret = if ret == 0 {
+                    bch2_btree_bit_mod(&mut trans, 5, bucket, false)
+                } else {
+                    ret
+                };
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+
             bch2_free_super(&mut c.disk_sb);
         }
     }
