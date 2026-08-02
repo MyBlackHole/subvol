@@ -691,6 +691,10 @@ impl StorageEngine {
                      * need_discard; discard.c performs the later free
                      * transition after the device-side discard boundary. */
                     alloc.data_type = BCH_DATA_NEED_DISCARD;
+                    if alloc.oldest_gen == alloc.gen {
+                        alloc.oldest_gen = alloc.oldest_gen.wrapping_add(1);
+                    }
+                    alloc.gen = alloc.gen.wrapping_add(1);
                 } else {
                     alloc.data_type = BCH_DATA_FREE;
                 }
