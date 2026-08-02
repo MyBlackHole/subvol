@@ -729,6 +729,47 @@ impl StorageEngine {
         }
     }
 
+    /// Runs every consistency check in dependency order, mirroring the
+    /// recovery pass driver executing each pass in sequence while keeping
+    /// the first error (`__bch2_run_explicit_recovery_pass(...) ?: ret`,
+    /// recovery.c:68-98): every check runs, the first error wins.  Order:
+    /// topology (verify) -> derived pointers (verify_derived_state) ->
+    /// bucket indexes (verify_bucket_indexes) -> guard invariants
+    /// (verify_guard_invariants).
+    pub fn verify_all(&self) -> Result<(), EngineError> {
+        let live_btrees = {
+            let fs = self.lock_fs()?;
+            let mut ids = Vec::new();
+            unsafe {
+                for id in 0..BTREE_ID_NR {
+                    if !bch2_btree_id_root_b(&**fs, id).is_null() {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids
+        };
+        let mut first_err = None;
+        for id in live_btrees {
+            if let Err(err) = self.verify(BtreeId::new(id as u8).expect("id in BTREE_ID_NR")) {
+                first_err.get_or_insert(err);
+            }
+        }
+        for check in [
+            Self::verify_derived_state,
+            Self::verify_bucket_indexes,
+            Self::verify_guard_invariants,
+        ] {
+            if let Err(err) = check(self) {
+                first_err.get_or_insert(err);
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
     /// Queries the number of currently open buckets, the engine-local
     /// counterpart of the bch2_open_buckets_stop() close-all-on-umount
     /// invariant (fs.c:324, foreground.c:1171-1230): a caller may check
@@ -2807,9 +2848,9 @@ mod tests {
             engine.discard_bucket(KeyPosition::new(0, 4, 0)),
             Err(EngineError::Transaction(-11))
         ));
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         engine.reclaim_bucket(KeyPosition::new(0, 4, 0)).unwrap();
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         set_need_discard_index(&engine, crate::btree::bkey::POS(0, 4), false);
         assert!(matches!(
             engine.verify_bucket_indexes(),
@@ -2818,7 +2859,7 @@ mod tests {
             ))
         ));
         set_need_discard_index(&engine, crate::btree::bkey::POS(0, 4), true);
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         set_bucket_sectors(&engine, crate::btree::bkey::POS(0, 4), 1, 0);
         assert!(matches!(
             engine.reclaim_bucket(KeyPosition::new(0, 4, 0)),
@@ -2834,13 +2875,13 @@ mod tests {
             engine.discard_bucket(KeyPosition::new(0, 4, 0)),
             Err(EngineError::Transaction(-11))
         ));
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         {
             let fs = engine.lock_fs().unwrap();
             fs.journal.last_seq_ondisk.store(2, Ordering::Release);
         }
         engine.discard_bucket(KeyPosition::new(0, 4, 0)).unwrap();
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         assert_eq!(
             engine.allocate_bucket(0).unwrap(),
             KeyPosition::new(0, 4, 0)
@@ -2848,11 +2889,11 @@ mod tests {
 
         engine.inject_fault(FaultPoint::JournalWrite, 1).unwrap();
         assert!(engine.flush_journal().is_err());
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         engine.flush_journal().unwrap();
         drop(engine);
         let recovered = StorageEngine::open_persistent(&path).unwrap();
-        assert!(recovered.verify_bucket_indexes().is_ok());
+        assert!(recovered.verify_all().is_ok());
 
         drop(recovered);
         fs::remove_file(path).unwrap();
@@ -2878,7 +2919,7 @@ mod tests {
         engine.allocate_bucket(0).unwrap();
         engine.reclaim_bucket(position).unwrap();
         engine.run_discard_worker_once().unwrap();
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         drop(engine);
         fs::remove_file(path).unwrap();
     }
@@ -2911,7 +2952,7 @@ mod tests {
             worker.join().unwrap();
         }
         engine.run_discard_worker().unwrap();
-        engine.verify_bucket_indexes().unwrap();
+        engine.verify_all().unwrap();
         for position in &positions {
             assert!(
                 engine.queue_discard_bucket(*position).is_ok(),
@@ -2965,11 +3006,74 @@ mod tests {
     }
 
     #[test]
+    fn verify_all_returns_first_error_and_runs_every_check() {
+        let (engine, path) = prepared_bucket_engine("verify-all", 4);
+        add_free_bucket(&engine, 5);
+        assert!(engine.verify_all().is_ok());
+        let position = KeyPosition::new(0, 5, 0);
+        engine.open_bucket(position).unwrap();
+        assert!(matches!(
+            engine.verify_all(),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::OpenBucketFree
+            ))
+        ));
+        engine.close_open_bucket(position).unwrap();
+        assert!(engine.verify_all().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verify_all_keeps_first_error_when_multiple_checks_fail() {
+        let (engine, path) = prepared_bucket_engine("verify-all-first", 4);
+        add_free_bucket(&engine, 5);
+        let position = KeyPosition::new(0, 5, 0);
+        set_need_discard_index(&engine, position.raw(), true);
+        engine.open_bucket(position).unwrap();
+        assert!(matches!(
+            engine.verify_all(),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::NeedDiscardSet
+            ))
+        ));
+        engine.close_open_bucket(position).unwrap();
+        set_need_discard_index(&engine, position.raw(), false);
+        assert!(engine.verify_all().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verify_all_runs_later_checks_after_an_early_failure() {
+        let (engine, path) = prepared_bucket_engine("verify-all-continue", 4);
+        add_free_bucket(&engine, 5);
+        let position = KeyPosition::new(0, 5, 0);
+        set_need_discard_index(&engine, position.raw(), true);
+        engine.open_bucket(position).unwrap();
+        let result = engine.verify_all();
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::DerivedState(
+                    DerivedStateMismatch::NeedDiscardSet
+                ))
+            ),
+            "bucket index check precedes the guard check and must win"
+        );
+        engine.close_open_bucket(position).unwrap();
+        set_need_discard_index(&engine, position.raw(), false);
+        assert!(engine.verify_all().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn verify_guard_invariants_rejects_open_free_bucket() {
         let (engine, path) = prepared_bucket_engine("guard-open-free", 4);
         add_free_bucket(&engine, 5);
         let position = KeyPosition::new(0, 5, 0);
-        assert!(engine.verify_guard_invariants().is_ok());
+        assert!(engine.verify_all().is_ok());
         engine.open_bucket(position).unwrap();
         assert!(matches!(
             engine.verify_guard_invariants(),
@@ -2978,7 +3082,7 @@ mod tests {
             ))
         ));
         engine.close_open_bucket(position).unwrap();
-        assert!(engine.verify_guard_invariants().is_ok());
+        assert!(engine.verify_all().is_ok());
         drop(engine);
         fs::remove_file(path).unwrap();
     }
@@ -2987,7 +3091,7 @@ mod tests {
     fn verify_guard_invariants_rejects_notrw_free_bucket() {
         let (engine, path) = prepared_bucket_engine("guard-notrw-free", 4);
         add_free_bucket(&engine, 5);
-        assert!(engine.verify_guard_invariants().is_ok());
+        assert!(engine.verify_all().is_ok());
         engine.set_device_rw(0, false).unwrap();
         assert!(matches!(
             engine.verify_guard_invariants(),
@@ -2996,7 +3100,7 @@ mod tests {
             ))
         ));
         engine.set_device_rw(0, true).unwrap();
-        assert!(engine.verify_guard_invariants().is_ok());
+        assert!(engine.verify_all().is_ok());
         drop(engine);
         fs::remove_file(path).unwrap();
     }
@@ -3017,7 +3121,7 @@ mod tests {
         assert!(!engine.discard_queue_empty().unwrap());
         engine.run_discard_worker().unwrap();
         assert!(engine.discard_queue_empty().unwrap());
-        assert!(engine.verify_guard_invariants().is_ok());
+        assert!(engine.verify_all().is_ok());
         drop(engine);
         fs::remove_file(path).unwrap();
     }
@@ -3036,10 +3140,10 @@ mod tests {
             engine.discard_bucket(position),
             Err(EngineError::Transaction(-11))
         ));
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         engine.close_open_bucket(position).unwrap();
         engine.reclaim_bucket(position).unwrap();
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         drop(engine);
         fs::remove_file(path).unwrap();
     }
@@ -3054,7 +3158,7 @@ mod tests {
             engine.set_device_rw(0, false),
             Err(EngineError::Transaction(-16))
         ));
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         engine.close_open_bucket(position).unwrap();
         engine.set_device_rw(0, false).unwrap();
         assert!(matches!(
@@ -3064,7 +3168,7 @@ mod tests {
         engine.set_device_rw(0, true).unwrap();
         engine.reclaim_bucket(position).unwrap();
         engine.discard_bucket(position).unwrap();
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         drop(engine);
         fs::remove_file(path).unwrap();
     }
@@ -3107,7 +3211,7 @@ mod tests {
         assert_eq!(position.inode, 0);
         engine.close_open_bucket(position).unwrap();
         engine.reclaim_bucket(position).unwrap();
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         drop(engine);
         fs::remove_file(path).unwrap();
     }
@@ -3150,7 +3254,7 @@ mod tests {
         engine.close_open_bucket(position).unwrap();
         drop(engine);
         let recovered = StorageEngine::open_persistent(&path).unwrap();
-        assert!(recovered.verify_bucket_indexes().is_ok());
+        assert!(recovered.verify_all().is_ok());
         drop(recovered);
         fs::remove_file(path).unwrap();
     }
@@ -3164,16 +3268,16 @@ mod tests {
             .inject_fault(FaultPoint::TransactionRestart, 1)
             .unwrap();
         assert!(engine.reclaim_bucket(position).is_ok());
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         engine.inject_fault(FaultPoint::JournalWrite, 1).unwrap();
         assert!(engine.flush_journal().is_err());
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         engine.flush_journal().unwrap();
         assert!(engine.discard_bucket(position).is_ok());
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         drop(engine);
         let recovered = StorageEngine::open_persistent(&path).unwrap();
-        assert!(recovered.verify_bucket_indexes().is_ok());
+        assert!(recovered.verify_all().is_ok());
         drop(recovered);
         fs::remove_file(path).unwrap();
     }
@@ -3203,7 +3307,7 @@ mod tests {
         );
         engine.close_open_bucket(open).unwrap();
         assert!(engine.run_discard_worker().is_ok());
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         assert!(
             engine.discard_queue_empty().unwrap(),
             "worker Ok implies drained queue"
@@ -3231,7 +3335,7 @@ mod tests {
         ));
         engine.set_device_rw(0, true).unwrap();
         assert!(engine.run_discard_worker().is_ok());
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         assert!(
             engine.discard_queue_empty().unwrap(),
             "worker Ok implies drained queue"
@@ -3262,7 +3366,7 @@ mod tests {
         assert!(engine.verify_bucket_indexes().is_ok());
         engine.set_device_rw(0, true).unwrap();
         engine.discard_bucket(position).unwrap();
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         drop(engine);
         fs::remove_file(path).unwrap();
     }
@@ -3281,7 +3385,7 @@ mod tests {
             positions.push(position);
         }
         engine.run_discard_worker().unwrap();
-        engine.verify_bucket_indexes().unwrap();
+        engine.verify_all().unwrap();
         for position in &positions {
             assert!(
                 engine.queue_discard_bucket(*position).is_ok(),
@@ -3315,7 +3419,7 @@ mod tests {
         engine.allocate_bucket(0).unwrap();
         engine.reclaim_bucket(not_ready).unwrap();
         assert!(engine.run_discard_worker().is_ok());
-        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.verify_all().is_ok());
         assert!(
             engine.discard_queue_empty().unwrap(),
             "worker Ok implies drained queue"
@@ -3342,7 +3446,7 @@ mod tests {
         let recovered = StorageEngine::open_persistent(&path).unwrap();
         assert_eq!(recovered.discover_discard_buckets().unwrap(), 1);
         recovered.run_discard_worker_once().unwrap();
-        assert!(recovered.verify_bucket_indexes().is_ok());
+        assert!(recovered.verify_all().is_ok());
         drop(recovered);
         fs::remove_file(path).unwrap();
     }
@@ -3504,7 +3608,7 @@ mod tests {
                     }
                     _ => {}
                 }
-                prop_assert!(engine.verify_bucket_indexes().is_ok());
+                prop_assert!(engine.verify_all().is_ok());
                 let mut fs = engine.lock_fs().unwrap();
                 for index in 0..4 {
                     let mut alloc = None;
@@ -3673,7 +3777,7 @@ mod tests {
                     }
                     _ => {}
                 }
-                prop_assert!(engine.verify_bucket_indexes().is_ok());
+                prop_assert!(engine.verify_all().is_ok());
             }
             drop(engine);
             fs::remove_file(path).unwrap();
