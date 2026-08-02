@@ -3478,6 +3478,16 @@ mod tests {
             }
             bch2_trans_put(&mut trans);
 
+            let mut stale = btree_trans::default();
+            bch2_trans_init(&mut stale, &mut c);
+            bch2_trans_begin(&mut stale);
+            assert_eq!(
+                stage_extent_pointer(&mut stale, SPOS(21, 77, 0), 35, 7, 3, 0),
+                0
+            );
+            assert_eq!(bch2_trans_commit(&mut stale), -1);
+            bch2_trans_put(&mut stale);
+
             bch2_free_super(&mut c.disk_sb);
         }
     }
