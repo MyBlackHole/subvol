@@ -5002,35 +5002,88 @@ mod tests {
                 engine.put_sync(BtreeId::DEFAULT, key(704, &[4])).unwrap();
             }
             "cc-flush-before" => {
-                concurrent_crash_child(Arc::new(engine), Path::new(&ready), "cc-flush-before");
+                concurrent_crash_child(Arc::new(engine.clone()), "cc-flush-before");
             }
             "cc-flush-after" => {
-                concurrent_crash_child(Arc::new(engine), Path::new(&ready), "cc-flush-after");
+                concurrent_crash_child(Arc::new(engine.clone()), "cc-flush-after");
             }
             "cc-mid-write" => {
-                concurrent_crash_child(Arc::new(engine), Path::new(&ready), "cc-mid-write");
+                concurrent_crash_child(Arc::new(engine.clone()), "cc-mid-write");
+            }
+            "cc-single-put" => {
+                /* deterministic unflushed crash point: a JournalWrite
+                 * fault is armed so even a background-reclaim flush fails
+                 * before any write; the record then provably never
+                 * reaches disk (T0196 fault-matrix pattern, engine-local
+                 * — the recovered image opens without the fault) */
+                engine.inject_fault(FaultPoint::JournalWrite, 20).unwrap();
+                let k = BtreeKey::new(KeyPosition::new(9, 1, 0), vec![9]);
+                engine.put(BtreeId::DEFAULT, k.unwrap()).unwrap();
             }
             _ => panic!("unknown crash phase {phase}"),
         }
+        let journal_diag = {
+            let fs = engine.inner.fs.lock().unwrap();
+            let j = &fs.journal;
+            let space = j.space.lock().unwrap();
+            let ja = j.device.lock().unwrap();
+            /* 崩溃点诊断：SUBVOL_LOG=info 时打印 abort 前的 journal 状态，
+             * 供人工审计。cc-single-put/cc-flush-before 注入 JournalWrite
+             * 故障后 seq_ondisk 应保持 0（无任何记录落盘），flush-after
+             * 应等于已提交 seq；cc-mid-write 无注入，后台 reclaim 可能已
+             * 落盘部分记录，seq_ondisk 介于 0 与已提交 seq 之间。空间
+             * 字段用裸索引（space[2]=journal_space_clean、
+             * space[3]=journal_space_total，见 journal.rs
+             * journal_space_from）。 */
+            format!(
+                "seq_ondisk={} last_seq_ondisk={} closed={} watermark={} cur_entry_u64s={} pin={} med={} low={} seq={} clean_total={} clean_next={} total_total={} nr_direct_reclaim={} ja_nr={} ja_sectors_free={} ja_cur={} ja_dirty_idx={} ja_dirty_idx_ondisk={}",
+                j.seq_ondisk.load(Ordering::Acquire),
+                j.last_seq_ondisk.load(Ordering::Acquire),
+                j.closed.lock().unwrap().len(),
+                j.watermark.load(Ordering::Acquire),
+                j.cur_entry_u64s.load(Ordering::Acquire),
+                j.pin.lock().unwrap().1.len(),
+                journal_med_on_space(j),
+                journal_low_on_space(j),
+                j.seq.load(Ordering::Acquire),
+                space[2].total,
+                space[2].next_entry,
+                space[3].total,
+                j.nr_direct_reclaim.load(Ordering::Acquire),
+                ja.nr, ja.sectors_free, ja.cur_idx, ja.dirty_idx, ja.dirty_idx_ondisk,
+            )
+        };
+        crate::rewrite_log_info!("[crash-child {phase}] journal: {journal_diag}");
         fs::write(ready, b"durable-before-abort").unwrap();
         std::process::abort();
     }
 
     /// T0201: concurrent writers (btree put + alloc mix) with a one-shot
     /// restart injection, then the caller aborts at the chosen crash
-    /// point.  The crash point is synchronized by `ready`:
-    /// - cc-flush-before: all writers finish their rounds, the process
-    ///   aborts before any flush — the journal holds unflushed
+    /// point.  The crash point is selected by `mode`:
+    /// - cc-flush-before: a JournalWrite fault is armed (every flush
+    ///   fails before any write, exactly like T0196's fault matrix), then
+    ///   all writers finish their rounds and the process aborts before
+    ///   any flush — the journal provably holds only in-memory
     ///   transaction records that recovery must drop (journal replay only
-    ///   re-applies durable records).
+    ///   re-applies durable records).  The fault is engine-local, so the
+    ///   recovered image opens without it.
     /// - cc-flush-after: all writers finish and the journal is flushed
     ///   before the abort — every committed transaction is durable and
     ///   must survive recovery.
-    /// - cc-mid-write: the main thread returns after the first round's
-    ///   barrier slack without joining the writers, so the abort lands
-    ///   while writers are still mid-round; some transactions are
-    ///   unflushed and must be dropped, the rest must survive.
-    fn concurrent_crash_child(engine: Arc<StorageEngine>, ready: &Path, mode: &str) {
+    /// - cc-mid-write: no fault is armed (real crash timing), the main
+    ///   thread returns after the first round's barrier slack without
+    ///   joining the writers, so the abort lands while writers are still
+    ///   mid-round; some transactions are unflushed and must be dropped,
+    ///   the rest may have been flushed by background reclaim and
+    ///   survive.
+    fn concurrent_crash_child(engine: Arc<StorageEngine>, mode: &str) {
+        if mode == "cc-flush-before" {
+            /* every background-reclaim flush attempt fails before any
+             * write lands, so no committed transaction can become durable
+             * between the writers' commits and the abort */
+            engine.inject_fault(FaultPoint::JournalWrite, 20).unwrap();
+        }
         /* 4 free buckets (4..=7) so the 4 writers' start barrier allocates
          * one bucket each without contention, then recycles (T0199 pattern) */
         for offset in 4..=7 {
@@ -5144,14 +5197,38 @@ mod tests {
     #[test]
     fn persistent_concurrent_crash_recovery_converges() {
         /* T0201: concurrent writers + deterministic crash point + recovery.
-         * Each crash point must recover to a consistent image: replay only
+         * Every crash point must recover to a consistent image: replay only
          * re-applies durable journal records (unflushed transactions are
          * dropped), derived state rebuilds from the alloc tree, verify_all
          * passes, no open-bucket leak, and the btree keys are readable.
-         * flush-after additionally asserts every committed key survives;
-         * flush-before / mid-write assert only eventual consistency (some
-         * transactions were unflushed and must be dropped). */
-        for phase in ["cc-flush-before", "cc-flush-after", "cc-mid-write"] {
+         *
+         * Deterministic durability boundaries:
+         * - cc-single-put: a JournalWrite fault is armed (every flush
+         *   fails before any write, T0196 pattern), one non-sync put
+         *   commits, then an immediate abort — the journal provably holds
+         *   only an in-memory record (never flushed), so recovery must
+         *   drop it.
+         * - cc-flush-before: the JournalWrite fault is armed before the
+         *   writers start, all 4 writers finish their 3 rounds (12
+         *   committed transactions), then an immediate abort with no
+         *   flush — every committed transaction is unflushed, so recovery
+         *   must drop all 12.
+         * - cc-flush-after: all writers finish and the journal is flushed
+         *   before the abort — every committed transaction is durable, so
+         *   all 12 writer keys survive.
+         *
+         * cc-mid-write arms no fault (real crash timing): the abort lands
+         * mid-round and background reclaim may have flushed any subset of
+         * the committed transactions.  Exactly like bcachefs's background
+         * journal reclaim, which records survive is nondeterministic —
+         * assert only final consistency (T0199 principle: never assert
+         * arrival order or a specific survivor set). */
+        for phase in [
+            "cc-single-put",
+            "cc-flush-before",
+            "cc-flush-after",
+            "cc-mid-write",
+        ] {
             let path = persistent_test_path(&format!("concurrent-crash-{phase}"));
             run_crash_child(&path, phase);
             let recovered = StorageEngine::open_persistent(&path).unwrap();
@@ -5161,10 +5238,51 @@ mod tests {
             assert!(keys
                 .windows(2)
                 .all(|pair| pair[0].position() < pair[1].position()));
-            if phase == "cc-flush-after" {
-                /* flush-after: every committed transaction is durable, so
-                 * all 12 writer keys (4 writers x 3 rounds) survive */
-                assert_eq!(keys.len(), 12);
+            match phase {
+                "cc-single-put" => {
+                    /* JournalWrite fault armed: the journal record was
+                     * never written to disk, so recovery drops the
+                     * transaction — journal replay re-applies only durable
+                     * records */
+                    assert!(
+                        keys.is_empty(),
+                        "cc-single-put: {} keys survived (expected 0): {:?}",
+                        keys.len(),
+                        keys.iter().map(|k| k.position()).collect::<Vec<_>>()
+                    );
+                }
+                "cc-flush-before" => {
+                    /* JournalWrite fault armed: all 12 committed
+                     * transactions stayed in-memory, so recovery must
+                     * drop all of them (journal replay re-applies only
+                     * durable records) */
+                    assert!(
+                        keys.is_empty(),
+                        "cc-flush-before: {} keys survived (expected 0): {:?}",
+                        keys.len(),
+                        keys.iter().map(|k| k.position()).collect::<Vec<_>>()
+                    );
+                }
+                "cc-flush-after" => {
+                    /* flush-after: every committed transaction is durable,
+                     * so all 12 writer keys survive */
+                    assert_eq!(keys.len(), 12);
+                }
+                "cc-mid-write" => {
+                    /* background reclaim may have flushed any subset of
+                     * the committed transactions before the abort; assert
+                     * only that the survivor set is a subset of the 12
+                     * writer keys (positions writer+1/round+1 for writer
+                     * in 0..4, round in 0..3) and the image is consistent */
+                    for key in &keys {
+                        let pos = key.position();
+                        assert!(
+                            pos.inode >= 1 && pos.inode <= 4 && pos.offset >= 1 && pos.offset <= 3,
+                            "unexpected key outside writer rounds: {pos:?}"
+                        );
+                    }
+                }
+                _ => unreachable!("unknown phase {phase}"),
             }
             drop(recovered);
             fs::remove_file(path).unwrap();
