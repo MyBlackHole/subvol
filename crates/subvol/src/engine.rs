@@ -3480,6 +3480,26 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn discard_worker_drained_persistent_image_reopens_verified() {
+        let (engine, path) = prepared_bucket_engine("discard-reopen-verify", 4);
+        let position = KeyPosition::new(0, 4, 0);
+        engine.allocate_bucket(0).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        engine.queue_discard_bucket(position).unwrap();
+        engine.run_discard_worker().unwrap();
+        assert!(engine.discard_queue_empty().unwrap());
+        assert!(engine.verify_all().is_ok());
+        engine.flush_journal().unwrap();
+        drop(engine);
+
+        let reopened = StorageEngine::open_persistent(&path).unwrap();
+        assert!(reopened.verify_all().is_ok());
+        assert!(reopened.discard_queue_empty().unwrap());
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 16,
@@ -4020,6 +4040,28 @@ mod tests {
             engine.scan(BtreeId::DEFAULT).unwrap(),
             vec![key(410, &[1]), key(411, &[2, 3])]
         );
+    }
+
+    #[test]
+    fn background_reclaim_checkpoint_preserves_verified_state() {
+        let (engine, path) = prepared_bucket_engine("reclaim-verify", 4);
+        engine.put_sync(BtreeId::DEFAULT, key(420, &[1])).unwrap();
+        let requested = engine.request_reclaim().unwrap();
+        let status = engine.wait_for_reclaim(Duration::from_secs(1)).unwrap();
+        assert!(status.completed >= requested);
+        assert_eq!(status.last_error, None);
+        assert!(engine.verify_all().is_ok());
+        engine.flush_journal().unwrap();
+        drop(engine);
+
+        let reopened = StorageEngine::open_persistent(&path).unwrap();
+        assert!(reopened.verify_all().is_ok());
+        assert_eq!(
+            reopened.scan(BtreeId::DEFAULT).unwrap(),
+            vec![key(420, &[1])]
+        );
+        drop(reopened);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
