@@ -158,6 +158,10 @@ pub enum FaultPoint {
     TransactionRestart,
     /// A journal write failure before record publication or sequence advance.
     JournalWrite,
+    /// A restart injected at the discard worker's per-bucket transaction
+    /// commit boundary (discard.c:598-657 fast_work: every bucket is its
+    /// own btree transaction, commit.c:1390 injection point).
+    DiscardCommitRestart,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -834,6 +838,7 @@ impl StorageEngine {
                     continue;
                 }
                 let bucket_offset = (*key).k.p.offset;
+                let bucket_offset = (*key).k.p.offset;
                 if bucket_offset < member.first_bucket as u64 || bucket_offset >= member.nbuckets {
                     continue;
                 }
@@ -893,8 +898,7 @@ impl StorageEngine {
         }
     }
 
-    /// Marks a bucket as open, mirroring an in-progress write claim in the
-    /// open_buckets hash (foreground.h:274-296).  While open, the bucket is
+    /// Marks a bucket as open, mirroring an in-progress write claim in the    /// open_buckets hash (foreground.h:274-296).  While open, the bucket is
     /// protected from reclamation: reclaim and discard both refuse it, like
     /// bch2_bucket_is_open_safe() skipping open buckets in the discard path
     /// (discard.c:344-347, 433-436).
@@ -1467,6 +1471,9 @@ impl StorageEngine {
             FaultPoint::JournalWrite => fs
                 .journal
                 .fault_inject_write_error
+                .store(count, Ordering::Release),
+            FaultPoint::DiscardCommitRestart => fs
+                .fault_inject_discard_restarts
                 .store(count, Ordering::Release),
         }
         Ok(())
@@ -2557,7 +2564,22 @@ unsafe fn bit_mod_sync(
         bch2_trans_begin(&mut trans);
         let ret = bch2_btree_bit_mod(&mut trans, btree, position, set);
         let ret = if ret == 0 {
-            bch2_trans_commit(&mut trans)
+            if fs
+                .fault_inject_discard_restarts
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+            {
+                /* T0199: per-bucket restart injection at the
+                 * discard transaction commit boundary, the
+                 * trans_maybe_inject_restart position
+                 * (commit.c:1390); -4 rides the existing
+                 * bch2_trans_begin retry loop below. */
+                -4
+            } else {
+                bch2_trans_commit(&mut trans)
+            }
         } else {
             ret
         };
@@ -4593,6 +4615,177 @@ mod tests {
                 }
             }));
         }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        engine.sync().unwrap();
+        assert_eq!(engine.scan(BtreeId::DEFAULT).unwrap().len(), 96);
+        engine.verify(BtreeId::DEFAULT).unwrap();
+    }
+
+    #[test]
+    fn discard_commit_restart_injected_worker_retries_and_drains() {
+        /* T0199: DiscardCommitRestart 注入命中 discard 路径的每桶
+         * 事务提交边界（discard.c:598-657 fast_work 每桶一事务，
+         * commit.c:1390 注入位置），-4 走既有 bch2_trans_begin 重试
+         * 循环，最终队列排空且桶全部 freed。 */
+        let (engine, path) = prepared_bucket_engine("interleave-inject", 4);
+        for offset in 5..=7 {
+            add_free_bucket(&engine, offset);
+        }
+        let mut positions = Vec::new();
+        for _ in 0..4 {
+            let position = engine.allocate_bucket(0).unwrap();
+            engine.reclaim_bucket(position).unwrap();
+            engine.queue_discard_bucket(position).unwrap();
+            positions.push(position);
+        }
+        engine
+            .inject_fault(FaultPoint::DiscardCommitRestart, 6)
+            .unwrap();
+        engine.run_discard_worker().unwrap();
+        engine.verify_all().unwrap();
+        for position in &positions {
+            assert!(
+                engine.queue_discard_bucket(*position).is_ok(),
+                "queue should be drained: {position:?}"
+            );
+        }
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writers_with_restart_injection_converge() {
+        /* T0199 写者×写者：4 线程 Barrier 起跑并发 allocate/reclaim
+         * 争用全局 fs 锁 + 共享 TransactionRestart 注入计数（谁先消费
+         * 谁重启），断言只依赖最终一致：全部成功 + 派生树一致 + 无
+         * 桶泄漏（对齐上游：并发下只保证最终一致，不保证到达顺序）。
+         * 持久化几何固定 8 桶（8MB / 1MB 桶），可用 free 桶 4..=7；每轮
+         * allocate 后二次 reclaim 归还 freespace（NEED_DISCARD→FREE +
+         * freespace 补键，engine.rs:1043-1049），4 桶循环复用。 */
+        let (engine, path) = prepared_bucket_engine("interleave-writers", 4);
+        for offset in 5..=7 {
+            add_free_bucket(&engine, offset);
+        }
+        let engine = Arc::new(engine);
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..6 {
+                    let position = engine.allocate_bucket(0).unwrap();
+                    engine.reclaim_bucket(position).unwrap();
+                    engine.reclaim_bucket(position).unwrap();
+                }
+            }));
+        }
+        engine
+            .inject_fault(FaultPoint::TransactionRestart, 12)
+            .unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        engine.verify_all().unwrap();
+        engine
+            .inject_fault(FaultPoint::TransactionRestart, 0)
+            .unwrap();
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_producers_and_discard_worker_with_injection_drain() {
+        /* T0199 写者×worker：生产者线程并发入队（FIFO，对齐
+         * bch2_fast_discard_bucket_add discard.c:643），主线程
+         * run_discard_worker 并发排空 + DiscardCommitRestart 注入；
+         * 断言只依赖最终一致：队列最终空 + 树一致 + 桶可重新入队。
+         * 桶 4..=7 循环：discard 归还 freespace 后下一轮重新 reclaim。 */
+        let (engine, path) = prepared_bucket_engine("interleave-producer", 4);
+        for offset in 5..=7 {
+            add_free_bucket(&engine, offset);
+        }
+        let buckets = [4u64, 5, 6, 7];
+        let engine = Arc::new(engine);
+        for _round in 0..3 {
+            for bucket in buckets {
+                let position = engine.allocate_bucket(0).unwrap();
+                engine.reclaim_bucket(position).unwrap();
+                assert_eq!(position.offset, bucket);
+            }
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let mut workers = Vec::new();
+            for bucket in buckets {
+                let engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+                workers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    engine
+                        .queue_discard_bucket(KeyPosition::new(0, bucket, 0))
+                        .unwrap();
+                }));
+            }
+            barrier.wait();
+            engine
+                .inject_fault(FaultPoint::DiscardCommitRestart, 2)
+                .unwrap();
+            engine.run_discard_worker().unwrap();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            engine.run_discard_worker().unwrap();
+            let pending = engine.inner.discard_inflight.lock().unwrap().0.len();
+            assert_eq!(pending, 0, "queue should be fully drained");
+        }
+        engine.verify_all().unwrap();
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rcu_readers_with_writer_restart_injection_keep_order() {
+        /* T0199 RCU 读者×写者：读者（RCU read guard，不持 fs 锁）与
+         * 写者并发，写者事务注入 TransactionRestart；读者每次 scan
+         * 必须有序（读一致快照），最终 96 键全部落盘且 verify 通过。 */
+        let engine = Arc::new(StorageEngine::new().unwrap());
+        let mut workers = Vec::new();
+        for writer in 0..4u64 {
+            let engine = Arc::clone(&engine);
+            workers.push(std::thread::spawn(move || {
+                for offset in 0..24u64 {
+                    engine
+                        .put(
+                            BtreeId::DEFAULT,
+                            BtreeKey::new(
+                                KeyPosition::new(writer + 1, offset + 1, 0),
+                                vec![writer, offset],
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                }
+                engine.sync().unwrap();
+            }));
+        }
+        for _ in 0..3 {
+            let engine = Arc::clone(&engine);
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..32 {
+                    let reader = engine.read_transaction();
+                    let keys = reader.scan(BtreeId::DEFAULT).unwrap();
+                    assert!(keys
+                        .windows(2)
+                        .all(|pair| pair[0].position() < pair[1].position()));
+                }
+            }));
+        }
+        engine
+            .inject_fault(FaultPoint::TransactionRestart, 24)
+            .unwrap();
         for worker in workers {
             worker.join().unwrap();
         }

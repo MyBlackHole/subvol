@@ -503,6 +503,12 @@ pub struct bch_fs {
      * same transaction-local restart protocol as the normal commit path.
      */
     pub fault_inject_transaction_restarts: AtomicU32,
+    /* T0199: per-path restart injection for the discard worker's
+     * bucket transactions (discard.c fast_work per-bucket trans,
+     * commit.c:1390 injection point).  Kept separate from the
+     * generic counter so tests can inject into the discard path
+     * without perturbing user transactions. */
+    pub fault_inject_discard_restarts: AtomicU32,
     pub devs_online: crate::btree::bset::bch_devs_mask,
     pub disk_sb: crate::sb::bch_sb_handle,
     pub btree: bch_fs_btree,
