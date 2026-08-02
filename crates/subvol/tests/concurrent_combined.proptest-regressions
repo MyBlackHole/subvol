@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e26cfe1d0fc9d1d7878adb5a9fddf16f00e7e135b7d28ababa26427640e480f3 # shrinks to plan = [[Delete(3, 19, 2), Allocate, Allocate, Reclaim(0), Reclaim(0), Allocate, Allocate, RunOnce, Put(3, 24, 0, [3015345243859949178, 10785443318847364397]), RunOnce, Put(1, 4, 0, [18324131955058493822])], [Queue(0), Queue(0), RunOnce, RunOnce, Delete(3, 9, 0), Reclaim(0), Allocate, Delete(3, 17, 2)], [RunOnce, Allocate, Allocate, RunOnce, Reclaim(0), RunOnce, Allocate, RunOnce, RunOnce]]
