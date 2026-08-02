@@ -2170,6 +2170,50 @@ mod tests {
         }
     }
 
+    fn set_bucket_sectors(engine: &StorageEngine, position: bpos, dirty: u32, cached: u32) {
+        unsafe {
+            let mut fs = engine.lock_fs().unwrap();
+            let mut alloc = None;
+            for raw in scan_raw_locked(&mut **fs, 4).unwrap() {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == KEY_TYPE_alloc_v4 && (*key).k.p == position {
+                    let value = (key as *const u8)
+                        .add(core::mem::size_of::<bkey>())
+                        .cast::<bch_alloc_v4>();
+                    alloc = Some(core::ptr::read_unaligned(value));
+                    break;
+                }
+            }
+            let mut alloc = alloc.expect("test bucket alloc exists");
+            alloc.dirty_sectors = dirty;
+            alloc.cached_sectors = cached;
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut **fs);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    position,
+                    KEY_TYPE_alloc_v4,
+                    (&alloc as *const bch_alloc_v4).cast(),
+                    core::mem::size_of::<bch_alloc_v4>(),
+                );
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+        }
+    }
+
     fn set_need_discard_index(engine: &StorageEngine, position: bpos, set: bool) {
         unsafe {
             let mut fs = engine.lock_fs().unwrap();
@@ -2368,6 +2412,12 @@ mod tests {
         ));
         set_need_discard_index(&engine, crate::btree::bkey::POS(0, 4), true);
         assert!(engine.verify_bucket_indexes().is_ok());
+        set_bucket_sectors(&engine, crate::btree::bkey::POS(0, 4), 1, 0);
+        assert!(matches!(
+            engine.reclaim_bucket(KeyPosition::new(0, 4, 0)),
+            Err(EngineError::Transaction(-16))
+        ));
+        set_bucket_sectors(&engine, crate::btree::bkey::POS(0, 4), 0, 0);
         set_bucket_journal_seq(&engine, crate::btree::bkey::POS(0, 4), 2);
         {
             let fs = engine.lock_fs().unwrap();
