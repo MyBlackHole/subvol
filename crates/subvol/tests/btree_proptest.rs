@@ -13,7 +13,7 @@
 //! 测试模型是项目自有的验证设施（T0168 AC-4 将"属性测试为零"列为
 //! 双基准差距项，AGENTS.md 明确要求属性测试验证），不构成运行时逻辑。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
@@ -644,6 +644,221 @@ proptest! {
         assert_model(&recovered, &model);
         let _ = std::fs::remove_file(&dir);
     }
+
+    #[test]
+    fn combined_alloc_discard_and_btree_ops_match_model(
+        ops in prop::collection::vec(combined_op_strategy(), 1..=MAX_OPS),
+        crash_every in 9usize..=17,
+    ) {
+        /* T0202 组合 op 域：btree（put/delete）与 alloc
+         * （allocate/reclaim/queue_discard/run_discard_worker_once）在单一
+         * 随机序列中交错，周期性崩溃恢复点做精确断言（桶三态 + 队列 +
+         * btree 模型三者同时对照）。
+         *
+         * bcachefs 语义锚点：alloc 键更新与 freespace 位维护
+         * （fs/alloc/background.c:1113 alloc_freespace_pos +
+         * bch2_btree_bit_mod）；need_discard 树是持久队列（discard.c
+         * 的 for_each_btree_key 扫描路径），fast_discard 才是内存 darray
+         * （discard.c:643 bch2_fast_discard_bucket_add）——崩溃后树位
+         * 保留（discover_discard_buckets 可见）、内存队列清空。 */
+        let dir = unique_tmp_dir();
+        let mut engine = StorageEngine::create_persistent(&dir).unwrap();
+        for offset in 4..=7u64 {
+            engine.add_free_bucket(offset);
+        }
+        let buckets = [
+            KeyPosition::new(0, 4, 0),
+            KeyPosition::new(0, 5, 0),
+            KeyPosition::new(0, 6, 0),
+            KeyPosition::new(0, 7, 0),
+        ];
+        let mut btree_model = BTreeMap::new();
+        let mut bucket_model = BucketModel::default();
+
+        for (step, op) in ops.iter().enumerate() {
+            match op {
+                CombinedOp::Btree(bt) => {
+                    apply_group(&engine, &OpGroup::Single(bt.clone())).unwrap();
+                    apply_model(&mut btree_model, bt);
+                }
+                CombinedOp::Allocate => {
+                    /* allocate 恒成功 iff 模型有 free 桶；返回最小 free
+                     * 桶（freespace 位 ∩ FREE 的 offset 升序第一个，
+                     * engine.rs:825）。 */
+                    let free_count = bucket_model.state.iter().filter(|&&s| s == 0).count();
+                    match engine.allocate_bucket(0) {
+                        Ok(position) => {
+                            prop_assert_ne!(free_count, 0, "allocate 成功必须存在 free 桶");
+                            let idx = (position.offset - 4) as usize;
+                            prop_assert!(idx < 4, "allocate 必须落在模型桶域");
+                            let first_free = bucket_model
+                                .state
+                                .iter()
+                                .position(|&s| s == 0)
+                                .expect("free 桶必然存在");
+                            prop_assert_eq!(idx, first_free, "allocate 返回最小 free 桶");
+                            bucket_model.state[idx] = 1;
+                        }
+                        Err(e) => {
+                            prop_assert_eq!(free_count, 0, "allocate 失败仅因空间耗尽");
+                            prop_assert!(
+                                matches!(e, EngineError::Transaction(-28)),
+                                "空间耗尽必须返回 -28"
+                            );
+                        }
+                    }
+                }
+                CombinedOp::ReclaimBucket(b) => {
+                    /* 组合域守卫全不触发：无 open 桶、dev 恒 rw、无
+                     * backpointer、无脏/缓存扇区、journal_seq_empty 恒 0
+                     * → reclaim 恒成功且 0↔2 toggle（engine.rs:1090）。 */
+                    let idx = *b;
+                    let result = engine.reclaim_bucket(buckets[idx]);
+                    prop_assert!(result.is_ok(), "reclaim 恒成功 @ {idx}");
+                    bucket_model.state[idx] = if bucket_model.state[idx] == 2 { 0 } else { 2 };
+                }
+                CombinedOp::QueueDiscard(b) => {
+                    let idx = *b;
+                    let result = engine.queue_discard_bucket(buckets[idx]);
+                    if bucket_model.queued[idx] {
+                        prop_assert!(
+                            matches!(result, Err(EngineError::Transaction(-17))),
+                            "重复 queue 必须 -17（EEXIST 边界）@ {idx}"
+                        );
+                    } else {
+                        prop_assert!(result.is_ok());
+                        bucket_model.queued[idx] = true;
+                        bucket_model.queue.push_back(idx);
+                    }
+                }
+                CombinedOp::RunDiscardOnce => {
+                    /* 引擎与模型队列同构（同 push/pop 序列）：空队 -11；
+                     * 队首非 need-discard 时引擎回旋队尾并返回 -11
+                     * （engine.rs:1209 run_discard_worker_once）。 */
+                    match bucket_model.queue.pop_front() {
+                        None => {
+                            prop_assert!(matches!(
+                                engine.run_discard_worker_once(),
+                                Err(EngineError::Transaction(-11))
+                            ));
+                        }
+                        Some(head) => {
+                            let result = engine.run_discard_worker_once();
+                            if bucket_model.state[head] == 2 {
+                                prop_assert!(result.is_ok(), "need-discard 桶必须 discard 成功");
+                                bucket_model.queued[head] = false;
+                                bucket_model.state[head] = 0;
+                            } else {
+                                prop_assert!(
+                                    matches!(result, Err(EngineError::Transaction(-11))),
+                                    "非 need-discard 队首必须回旋 -11"
+                                );
+                                bucket_model.queue.push_back(head);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if step % crash_every == crash_every - 1 {
+                /* sync 点：journal 落盘后丢弃引擎，模拟崩溃。重建后三态
+                 * 同时精确对照：btree 键、桶 alloc 树状态（need_discard
+                 * 树位持久）。open_persistent 不自动恢复 fast_discard
+                 * 内存队列（darray 语义，discard.c:643）；discover 才是
+                 * 恢复入口（扫描 need_discard 树并重新入队，engine.rs:1309
+                 * ——对齐 bcachefs 的树为持久队列、内存 darray 为工作集）。 */
+                engine.sync().unwrap();
+                drop(engine);
+                engine = StorageEngine::open_persistent(&dir).unwrap();
+                assert_model(&engine, &btree_model);
+                let rebuilt = rebuild_bucket_state(&engine);
+                prop_assert_eq!(rebuilt, bucket_model.state, "崩溃后桶状态必须精确");
+                prop_assert!(
+                    engine.discard_queue_empty().unwrap(),
+                    "open_persistent 不得自动入队（darray 为内存态）"
+                );
+                let discovered = engine.discover_discard_buckets().unwrap();
+                prop_assert_eq!(
+                    discovered,
+                    bucket_model.state.iter().filter(|&&s| s == 2).count(),
+                    "need_discard 树位计数必须等于模型 need-discard 桶数"
+                );
+                /* discover 把树位桶重新入队（树扫描键序 = offset 升序），
+                 * 模型同步重建队列（对齐 T0197 op4 模式）。 */
+                bucket_model.queued = [false; 4];
+                bucket_model.queue.clear();
+                for (idx, &s) in bucket_model.state.iter().enumerate() {
+                    if s == 2 {
+                        bucket_model.queued[idx] = true;
+                        bucket_model.queue.push_back(idx);
+                    }
+                }
+            }
+        }
+        engine.sync().unwrap();
+        drop(engine);
+        let recovered = StorageEngine::open_persistent(&dir).unwrap();
+        assert_model(&recovered, &btree_model);
+        let rebuilt = rebuild_bucket_state(&recovered);
+        assert_eq!(rebuilt, bucket_model.state, "最终崩溃后桶状态必须精确");
+        let _ = std::fs::remove_file(&dir);
+    }
+}
+
+/// T0202 组合域桶模型：与引擎 alloc 树/内存队列严格同构的影子状态。
+/// state: 0=free、1=btree-owned、2=need-discard（对齐 T0197 模型）。
+#[derive(Clone, Debug, Default)]
+struct BucketModel {
+    state: [u8; 4],
+    queued: [bool; 4],
+    queue: VecDeque<usize>,
+}
+
+/// T0202 组合 op：btree 域（put/delete）与 alloc 域（4 种 op）混合。
+#[derive(Clone, Debug)]
+enum CombinedOp {
+    Btree(Op),
+    Allocate,
+    ReclaimBucket(usize),
+    QueueDiscard(usize),
+    RunDiscardOnce,
+}
+
+fn combined_op_strategy() -> impl Strategy<Value = CombinedOp> {
+    prop_oneof![
+        2 => op_strategy().prop_map(CombinedOp::Btree),
+        1 => Just(CombinedOp::Allocate),
+        1 => (0usize..4).prop_map(CombinedOp::ReclaimBucket),
+        1 => (0usize..4).prop_map(CombinedOp::QueueDiscard),
+        1 => Just(CombinedOp::RunDiscardOnce),
+    ]
+}
+
+/// 从 alloc 树读取桶 data_type（崩溃重建用）。bch_alloc_v4 布局
+/// （bset.rs:1042，repr(C)）：bch_val(0B) + journal_seq_nonempty
+/// u64@0 + flags u32@8 + gen u8@12 + oldest_gen u8@13 + data_type
+/// u8@14 → 编码进 value[1] 的字节 6（>>48）。
+fn alloc_data_type(value: &[u64]) -> u8 {
+    ((value[1] >> 48) & 0xff) as u8
+}
+
+/// 崩溃重建：从 alloc 树重读 4..=7 桶状态（need_discard 树位持久）。
+fn rebuild_bucket_state(engine: &StorageEngine) -> [u8; 4] {
+    let keys = engine.scan(BtreeId::new(4).unwrap()).unwrap();
+    let mut state = [0u8; 4];
+    for key in &keys {
+        let pos = key.position();
+        if pos.inode != 0 || !(4..=7).contains(&pos.offset) {
+            continue;
+        }
+        let idx = (pos.offset - 4) as usize;
+        state[idx] = match alloc_data_type(key.value()) {
+            0 => 0, /* BCH_DATA_FREE */
+            9 => 2, /* BCH_DATA_NEED_DISCARD */
+            _ => 1, /* btree-owned */
+        };
+    }
+    state
 }
 
 fn ops_of(group: &OpGroup) -> &[Op] {
@@ -710,6 +925,84 @@ fn unique_tmp_dir() -> PathBuf {
         std::thread::current().id()
     ));
     path
+}
+
+/// T0202 确定性边界：allocate 空间耗尽返回 -28（4 桶全占后无候选）。
+#[test]
+fn combined_allocate_space_exhaustion() {
+    let dir = unique_tmp_dir();
+    let engine = StorageEngine::create_persistent(&dir).unwrap();
+    for offset in 4..=7u64 {
+        engine.add_free_bucket(offset);
+    }
+    for _ in 0..4 {
+        assert!(engine.allocate_bucket(0).is_ok());
+    }
+    assert!(matches!(
+        engine.allocate_bucket(0),
+        Err(EngineError::Transaction(-28))
+    ));
+    let _ = std::fs::remove_file(&dir);
+}
+
+/// T0202 确定性边界：重复 queue 同桶返回 -17（EEXIST 边界）。
+#[test]
+fn combined_queue_discard_duplicate_rejected() {
+    let dir = unique_tmp_dir();
+    let engine = StorageEngine::create_persistent(&dir).unwrap();
+    engine.add_free_bucket(4);
+    engine.reclaim_bucket(KeyPosition::new(0, 4, 0)).unwrap();
+    let bucket = KeyPosition::new(0, 4, 0);
+    assert!(engine.queue_discard_bucket(bucket).is_ok());
+    assert!(matches!(
+        engine.queue_discard_bucket(bucket),
+        Err(EngineError::Transaction(-17))
+    ));
+    let _ = std::fs::remove_file(&dir);
+}
+
+/// T0202 确定性边界：空队列 worker 返回 -11；非 need-discard 队首回旋
+/// -11 且桶保留在队列，reclaim 后同一队列位置可被成功处理。
+#[test]
+fn combined_discard_worker_empty_and_rotation() {
+    let dir = unique_tmp_dir();
+    let engine = StorageEngine::create_persistent(&dir).unwrap();
+    engine.add_free_bucket(4);
+    assert!(matches!(
+        engine.run_discard_worker_once(),
+        Err(EngineError::Transaction(-11))
+    ));
+    let bucket = KeyPosition::new(0, 4, 0);
+    engine.queue_discard_bucket(bucket).unwrap();
+    assert!(matches!(
+        engine.run_discard_worker_once(),
+        Err(EngineError::Transaction(-11))
+    ));
+    assert!(!engine.discard_queue_empty().unwrap());
+    engine.reclaim_bucket(bucket).unwrap();
+    assert!(engine.run_discard_worker_once().is_ok());
+    assert!(engine.discard_queue_empty().unwrap());
+    let _ = std::fs::remove_file(&dir);
+}
+
+/// T0202 确定性边界：reclaim → discover（树位入队）→ worker 全链路
+/// （桶 2→0 回 free，可被再次 allocate）。
+#[test]
+fn combined_reclaim_queue_discard_cycle() {
+    let dir = unique_tmp_dir();
+    let engine = StorageEngine::create_persistent(&dir).unwrap();
+    engine.add_free_bucket(5);
+    let bucket = KeyPosition::new(0, 5, 0);
+    engine.allocate_bucket(0).unwrap();
+    engine.reclaim_bucket(bucket).unwrap();
+    assert_eq!(engine.discover_discard_buckets().unwrap(), 1);
+    /* discover 把 need_discard 树位桶重新入队（engine.rs:1309），
+     * 队列随后由 worker 处理。 */
+    assert!(!engine.discard_queue_empty().unwrap());
+    engine.run_discard_worker_once().unwrap();
+    assert_eq!(engine.discover_discard_buckets().unwrap(), 0);
+    assert_eq!(engine.allocate_bucket(0).unwrap(), bucket);
+    let _ = std::fs::remove_file(&dir);
 }
 /// 确定性回归：proptest 抓到的 delete 死循环（卡在 D(2,18,0)）。
 /// 确定性回归：proptest 抓到的 delete 死循环（卡在 D(2,18,0)）。

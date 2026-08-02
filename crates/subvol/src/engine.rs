@@ -820,6 +820,54 @@ impl StorageEngine {
             .is_empty())
     }
 
+    /// 测试设施：将 bucket_offset 初始化为 free 桶（alloc 记录 + freespace
+    /// 位）。语义锚点：bcachefs 的 alloc 键更新与 freespace 位维护
+    /// （fs/alloc/background.c:1113 alloc_freespace_pos +
+    /// bch2_btree_bit_mod）——先写 alloc_v4 记录（trigger_update_value
+    /// 触发 alloc 触发器），再置 freespace 位。仅供属性测试初始化桶
+    /// 状态，非运行时路径（T0202 组合测试从 mod tests 提升，逻辑零变化）。
+    pub fn add_free_bucket(&self, bucket_offset: u64) {
+        unsafe {
+            let mut fs = self.lock_fs().unwrap();
+            let position = crate::btree::bkey::POS(0, bucket_offset);
+            let alloc = bch_alloc_v4::default();
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut **fs);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    position,
+                    KEY_TYPE_alloc_v4,
+                    (&alloc as *const bch_alloc_v4).cast(),
+                    core::mem::size_of::<bch_alloc_v4>(),
+                );
+                let ret = if ret == 0 {
+                    bch2_btree_bit_mod(
+                        &mut trans,
+                        BTREE_ID_FREESPACE,
+                        alloc_freespace_pos(position, &alloc),
+                        true,
+                    )
+                } else {
+                    ret
+                };
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+        }
+    }
+
     /// Selects the first free alloc bucket for a device and atomically marks
     /// it as btree-owned, matching foreground.c's free-bucket candidate rule.
     pub fn allocate_bucket(&self, dev: u64) -> Result<KeyPosition, EngineError> {
@@ -3182,9 +3230,9 @@ mod tests {
     #[test]
     fn discard_worker_concurrent_queue_single_worker_drains_all() {
         let (engine, path) = prepared_bucket_engine("discard-concurrent", 4);
-        add_free_bucket(&engine, 5);
-        add_free_bucket(&engine, 6);
-        add_free_bucket(&engine, 7);
+        engine.add_free_bucket(5);
+        engine.add_free_bucket(6);
+        engine.add_free_bucket(7);
         let mut positions = Vec::new();
         for _ in 0..4 {
             let position = engine.allocate_bucket(0).unwrap();
@@ -3218,52 +3266,10 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-    fn add_free_bucket(engine: &StorageEngine, bucket_offset: u64) {
-        unsafe {
-            let mut fs = engine.lock_fs().unwrap();
-            let position = crate::btree::bkey::POS(0, bucket_offset);
-            let alloc = bch_alloc_v4::default();
-            let mut trans = btree_trans::default();
-            bch2_trans_init(&mut trans, &mut **fs);
-            loop {
-                bch2_trans_begin(&mut trans);
-                let ret = trigger_update_value(
-                    &mut trans,
-                    4,
-                    position,
-                    KEY_TYPE_alloc_v4,
-                    (&alloc as *const bch_alloc_v4).cast(),
-                    core::mem::size_of::<bch_alloc_v4>(),
-                );
-                let ret = if ret == 0 {
-                    bch2_btree_bit_mod(
-                        &mut trans,
-                        BTREE_ID_FREESPACE,
-                        alloc_freespace_pos(position, &alloc),
-                        true,
-                    )
-                } else {
-                    ret
-                };
-                let ret = if ret == 0 {
-                    bch2_trans_commit(&mut trans)
-                } else {
-                    ret
-                };
-                if ret == -12 && trans.realloc_bytes_required != 0 {
-                    continue;
-                }
-                assert_eq!(ret, 0);
-                break;
-            }
-            bch2_trans_put(&mut trans);
-        }
-    }
-
     #[test]
     fn fsck_image_passes_on_healthy_image() {
         let (engine, path) = prepared_bucket_engine("fsck-healthy", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         engine.reclaim_bucket(position).unwrap();
         drop(engine);
@@ -3283,7 +3289,7 @@ mod tests {
     #[test]
     fn fsck_image_no_mode_reports_stale_need_discard_key() {
         let (engine, path) = prepared_bucket_engine("fsck-nd-stale", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         /* a need_discard index entry for a bucket the alloc tree does not
          * know: rebuild_derived_state clears freespace/alloc but not the
          * need_discard tree (engine.rs:2014-2019), so the stale entry
@@ -3304,7 +3310,7 @@ mod tests {
     #[test]
     fn fsck_image_yes_mode_deletes_stale_need_discard_key() {
         let (engine, path) = prepared_bucket_engine("fsck-nd-fix", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
         engine.flush_journal().unwrap();
         drop(engine);
@@ -3334,7 +3340,7 @@ mod tests {
     #[test]
     fn fsck_image_yes_mode_restores_missing_need_discard_entry() {
         let (engine, path) = prepared_bucket_engine("fsck-nd-missing", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         engine.reclaim_bucket(position).unwrap();
         /* drop the need_discard index entry the reclaim wrote: the alloc
@@ -3371,7 +3377,7 @@ mod tests {
          * the bch2_trans_begin retry loop (lockrestart_do, iter.h:1115-1127)
          * and the repair converges; the injected point is consumed once. */
         let (engine, path) = prepared_bucket_engine("fsck-rt-inject", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
         engine.flush_journal().unwrap();
         drop(engine);
@@ -3392,7 +3398,7 @@ mod tests {
          * aborts the repair with the transaction error; the image keeps
          * its inconsistency, so a clean rerun completes the repair. */
         let (engine, path) = prepared_bucket_engine("fsck-oom-inject", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
         engine.flush_journal().unwrap();
         drop(engine);
@@ -3414,7 +3420,7 @@ mod tests {
          * repairs are dropped by the reopen (journal replay only re-applies
          * durable records), so a clean rerun repairs and verifies. */
         let (engine, path) = prepared_bucket_engine("fsck-flush-inject", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
         engine.flush_journal().unwrap();
         drop(engine);
@@ -3444,7 +3450,7 @@ mod tests {
             FsckFaultPoint::AfterRepairBeforeFlush,
         ] {
             let (engine, path) = prepared_bucket_engine("fsck-fault-matrix", 4);
-            add_free_bucket(&engine, 5);
+            engine.add_free_bucket(5);
             set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
             engine.flush_journal().unwrap();
             drop(engine);
@@ -3459,7 +3465,7 @@ mod tests {
     #[test]
     fn fsck_image_no_mode_leaves_image_unchanged() {
         let (engine, path) = prepared_bucket_engine("fsck-nd-unchanged", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
         engine.flush_journal().unwrap();
         drop(engine);
@@ -3484,7 +3490,7 @@ mod tests {
     #[test]
     fn verify_all_returns_first_error_and_runs_every_check() {
         let (engine, path) = prepared_bucket_engine("verify-all", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         assert!(engine.verify_all().is_ok());
         let position = KeyPosition::new(0, 5, 0);
         engine.open_bucket(position).unwrap();
@@ -3503,7 +3509,7 @@ mod tests {
     #[test]
     fn verify_all_keeps_first_error_when_multiple_checks_fail() {
         let (engine, path) = prepared_bucket_engine("verify-all-first", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = KeyPosition::new(0, 5, 0);
         set_need_discard_index(&engine, position.raw(), true);
         engine.open_bucket(position).unwrap();
@@ -3523,7 +3529,7 @@ mod tests {
     #[test]
     fn verify_all_runs_later_checks_after_an_early_failure() {
         let (engine, path) = prepared_bucket_engine("verify-all-continue", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = KeyPosition::new(0, 5, 0);
         set_need_discard_index(&engine, position.raw(), true);
         engine.open_bucket(position).unwrap();
@@ -3547,7 +3553,7 @@ mod tests {
     #[test]
     fn verify_guard_invariants_rejects_open_free_bucket() {
         let (engine, path) = prepared_bucket_engine("guard-open-free", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = KeyPosition::new(0, 5, 0);
         assert!(engine.verify_all().is_ok());
         engine.open_bucket(position).unwrap();
@@ -3566,7 +3572,7 @@ mod tests {
     #[test]
     fn verify_guard_invariants_rejects_notrw_free_bucket() {
         let (engine, path) = prepared_bucket_engine("guard-notrw-free", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         assert!(engine.verify_all().is_ok());
         engine.set_device_rw(0, false).unwrap();
         assert!(matches!(
@@ -3584,7 +3590,7 @@ mod tests {
     #[test]
     fn guard_query_open_bucket_count_and_queue_empty() {
         let (engine, path) = prepared_bucket_engine("guard-query", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         assert_eq!(engine.open_bucket_count().unwrap(), 0);
         assert!(engine.discard_queue_empty().unwrap());
@@ -3605,7 +3611,7 @@ mod tests {
     #[test]
     fn discard_worker_rejects_open_bucket_until_closed() {
         let (engine, path) = prepared_bucket_engine("discard-open", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         engine.open_bucket(position).unwrap();
         assert!(matches!(
@@ -3627,7 +3633,7 @@ mod tests {
     #[test]
     fn set_device_rw_false_refuses_open_bucket_on_device() {
         let (engine, path) = prepared_bucket_engine("rw-open-guard", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         engine.open_bucket(position).unwrap();
         assert!(matches!(
@@ -3674,7 +3680,7 @@ mod tests {
     #[test]
     fn persistent_engine_derives_rw_devs_from_devs_online() {
         let (engine, path) = prepared_bucket_engine("rw-derive", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         assert_eq!(position.inode, 0);
         engine.set_device_rw(0, false).unwrap();
@@ -3695,7 +3701,7 @@ mod tests {
     #[test]
     fn drop_detects_unclosed_open_bucket_leak() {
         let (engine, path) = prepared_bucket_engine("drop-leak", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         engine.open_bucket(position).unwrap();
         assert_eq!(
@@ -3724,7 +3730,7 @@ mod tests {
     #[test]
     fn close_open_bucket_then_drop_is_clean() {
         let (engine, path) = prepared_bucket_engine("drop-clean", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         engine.open_bucket(position).unwrap();
         engine.close_open_bucket(position).unwrap();
@@ -3738,7 +3744,7 @@ mod tests {
     #[test]
     fn discard_reclaim_transaction_fault_leaves_no_half_state() {
         let (engine, path) = prepared_bucket_engine("discard-fault", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         engine
             .inject_fault(FaultPoint::TransactionRestart, 1)
@@ -3761,8 +3767,8 @@ mod tests {
     #[test]
     fn discard_worker_skips_open_and_notrw_but_drains_ready_buckets() {
         let (engine, path) = prepared_bucket_engine("discard-guard", 4);
-        add_free_bucket(&engine, 5);
-        add_free_bucket(&engine, 6);
+        engine.add_free_bucket(5);
+        engine.add_free_bucket(6);
         let open = engine.allocate_bucket(0).unwrap();
         let ready = engine.allocate_bucket(0).unwrap();
         engine.reclaim_bucket(open).unwrap();
@@ -3796,7 +3802,7 @@ mod tests {
     #[test]
     fn discard_worker_rotates_notrw_device_buckets_until_rw_restored() {
         let (engine, path) = prepared_bucket_engine("discard-notrw-rotate", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         engine.reclaim_bucket(position).unwrap();
         engine.set_device_rw(0, false).unwrap();
@@ -3823,7 +3829,7 @@ mod tests {
     #[test]
     fn discard_worker_requires_rw_device() {
         let (engine, path) = prepared_bucket_engine("discard-notrw", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let position = engine.allocate_bucket(0).unwrap();
         engine.reclaim_bucket(position).unwrap();
         engine.set_device_rw(0, false).unwrap();
@@ -3850,9 +3856,9 @@ mod tests {
     #[test]
     fn discard_worker_fifo_pass_drains_entire_queue() {
         let (engine, path) = prepared_bucket_engine("discard-fifo", 4);
-        add_free_bucket(&engine, 5);
-        add_free_bucket(&engine, 6);
-        add_free_bucket(&engine, 7);
+        engine.add_free_bucket(5);
+        engine.add_free_bucket(6);
+        engine.add_free_bucket(7);
         let mut positions = Vec::new();
         for _ in 0..3 {
             let position = engine.allocate_bucket(0).unwrap();
@@ -3875,7 +3881,7 @@ mod tests {
     #[test]
     fn discard_worker_eagain_rotates_to_tail_without_blocking_ready_buckets() {
         let (engine, path) = prepared_bucket_engine("discard-eagain", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let ready = engine.allocate_bucket(0).unwrap();
         let not_ready = KeyPosition::new(0, if ready.offset == 4 { 5 } else { 4 }, 0);
         engine.reclaim_bucket(ready).unwrap();
@@ -4063,9 +4069,9 @@ mod tests {
         fn open_bucket_discard_model_protects_open_from_reuse(
             operations in prop::collection::vec((0u8..8, 0u8..4), 1..=40),
         ) {            let (engine, path) = prepared_bucket_engine("discard-open-model", 4);
-            add_free_bucket(&engine, 5);
-            add_free_bucket(&engine, 6);
-            add_free_bucket(&engine, 7);
+            engine.add_free_bucket( 5);
+            engine.add_free_bucket( 6);
+            engine.add_free_bucket( 7);
             let buckets = [
                 KeyPosition::new(0, 4, 0),
                 KeyPosition::new(0, 5, 0),
@@ -4300,7 +4306,7 @@ mod tests {
     #[test]
     fn not_rw_dimension_guard_verdicts_are_implementation_adjudicated() {
         let (engine, path) = prepared_bucket_engine("discard-notrw-model", 4);
-        add_free_bucket(&engine, 5);
+        engine.add_free_bucket(5);
         let mut engine = ModelEngine::new(engine);
         let bucket5 = KeyPosition::new(0, 5, 0);
         engine.set_device_rw(0, false).unwrap();
@@ -4360,9 +4366,9 @@ mod tests {
             operations in prop::collection::vec((0u8..6, 0u8..4), 1..=40),
         ) {
             let (engine, path) = prepared_bucket_engine("discard-model", 4);
-            add_free_bucket(&engine, 5);
-            add_free_bucket(&engine, 6);
-            add_free_bucket(&engine, 7);
+            engine.add_free_bucket( 5);
+            engine.add_free_bucket( 6);
+            engine.add_free_bucket( 7);
             let buckets = [
                 KeyPosition::new(0, 4, 0),
                 KeyPosition::new(0, 5, 0),
@@ -4797,7 +4803,7 @@ mod tests {
          * 循环，最终队列排空且桶全部 freed。 */
         let (engine, path) = prepared_bucket_engine("interleave-inject", 4);
         for offset in 5..=7 {
-            add_free_bucket(&engine, offset);
+            engine.add_free_bucket(offset);
         }
         let mut positions = Vec::new();
         for _ in 0..4 {
@@ -4832,7 +4838,7 @@ mod tests {
          * freespace 补键，engine.rs:1043-1049），4 桶循环复用。 */
         let (engine, path) = prepared_bucket_engine("interleave-writers", 4);
         for offset in 5..=7 {
-            add_free_bucket(&engine, offset);
+            engine.add_free_bucket(offset);
         }
         let engine = Arc::new(engine);
         let barrier = Arc::new(std::sync::Barrier::new(4));
@@ -4872,7 +4878,7 @@ mod tests {
          * 桶 4..=7 循环：discard 归还 freespace 后下一轮重新 reclaim。 */
         let (engine, path) = prepared_bucket_engine("interleave-producer", 4);
         for offset in 5..=7 {
-            add_free_bucket(&engine, offset);
+            engine.add_free_bucket(offset);
         }
         let buckets = [4u64, 5, 6, 7];
         let engine = Arc::new(engine);
@@ -5087,7 +5093,7 @@ mod tests {
         /* 4 free buckets (4..=7) so the 4 writers' start barrier allocates
          * one bucket each without contention, then recycles (T0199 pattern) */
         for offset in 4..=7 {
-            add_free_bucket(&engine, offset);
+            engine.add_free_bucket(offset);
         }
         /* Barrier(5): 4 writers + the main thread, which participates in
          * every barrier so the round boundaries are deterministic (the
