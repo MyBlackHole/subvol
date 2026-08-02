@@ -1885,10 +1885,12 @@ pub(crate) unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<()
             .add(core::mem::size_of::<bkey>())
             .cast::<bch_alloc_v4>();
         let alloc = core::ptr::read_unaligned(value);
-        actual_alloc.insert(
-            ((*key).k.p.inode, (*key).k.p.offset),
-            (alloc.gen, alloc.dirty_sectors),
-        );
+        if alloc.dirty_sectors != 0 {
+            actual_alloc.insert(
+                ((*key).k.p.inode, (*key).k.p.offset),
+                (alloc.gen, alloc.dirty_sectors),
+            );
+        }
     }
     if actual_alloc != expected_alloc {
         crate::rewrite_log_error!("derived validator: alloc set mismatch");
@@ -2255,11 +2257,11 @@ mod tests {
         );
 
         engine.flush_journal().unwrap();
-        let image = engine.durable_journal().unwrap();
-        let recovered = StorageEngine::recover(&image).unwrap();
+        drop(engine);
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
         assert!(recovered.verify_bucket_indexes().is_ok());
 
-        drop(engine);
+        drop(recovered);
         fs::remove_file(path).unwrap();
     }
 
