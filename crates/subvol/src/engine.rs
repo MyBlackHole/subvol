@@ -2415,15 +2415,162 @@ pub(crate) unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<()
 }
 
 /// Opens a persistent engine image and runs every consistency check,
-/// mirroring the fsck command flow: open the device, run all recovery
-/// passes, report the first error (fsck.rs:419-447).  The engine has no
-/// repair path, so this is the no-repair mode only, matching upstream
-/// `-n/--no_repair` ("Don't repair, only check for errors", fsck.rs:60-61).
-/// An open failure surfaces as an Io error; a failed check surfaces as
-/// the verifying error (e.g. a DerivedStateMismatch variant).
-pub fn fsck_image(path: impl AsRef<Path>) -> Result<(), EngineError> {
+/// fix_errors mode for `fsck_image`, mirroring the upstream fsck option
+/// values FSCK_FIX_no / FSCK_FIX_yes (opts.h:132, init/error.c:437-449):
+/// `No` reports the first verifying error without touching the image
+/// (upstream `-n` -> nochanges + fix_errors=no, fsck.rs:266-269), `Yes`
+/// repairs the alloc<->derived-index inconsistencies it knows how to fix
+/// before re-verifying (upstream `-y` -> fix_errors=yes, fsck.rs:248-250).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FixErrors {
+    No,
+    Yes,
+}
+
+/// Runs the fsck flow over a persistent image, mirroring the fsck command
+/// flow: open the device, run all recovery passes, report the first error
+/// (fsck.rs:419-447).  The engine has no interactive repair path, so only
+/// the no-repair and the automatic-repair modes exist, matching upstream
+/// `-n/--no_repair` ("Don't repair, only check for errors", fsck.rs:60-61)
+/// and `-y/--yes` (auto-repair).  An open failure surfaces as an Io error;
+/// a failed check surfaces as the verifying error (e.g. a
+/// DerivedStateMismatch variant).  In `Yes` mode the alloc<->derived-index
+/// inconsistencies are repaired first (T0198, see repair_derived_indexes);
+/// guard-verdict errors (OpenBucketFree / NotRwBucketFree) are never
+/// repaired, matching the upstream skip semantics.
+pub fn fsck_image(path: impl AsRef<Path>, fix: FixErrors) -> Result<(), EngineError> {
     let engine = StorageEngine::open_persistent(path)?;
+    if fix == FixErrors::Yes {
+        repair_derived_indexes(&engine)?;
+        /* make the repairs durable before reporting success, like the
+         * upstream fsck flow's fs.exit() shutdown (fsck.rs:457-460) */
+        engine.flush_journal()?;
+    }
     engine.verify_all()
+}
+
+/// Repairs the alloc<->derived-index inconsistencies reported by
+/// `verify_bucket_indexes` (FreespaceSet / NeedDiscardSet).  The repair is
+/// two-directional, mirroring `bch2_check_alloc_key` (alloc/check.c:175-188):
+/// an index entry whose alloc bucket is no longer in the indexed state is
+/// deleted (`delete_freespace_key` alloc/check.c:352-386, and
+/// `bch2_check_discard_key`'s `bch2_btree_bit_mod_buffered(..., false)`
+/// alloc/check.c:411-416), and an alloc bucket missing its index entry gets
+/// one inserted.  Each entry is repaired in its own transaction, matching
+/// `delete_freespace_key`'s single-transaction commit (alloc/check.c:366-371);
+/// a non-index failure aborts the repair (upstream ret propagation) instead
+/// of pretending success.
+fn repair_derived_indexes(engine: &StorageEngine) -> Result<(), EngineError> {
+    let mut fs = engine.lock_fs()?;
+    unsafe {
+        if fs.disk_sb.sb.is_null() {
+            return Err(EngineError::Transaction(-1));
+        }
+        /* Derive the expected index sets from the alloc tree, the same
+         * projection verify_bucket_indexes computes (engine.rs:618-668):
+         * FREE buckets must carry a freespace entry at
+         * alloc_freespace_pos(), NEED_DISCARD buckets a need_discard
+         * entry at the bucket position. */
+        let mut expected_index = BTreeSet::new();
+        let mut expected_need_discard = BTreeSet::new();
+        for raw in scan_raw_locked(&mut **fs, 4)? {
+            let key = raw.words.as_ptr().cast::<bkey_i>();
+            if (*key).k.type_ != KEY_TYPE_alloc_v4 {
+                continue;
+            }
+            let value = (key as *const u8)
+                .add(core::mem::size_of::<bkey>())
+                .cast::<bch_alloc_v4>();
+            let alloc = core::ptr::read_unaligned(value);
+            if alloc.data_type == BCH_DATA_FREE {
+                let indexed = alloc_freespace_pos((*key).k.p, &alloc);
+                expected_index.insert((indexed.inode, indexed.offset));
+            } else if alloc.data_type == BCH_DATA_NEED_DISCARD {
+                expected_need_discard.insert(((*key).k.p.inode, (*key).k.p.offset));
+            }
+        }
+        /* Delete stale freespace entries, then insert missing ones. */
+        let mut stale = Vec::new();
+        let mut missing = expected_index.clone();
+        for raw in scan_raw_locked(&mut **fs, BTREE_ID_FREESPACE)? {
+            let key = raw.words.as_ptr().cast::<bkey_i>();
+            if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set {
+                let pos = ((*key).k.p.inode, (*key).k.p.offset);
+                if !expected_index.contains(&pos) {
+                    stale.push((*key).k.p);
+                }
+                missing.remove(&pos);
+            }
+        }
+        for position in stale {
+            bit_mod_sync(&mut **fs, BTREE_ID_FREESPACE, position, false)?;
+        }
+        for (inode, offset) in missing {
+            bit_mod_sync(
+                &mut **fs,
+                BTREE_ID_FREESPACE,
+                crate::btree::bkey::POS(inode, offset),
+                true,
+            )?;
+        }
+        /* Delete stale need_discard entries, then insert missing ones. */
+        let mut stale = Vec::new();
+        let mut missing = expected_need_discard.clone();
+        for raw in scan_raw_locked(&mut **fs, BTREE_ID_NEED_DISCARD)? {
+            let key = raw.words.as_ptr().cast::<bkey_i>();
+            if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set {
+                let pos = ((*key).k.p.inode, (*key).k.p.offset);
+                if !expected_need_discard.contains(&pos) {
+                    stale.push((*key).k.p);
+                }
+                missing.remove(&pos);
+            }
+        }
+        for position in stale {
+            bit_mod_sync(&mut **fs, BTREE_ID_NEED_DISCARD, position, false)?;
+        }
+        for (inode, offset) in missing {
+            bit_mod_sync(
+                &mut **fs,
+                BTREE_ID_NEED_DISCARD,
+                crate::btree::bkey::POS(inode, offset),
+                true,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// One-transaction bit-map entry modification, mirroring
+/// `delete_freespace_key`'s commit flow (alloc/check.c:366-371): a -12
+/// (ENOMEM) restart grows the transaction and retries, any other failure
+/// aborts the repair with the transaction error.
+unsafe fn bit_mod_sync(
+    fs: &mut bch_fs,
+    btree: u8,
+    position: bpos,
+    set: bool,
+) -> Result<(), EngineError> {
+    let mut trans = btree_trans::default();
+    bch2_trans_init(&mut trans, fs);
+    loop {
+        bch2_trans_begin(&mut trans);
+        let ret = bch2_btree_bit_mod(&mut trans, btree, position, set);
+        let ret = if ret == 0 {
+            bch2_trans_commit(&mut trans)
+        } else {
+            ret
+        };
+        if ret == -12 && trans.realloc_bytes_required != 0 {
+            continue;
+        }
+        bch2_trans_put(&mut trans);
+        if ret != 0 {
+            return Err(EngineError::Transaction(ret));
+        }
+        break;
+    }
+    Ok(())
 }
 
 unsafe fn configure_persistent_journal(
@@ -3024,14 +3171,127 @@ mod tests {
         let position = engine.allocate_bucket(0).unwrap();
         engine.reclaim_bucket(position).unwrap();
         drop(engine);
-        assert!(fsck_image(&path).is_ok());
+        assert!(fsck_image(&path, FixErrors::No).is_ok());
         fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn fsck_image_io_error_on_unreadable_image() {
         let path = persistent_test_path("fsck-io");
-        assert!(matches!(fsck_image(&path), Err(EngineError::Io(_))));
+        assert!(matches!(
+            fsck_image(&path, FixErrors::No),
+            Err(EngineError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn fsck_image_no_mode_reports_stale_need_discard_key() {
+        let (engine, path) = prepared_bucket_engine("fsck-nd-stale", 4);
+        add_free_bucket(&engine, 5);
+        /* a need_discard index entry for a bucket the alloc tree does not
+         * know: rebuild_derived_state clears freespace/alloc but not the
+         * need_discard tree (engine.rs:2014-2019), so the stale entry
+         * survives open_persistent and must be reported as NeedDiscardSet
+         * in no-repair mode (T0198). */
+        set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
+        engine.flush_journal().unwrap();
+        drop(engine);
+        assert!(matches!(
+            fsck_image(&path, FixErrors::No),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::NeedDiscardSet
+            ))
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fsck_image_yes_mode_deletes_stale_need_discard_key() {
+        let (engine, path) = prepared_bucket_engine("fsck-nd-fix", 4);
+        add_free_bucket(&engine, 5);
+        set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
+        engine.flush_journal().unwrap();
+        drop(engine);
+        assert!(fsck_image(&path, FixErrors::Yes).is_ok());
+        /* the repaired image reopens verified: the stale entry is gone and
+         * no index inconsistency remains (T0198 AC-2/AC-4) */
+        let reopened = StorageEngine::open_persistent(&path).unwrap();
+        assert!(reopened.verify_all().is_ok());
+        let mut fs = reopened.lock_fs().unwrap();
+        let mut stale = false;
+        unsafe {
+            for raw in scan_raw_locked(&mut **fs, BTREE_ID_NEED_DISCARD).unwrap() {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set
+                    && (*key).k.p == crate::btree::bkey::POS(0, 9)
+                {
+                    stale = true;
+                }
+            }
+        }
+        drop(fs);
+        drop(reopened);
+        assert!(!stale, "stale need_discard entry must be deleted");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fsck_image_yes_mode_restores_missing_need_discard_entry() {
+        let (engine, path) = prepared_bucket_engine("fsck-nd-missing", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        /* drop the need_discard index entry the reclaim wrote: the alloc
+         * tree still says NEED_DISCARD, so the entry must be re-inserted
+         * (upstream bch2_check_alloc_key's bidirectional repair,
+         * alloc/check.c:175-179) */
+        set_need_discard_index(&engine, position.raw(), false);
+        engine.flush_journal().unwrap();
+        drop(engine);
+        assert!(fsck_image(&path, FixErrors::Yes).is_ok());
+        let reopened = StorageEngine::open_persistent(&path).unwrap();
+        assert!(reopened.verify_all().is_ok());
+        let mut fs = reopened.lock_fs().unwrap();
+        let mut present = false;
+        unsafe {
+            for raw in scan_raw_locked(&mut **fs, BTREE_ID_NEED_DISCARD).unwrap() {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set
+                    && (*key).k.p == position.raw()
+                {
+                    present = true;
+                }
+            }
+        }
+        drop(fs);
+        drop(reopened);
+        assert!(present, "missing need_discard entry must be re-inserted");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fsck_image_no_mode_leaves_image_unchanged() {
+        let (engine, path) = prepared_bucket_engine("fsck-nd-unchanged", 4);
+        add_free_bucket(&engine, 5);
+        set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
+        engine.flush_journal().unwrap();
+        drop(engine);
+        /* no-repair must not touch the image: the same inconsistency
+         * reports again, and yes-mode can still repair afterwards */
+        assert!(matches!(
+            fsck_image(&path, FixErrors::No),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::NeedDiscardSet
+            ))
+        ));
+        assert!(matches!(
+            fsck_image(&path, FixErrors::No),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::NeedDiscardSet
+            ))
+        ));
+        assert!(fsck_image(&path, FixErrors::Yes).is_ok());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

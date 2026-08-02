@@ -2,9 +2,13 @@
 //!
 //! Mirrors the bcachefs fsck command flow (src/commands/fsck.rs:419-447):
 //! open the device/file, run every consistency pass, print errors, and
-//! exit with a status code.  The engine has no repair path, so this CLI
-//! is the no-repair mode only, matching upstream `-n/--no_repair`
-//! ("Don't repair, only check for errors", fsck.rs:60-61).
+//! exit with a status code.  Modes mirror the upstream fix_errors option
+//! (fsck.rs:248-250, 266-269): `-n/--no-repair` checks only ("Don't
+//! repair, only check for errors", fsck.rs:60-61) and is the default;
+//! `-y/--yes` auto-repairs the alloc<->derived-index inconsistencies
+//! before re-verifying (T0198).  Guard-verdict states (open buckets,
+//! non-rw free buckets) are never repaired, matching the upstream skip
+//! semantics.
 //!
 //! Exit codes (extending the fsck errcode channel to distinguish failure
 //! classes): 0 = check passed, 1 = consistency check failed (verify_all
@@ -13,13 +17,14 @@
 use std::env;
 use std::process;
 
-use subvol::{fsck_image, EngineError};
+use subvol::{fsck_image, EngineError, FixErrors};
 
-const USAGE: &str = "usage: subvol-fsck [-n] [-f] <image-file>";
+const USAGE: &str = "usage: subvol-fsck [-n] [-y] [-f] <image-file>";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut no_repair = false;
+    let mut yes = false;
     let mut force = false;
     let mut path = None;
 
@@ -27,9 +32,10 @@ fn main() {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-n" | "--no-repair" => no_repair = true,
+            "-y" | "--yes" => yes = true,
             "-f" | "--force" => force = true,
             "-h" | "--help" => {
-                println!("{USAGE}\n  -n, --no-repair  only check, never repair (the only mode: the engine has no repair path)\n  -f, --force      check even if the filesystem is marked clean (accepted for fsck parity)");
+                println!("{USAGE}\n  -n, --no-repair  only check, never repair (default)\n  -y, --yes        automatically repair index inconsistencies before checking\n  -f, --force      check even if the filesystem is marked clean (accepted for fsck parity)");
                 process::exit(0);
             }
             _ if arg.starts_with('-') => {
@@ -47,6 +53,11 @@ fn main() {
             }
         }
     }
+    if no_repair && yes {
+        eprintln!("subvol-fsck: -n and -y are mutually exclusive");
+        eprintln!("{USAGE}");
+        process::exit(2);
+    }
     let _ = (no_repair, force);
 
     let path = match path {
@@ -58,9 +69,14 @@ fn main() {
         }
     };
 
-    match fsck_image(&path) {
+    let fix = if yes { FixErrors::Yes } else { FixErrors::No };
+    match fsck_image(&path, fix) {
         Ok(()) => {
-            println!("OK");
+            if yes {
+                println!("OK (repaired)");
+            } else {
+                println!("OK");
+            }
             process::exit(0);
         }
         Err(EngineError::Io(error)) => {

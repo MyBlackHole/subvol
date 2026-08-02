@@ -14,7 +14,7 @@ mod util;
 
 pub use engine::{
     fsck_image, BtreeId, BtreeKey, DerivedStateMismatch, DurabilityPoint, EngineError,
-    EngineMetrics, FaultPoint, JournalSnapshot, KeyPosition, ReadTransaction, ReclaimStatus,
-    RecoveryFaultPoint, StorageEngine, Transaction, STORAGE_FORMAT_VERSION,
+    EngineMetrics, FaultPoint, FixErrors, JournalSnapshot, KeyPosition, ReadTransaction,
+    ReclaimStatus, RecoveryFaultPoint, StorageEngine, Transaction, STORAGE_FORMAT_VERSION,
 };
 pub use util::log::{emit, LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_OFF, LOG_WARN};

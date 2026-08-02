@@ -70,3 +70,49 @@ fn fsck_cli_missing_image_exits_two() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot open"));
 }
+
+fn run_fsck_args(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_subvol-fsck"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn fsck_cli_yes_mode_healthy_image_exits_zero_with_repair_output() {
+    let path = temp_path("healthy-y");
+    let engine = StorageEngine::create_persistent(&path).unwrap();
+    engine
+        .put(
+            BtreeId::DEFAULT,
+            BtreeKey::new(KeyPosition::new(0, 1, 0), vec![1]).unwrap(),
+        )
+        .unwrap();
+    drop(engine);
+
+    let output = run_fsck_args(&["-y", path.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "-y on a healthy image must pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "OK (repaired)\n",
+        "-y mode must report the repair run"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn fsck_cli_no_repair_and_yes_are_mutually_exclusive() {
+    let path = temp_path("ny-conflict");
+    fs::write(&path, b"junk").unwrap();
+    let output = run_fsck_args(&["-n", "-y", path.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("mutually exclusive"),
+        "stderr must explain the conflict"
+    );
+    fs::remove_file(path).unwrap();
+}
