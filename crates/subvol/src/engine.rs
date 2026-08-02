@@ -780,6 +780,7 @@ impl StorageEngine {
                 if alloc.dirty_sectors != 0 || alloc.cached_sectors != 0 {
                     return Err(EngineError::Transaction(-16));
                 }
+                let old_alloc = alloc;
                 if alloc.data_type != BCH_DATA_NEED_DISCARD {
                     /* background.c first moves an empty bucket into
                      * need_discard; discard.c performs the later free
@@ -813,7 +814,12 @@ impl StorageEngine {
                                 true,
                             )
                         } else {
-                            0
+                            bch2_btree_bit_mod(
+                                &mut trans,
+                                BTREE_ID_FREESPACE,
+                                alloc_freespace_pos((*key).k.p, &old_alloc),
+                                false,
+                            )
                         }
                     } else {
                         ret
