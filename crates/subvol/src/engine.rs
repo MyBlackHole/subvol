@@ -657,6 +657,9 @@ impl StorageEngine {
     pub fn allocate_bucket(&self, dev: u64) -> Result<KeyPosition, EngineError> {
         let mut fs = self.lock_fs()?;
         unsafe {
+            if fs.disk_sb.sb.is_null() || dev >= (*fs.disk_sb.sb).nr_devices as u64 {
+                return Err(EngineError::Transaction(-1));
+            }
             let member = crate::sb::io::bch2_sb_member_get(fs.disk_sb.sb, dev as usize);
             if member.bucket_size == 0 || !crate::sb::bch2_member_alive(&member) {
                 return Err(EngineError::Transaction(-1));
