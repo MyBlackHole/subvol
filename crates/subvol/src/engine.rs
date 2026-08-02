@@ -45,8 +45,8 @@ use crate::{
             BTREE_ID_NR,
         },
         update::{
-            bch2_clear_derived_tree, bch2_rebuild_derived_for_key, bch2_trans_commit,
-            bch2_trans_update, trigger_update_value,
+            bch2_btree_bit_mod, bch2_clear_derived_tree, bch2_rebuild_derived_for_key,
+            bch2_trans_commit, bch2_trans_update, trigger_update_value,
         },
     },
     journal::{
@@ -84,6 +84,15 @@ const RECLAIM_WORKER_DELAY: Duration = Duration::from_millis(25);
 const BCH_DATA_FREE: u8 = 0;
 const BCH_DATA_BTREE: u8 = 3;
 const BCH_DATA_NEED_DISCARD: u8 = 9;
+const BTREE_ID_FREESPACE: u8 = 5;
+
+fn alloc_freespace_pos(position: bpos, alloc: &bch_alloc_v4) -> bpos {
+    let gc_gen = alloc.gen.wrapping_sub(alloc.oldest_gen);
+    bpos {
+        offset: position.offset | (((gc_gen as u64) >> 4) << 56),
+        ..position
+    }
+}
 
 /// A logical btree identifier.  The IDs are engine-local and need not expose
 /// the filesystem-specific `BCH_BTREE_IDS()` namespace.
@@ -624,6 +633,7 @@ impl StorageEngine {
                 if alloc.data_type != BCH_DATA_FREE {
                     continue;
                 }
+                let old_alloc = alloc;
                 alloc.data_type = BCH_DATA_BTREE;
                 let mut trans = btree_trans::default();
                 bch2_trans_init(&mut trans, &mut **fs);
@@ -636,6 +646,16 @@ impl StorageEngine {
                     (&alloc as *const bch_alloc_v4).cast(),
                     core::mem::size_of::<bch_alloc_v4>(),
                 );
+                let ret = if ret == 0 {
+                    bch2_btree_bit_mod(
+                        &mut trans,
+                        BTREE_ID_FREESPACE,
+                        alloc_freespace_pos((*key).k.p, &old_alloc),
+                        false,
+                    )
+                } else {
+                    ret
+                };
                 let ret = if ret == 0 {
                     bch2_trans_commit(&mut trans)
                 } else {
@@ -709,6 +729,20 @@ impl StorageEngine {
                     (&alloc as *const bch_alloc_v4).cast(),
                     core::mem::size_of::<bch_alloc_v4>(),
                 );
+                let ret = if ret == 0 {
+                    if alloc.data_type == BCH_DATA_FREE {
+                        bch2_btree_bit_mod(
+                            &mut trans,
+                            BTREE_ID_FREESPACE,
+                            alloc_freespace_pos((*key).k.p, &alloc),
+                            true,
+                        )
+                    } else {
+                        0
+                    }
+                } else {
+                    ret
+                };
                 let ret = if ret == 0 {
                     bch2_trans_commit(&mut trans)
                 } else {
