@@ -686,8 +686,14 @@ impl StorageEngine {
                 if alloc.dirty_sectors != 0 || alloc.cached_sectors != 0 {
                     return Err(EngineError::Transaction(-16));
                 }
-                alloc.data_type = BCH_DATA_NEED_DISCARD;
-                alloc.data_type = BCH_DATA_FREE;
+                if alloc.data_type != BCH_DATA_NEED_DISCARD {
+                    /* background.c first moves an empty bucket into
+                     * need_discard; discard.c performs the later free
+                     * transition after the device-side discard boundary. */
+                    alloc.data_type = BCH_DATA_NEED_DISCARD;
+                } else {
+                    alloc.data_type = BCH_DATA_FREE;
+                }
                 let mut trans = btree_trans::default();
                 bch2_trans_init(&mut trans, &mut **fs);
                 bch2_trans_begin(&mut trans);
