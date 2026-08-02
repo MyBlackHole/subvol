@@ -2414,6 +2414,18 @@ pub(crate) unsafe fn check_extents_to_backpointers(fs: &mut bch_fs) -> Result<()
     Ok(())
 }
 
+/// Opens a persistent engine image and runs every consistency check,
+/// mirroring the fsck command flow: open the device, run all recovery
+/// passes, report the first error (fsck.rs:419-447).  The engine has no
+/// repair path, so this is the no-repair mode only, matching upstream
+/// `-n/--no_repair` ("Don't repair, only check for errors", fsck.rs:60-61).
+/// An open failure surfaces as an Io error; a failed check surfaces as
+/// the verifying error (e.g. a DerivedStateMismatch variant).
+pub fn fsck_image(path: impl AsRef<Path>) -> Result<(), EngineError> {
+    let engine = StorageEngine::open_persistent(path)?;
+    engine.verify_all()
+}
+
 unsafe fn configure_persistent_journal(
     fs: &mut bch_fs,
     file: std::fs::File,
@@ -3003,6 +3015,23 @@ mod tests {
             }
             bch2_trans_put(&mut trans);
         }
+    }
+
+    #[test]
+    fn fsck_image_passes_on_healthy_image() {
+        let (engine, path) = prepared_bucket_engine("fsck-healthy", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        drop(engine);
+        assert!(fsck_image(&path).is_ok());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fsck_image_io_error_on_unreadable_image() {
+        let path = persistent_test_path("fsck-io");
+        assert!(matches!(fsck_image(&path), Err(EngineError::Io(_))));
     }
 
     #[test]

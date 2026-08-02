@@ -13,8 +13,8 @@ mod snapshot;
 mod util;
 
 pub use engine::{
-    BtreeId, BtreeKey, DerivedStateMismatch, DurabilityPoint, EngineError, EngineMetrics,
-    FaultPoint, JournalSnapshot, KeyPosition, ReadTransaction, ReclaimStatus, RecoveryFaultPoint,
-    StorageEngine, Transaction, STORAGE_FORMAT_VERSION,
+    fsck_image, BtreeId, BtreeKey, DerivedStateMismatch, DurabilityPoint, EngineError,
+    EngineMetrics, FaultPoint, JournalSnapshot, KeyPosition, ReadTransaction, ReclaimStatus,
+    RecoveryFaultPoint, StorageEngine, Transaction, STORAGE_FORMAT_VERSION,
 };
 pub use util::log::{emit, LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_OFF, LOG_WARN};
