@@ -2254,6 +2254,11 @@ mod tests {
             KeyPosition::new(0, 4, 0)
         );
 
+        engine.flush_journal().unwrap();
+        let image = engine.durable_journal().unwrap();
+        let recovered = StorageEngine::recover(&image).unwrap();
+        assert!(recovered.verify_bucket_indexes().is_ok());
+
         drop(engine);
         fs::remove_file(path).unwrap();
     }
