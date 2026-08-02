@@ -3500,6 +3500,111 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    /// Matches a model-derived guard verdict against the implementation's
+    /// verification result.  A mismatch closes every open bucket before
+    /// panicking so the engine drop never aborts with an open-bucket-leak
+    /// assertion that masks the real failure message (T0197).
+    fn expect_verdict<F>(
+        engine: &StorageEngine,
+        open: &[bool; 4],
+        buckets: &[KeyPosition; 4],
+        expected: Option<DerivedStateMismatch>,
+        check: F,
+        context: &str,
+    ) where
+        F: Fn(&StorageEngine) -> Result<(), EngineError>,
+    {
+        let ok = match expected {
+            None => check(engine).is_ok(),
+            Some(expected) => matches!(
+                check(engine),
+                Err(EngineError::DerivedState(actual)) if actual == expected
+            ),
+        };
+        if !ok {
+            for index in 0..4 {
+                if open[index] {
+                    let _ = engine.close_open_bucket(buckets[index]);
+                }
+            }
+            panic!(
+                "{context}: model expected {expected:?}, engine reported {:?}",
+                check(engine)
+            );
+        }
+    }
+
+    /// Panic-safe model engine: closes every open bucket on drop so a
+    /// proptest failure mid-sequence can never abort with the engine's
+    /// open-bucket-leak assertion masking the real failure message (T0197).
+    struct ModelEngine {
+        engine: Option<StorageEngine>,
+        open: [bool; 4],
+    }
+
+    impl ModelEngine {
+        fn new(engine: StorageEngine) -> Self {
+            Self {
+                engine: Some(engine),
+                open: [false; 4],
+            }
+        }
+
+        fn open_bucket(&mut self, index: usize) {
+            self.engine
+                .as_ref()
+                .unwrap()
+                .open_bucket(KeyPosition::new(0, 4 + index as u64, 0))
+                .unwrap();
+            self.open[index] = true;
+        }
+
+        fn close_open_bucket(&mut self, index: usize) {
+            self.engine
+                .as_ref()
+                .unwrap()
+                .close_open_bucket(KeyPosition::new(0, 4 + index as u64, 0))
+                .unwrap();
+            self.open[index] = false;
+        }
+
+        fn reopen(&mut self, path: &Path) {
+            for index in 0..4 {
+                if self.open[index] {
+                    self.engine
+                        .as_ref()
+                        .unwrap()
+                        .close_open_bucket(KeyPosition::new(0, 4 + index as u64, 0))
+                        .unwrap();
+                    self.open[index] = false;
+                }
+            }
+            let old = self.engine.take().unwrap();
+            old.flush_journal().unwrap();
+            drop(old);
+            self.engine = Some(StorageEngine::open_persistent(path).unwrap());
+        }
+    }
+
+    impl Drop for ModelEngine {
+        fn drop(&mut self) {
+            if let Some(engine) = self.engine.as_ref() {
+                for index in 0..4 {
+                    if self.open[index] {
+                        let _ = engine.close_open_bucket(KeyPosition::new(0, 4 + index as u64, 0));
+                    }
+                }
+            }
+        }
+    }
+
+    impl std::ops::Deref for ModelEngine {
+        type Target = StorageEngine;
+        fn deref(&self) -> &StorageEngine {
+            self.engine.as_ref().unwrap()
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 16,
@@ -3509,9 +3614,8 @@ mod tests {
 
         #[test]
         fn open_bucket_discard_model_protects_open_from_reuse(
-            operations in prop::collection::vec((0u8..7, 0u8..4), 1..=40),
-        ) {
-            let (engine, path) = prepared_bucket_engine("discard-open-model", 4);
+            operations in prop::collection::vec((0u8..8, 0u8..4), 1..=40),
+        ) {            let (engine, path) = prepared_bucket_engine("discard-open-model", 4);
             add_free_bucket(&engine, 5);
             add_free_bucket(&engine, 6);
             add_free_bucket(&engine, 7);
@@ -3521,10 +3625,11 @@ mod tests {
                 KeyPosition::new(0, 6, 0),
                 KeyPosition::new(0, 7, 0),
             ];
-            let mut engine = engine;
+            let mut engine = ModelEngine::new(engine);
             let mut state = [0u8; 4]; // 0=free, 1=btree-owned, 2=need-discard
             let mut open = [false; 4];
             let mut queued = [false; 4];
+            let mut device_rw = true;
             let mut shadow_queue: VecDeque<usize> = VecDeque::new();
             for (kind, bucket) in operations {
                 let index = bucket as usize;
@@ -3547,7 +3652,7 @@ mod tests {
                         let round = shadow_queue.len();
                         for _ in 0..round {
                             if let Some(head) = shadow_queue.pop_front() {
-                                if state[head] == 2 && !open[head] {
+                                if state[head] == 2 && !open[head] && device_rw {
                                     queued[head] = false;
                                     state[head] = 0;
                                 } else {
@@ -3568,7 +3673,7 @@ mod tests {
                     }
                     2 => {
                         let result = engine.reclaim_bucket(buckets[index]);
-                        if open[index] {
+                        if open[index] || !device_rw {
                             prop_assert!(matches!(
                                 result,
                                 Err(EngineError::Transaction(-16))
@@ -3581,7 +3686,7 @@ mod tests {
                     3 => {
                         let result = engine.allocate_bucket(0);
                         let free_count = state.iter().filter(|&&s| s == 0).count();
-                        if free_count == 0 {
+                        if !device_rw || free_count == 0 {
                             prop_assert!(result.is_err());
                         } else {
                             let position = result.unwrap();
@@ -3591,20 +3696,15 @@ mod tests {
                                 .expect("allocated bucket is in the model");
                             prop_assert_eq!(state[allocated], 0);
                             state[allocated] = 1;
-                            open[allocated] = false;
                         }
                     }
                     4 => {
-                        engine.flush_journal().unwrap();
-                        for index in 0..4 {
-                            if open[index] {
-                                engine.close_open_bucket(buckets[index]).unwrap();
-                                open[index] = false;
-                            }
-                        }
-                        drop(engine);
-                        let recovered = StorageEngine::open_persistent(&path).unwrap();
-                        let discovered = recovered.discover_discard_buckets().unwrap();
+                        engine.reopen(&path);
+                        /* open_persistent re-derives rw_devs from
+                         * devs_online (engine.rs:1687-1700), so a
+                         * process-style restart puts dev 0 back rw. */
+                        device_rw = true;
+                        let discovered = engine.discover_discard_buckets().unwrap();
                         let expected = state.iter().filter(|&&s| s == 2).count();
                         prop_assert_eq!(discovered, expected);
                         state = [0u8; 4];
@@ -3612,7 +3712,7 @@ mod tests {
                         shadow_queue.clear();
                         for index in 0..4 {
                             let bucket = buckets[index];
-                            let mut fs = recovered.lock_fs().unwrap();
+                            let mut fs = engine.lock_fs().unwrap();
                             let mut alloc = None;
                             unsafe {
                                 for raw in scan_raw_locked(&mut **fs, 4).unwrap() {
@@ -3641,23 +3741,75 @@ mod tests {
                             };
                             open[index] = false;
                         }
-                        engine = recovered;
                     }
                     5 => {
-                        if state[index] != 0 {
-                            engine.open_bucket(buckets[index]).unwrap();
-                            open[index] = true;
-                        }
+                        /* Guard decision injection (T0197): the model no
+                         * longer pre-judges openability from its shadow
+                         * state; it unconditionally opens and lets the
+                         * implementation's guard invariants adjudicate
+                         * below (open_bucket is an unguarded insert,
+                         * engine.rs:901). */
+                        engine.open_bucket(index);
+                        open[index] = true;
                     }
                     6 => {
                         if open[index] {
-                            engine.close_open_bucket(buckets[index]).unwrap();
+                            engine.close_open_bucket(index);
                             open[index] = false;
+                        }
+                    }
+                    7 => {
+                        /* not_rw dimension (T0197 AC-3): toggle dev 0
+                         * writability and let set_device_rw's open-bucket
+                         * refusal (engine.rs:944-949) drive the model. */
+                        let rw = index & 1 == 0;
+                        let result = engine.set_device_rw(0, rw);
+                        if rw {
+                            prop_assert!(result.is_ok());
+                            device_rw = true;
+                        } else if open.iter().any(|&o| o) {
+                            prop_assert!(matches!(
+                                result,
+                                Err(EngineError::Transaction(-16))
+                            ));
+                        } else {
+                            prop_assert!(result.is_ok());
+                            device_rw = false;
                         }
                     }
                     _ => {}
                 }
-                prop_assert!(engine.verify_all().is_ok());
+                /* Expectation-driven adjudication: the model derives the
+                 * implementation's guard verdict (first violating free
+                 * bucket in tree order: open wins over not_rw, guard
+                 * invariants, engine.rs:713-722) and matches it against
+                 * verify_all's first error. */
+                let expected_error = {
+                    let mut expected = None;
+                    for index in 0..4 {
+                        if state[index] == 0 {
+                            if open[index] {
+                                expected =
+                                    Some(DerivedStateMismatch::OpenBucketFree);
+                                break;
+                            }
+                            if !device_rw {
+                                expected =
+                                    Some(DerivedStateMismatch::NotRwBucketFree);
+                                break;
+                            }
+                        }
+                    }
+                    expected
+                };
+                expect_verdict(
+                    &engine,
+                    &open,
+                    &buckets,
+                    expected_error,
+                    |e| e.verify_all(),
+                    "verify_all",
+                );
                 let mut fs = engine.lock_fs().unwrap();
                 for index in 0..4 {
                     let mut alloc = None;
@@ -3681,20 +3833,72 @@ mod tests {
                     }
                 }
                 drop(fs);
-                prop_assert!(
-                    engine.verify_guard_invariants().is_ok(),
-                    "guard invariants: no open or not_rw bucket may be free"
+                expect_verdict(
+                    &engine,
+                    &open,
+                    &buckets,
+                    expected_error,
+                    |e| e.verify_guard_invariants(),
+                    "verify_guard_invariants",
                 );
-            }
-            for index in 0..4 {
-                if open[index] {
-                    engine.close_open_bucket(buckets[index]).unwrap();
-                    open[index] = false;
-                }
             }
             drop(engine);
             fs::remove_file(path).unwrap();
         }
+    }
+
+    /// Deterministic not_rw-dimension companion to the proptest above
+    /// (T0197 AC-3): every guard verdict in this scenario is expected by
+    /// the model and produced by the implementation's own adjudication.
+    #[test]
+    fn not_rw_dimension_guard_verdicts_are_implementation_adjudicated() {
+        let (engine, path) = prepared_bucket_engine("discard-notrw-model", 4);
+        add_free_bucket(&engine, 5);
+        let mut engine = ModelEngine::new(engine);
+        let bucket5 = KeyPosition::new(0, 5, 0);
+        engine.set_device_rw(0, false).unwrap();
+        assert!(matches!(
+            engine.verify_all(),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::NotRwBucketFree
+            ))
+        ));
+        /* open wins over not_rw in tree-order verdict (engine.rs:713-722) */
+        engine.open_bucket(0);
+        assert!(matches!(
+            engine.verify_all(),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::OpenBucketFree
+            ))
+        ));
+        engine.close_open_bucket(0);
+        /* an open bucket refuses dev removal, like bch2_dev_allocator_remove()
+         * waiting for open write points to drain */
+        engine.open_bucket(1);
+        assert!(matches!(
+            engine.set_device_rw(0, false),
+            Err(EngineError::Transaction(-16))
+        ));
+        engine.close_open_bucket(1);
+        engine.set_device_rw(0, false).unwrap();
+        /* not_rw preserves the failure semantics of allocate (-1) and
+         * reclaim (-16), and the discard worker keeps rotating (EAGAIN) */
+        assert!(engine.allocate_bucket(0).is_err());
+        assert!(matches!(
+            engine.reclaim_bucket(bucket5),
+            Err(EngineError::Transaction(-16))
+        ));
+        engine.queue_discard_bucket(bucket5).unwrap();
+        assert!(matches!(
+            engine.run_discard_worker(),
+            Err(EngineError::Transaction(-11))
+        ));
+        /* a process-style restart re-derives rw_devs from devs_online
+         * (engine.rs:1687-1700): dev 0 is rw again */
+        engine.reopen(&path);
+        assert!(engine.allocate_bucket(0).is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
     }
 
     proptest! {
