@@ -244,6 +244,7 @@ pub enum DerivedStateMismatch {
     AllocSet,
     BackpointerSet,
     FreespaceSet,
+    NeedDiscardSet,
 }
 
 #[derive(Debug)]
@@ -661,7 +662,7 @@ impl StorageEngine {
             }
             if expected_need_discard != actual_need_discard {
                 return Err(EngineError::DerivedState(
-                    DerivedStateMismatch::FreespaceSet,
+                    DerivedStateMismatch::NeedDiscardSet,
                 ));
             }
             Ok(())
@@ -2444,7 +2445,7 @@ mod tests {
         assert!(matches!(
             engine.verify_bucket_indexes(),
             Err(EngineError::DerivedState(
-                DerivedStateMismatch::FreespaceSet
+                DerivedStateMismatch::NeedDiscardSet
             ))
         ));
         set_need_discard_index(&engine, crate::btree::bkey::POS(0, 4), true);
