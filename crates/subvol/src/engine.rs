@@ -713,7 +713,7 @@ impl StorageEngine {
                     } else {
                         ret
                     };
-                    if ret == -12 && trans.realloc_bytes_required != 0 {
+                    if ret == -4 || (ret == -12 && trans.realloc_bytes_required != 0) {
                         continue;
                     }
                     break ret;
@@ -812,7 +812,7 @@ impl StorageEngine {
                     } else {
                         ret
                     };
-                    if ret == -12 && trans.realloc_bytes_required != 0 {
+                    if ret == -4 || (ret == -12 && trans.realloc_bytes_required != 0) {
                         continue;
                     }
                     break ret;
