@@ -669,6 +669,9 @@ impl StorageEngine {
                     continue;
                 }
                 let bucket_offset = (*key).k.p.offset;
+                if bucket_offset < member.first_bucket as u64 || bucket_offset >= member.nbuckets {
+                    continue;
+                }
                 if !freespace_candidates.is_empty()
                     && !freespace_candidates.contains(&bucket_offset)
                 {
@@ -724,9 +727,15 @@ impl StorageEngine {
     pub fn reclaim_bucket(&self, position: KeyPosition) -> Result<(), EngineError> {
         let mut fs = self.lock_fs()?;
         unsafe {
+            if fs.disk_sb.sb.is_null() || position.inode >= (*fs.disk_sb.sb).nr_devices as u64 {
+                return Err(EngineError::Transaction(-1));
+            }
             let backpointers = scan_raw_locked(&mut **fs, 8)?;
             let member = crate::sb::io::bch2_sb_member_get(fs.disk_sb.sb, position.inode as usize);
             if member.bucket_size == 0 {
+                return Err(EngineError::Transaction(-1));
+            }
+            if position.offset < member.first_bucket as u64 || position.offset >= member.nbuckets {
                 return Err(EngineError::Transaction(-1));
             }
             let start = position.offset.saturating_mul(member.bucket_size as u64);
