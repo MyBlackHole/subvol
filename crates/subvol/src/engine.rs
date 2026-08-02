@@ -886,6 +886,39 @@ impl StorageEngine {
         }
     }
 
+    /// Completes the controlled discard boundary for a bucket already marked
+    /// need_discard.  The caller-facing error is EAGAIN-like until the
+    /// journal boundary is durable; the actual state/index transition remains
+    /// the single transaction performed by reclaim_bucket().
+    pub fn discard_bucket(&self, position: KeyPosition) -> Result<(), EngineError> {
+        let mut fs = self.lock_fs()?;
+        unsafe {
+            if fs.disk_sb.sb.is_null() || position.inode >= (*fs.disk_sb.sb).nr_devices as u64 {
+                return Err(EngineError::Transaction(-1));
+            }
+            let mut alloc_state = None;
+            for raw in scan_raw_locked(&mut **fs, 4)? {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ != KEY_TYPE_alloc_v4 || (*key).k.p != position.raw() {
+                    continue;
+                }
+                let value = (key as *const u8)
+                    .add(core::mem::size_of::<bkey>())
+                    .cast::<bch_alloc_v4>();
+                alloc_state = Some(core::ptr::read_unaligned(value));
+                break;
+            }
+            let alloc = alloc_state.ok_or(EngineError::Transaction(-2))?;
+            if alloc.data_type != BCH_DATA_NEED_DISCARD
+                || alloc.journal_seq_empty > fs.journal.last_seq_ondisk.load(Ordering::Acquire)
+            {
+                return Err(EngineError::Transaction(-11));
+            }
+        }
+        drop(fs);
+        self.reclaim_bucket(position)
+    }
+
     /// Publishes the current journal buffer.  Only records returned by
     /// `durable_journal()` after this succeeds can survive a crash.
     pub fn flush_journal(&self) -> Result<(), EngineError> {
@@ -2400,6 +2433,10 @@ mod tests {
             engine.allocate_bucket(0).unwrap(),
             KeyPosition::new(0, 4, 0)
         );
+        assert!(matches!(
+            engine.discard_bucket(KeyPosition::new(0, 4, 0)),
+            Err(EngineError::Transaction(-11))
+        ));
         assert!(engine.verify_bucket_indexes().is_ok());
         engine.reclaim_bucket(KeyPosition::new(0, 4, 0)).unwrap();
         assert!(engine.verify_bucket_indexes().is_ok());
@@ -2424,7 +2461,7 @@ mod tests {
             fs.journal.last_seq_ondisk.store(1, Ordering::Release);
         }
         assert!(matches!(
-            engine.reclaim_bucket(KeyPosition::new(0, 4, 0)),
+            engine.discard_bucket(KeyPosition::new(0, 4, 0)),
             Err(EngineError::Transaction(-11))
         ));
         assert!(engine.verify_bucket_indexes().is_ok());
@@ -2432,7 +2469,7 @@ mod tests {
             let fs = engine.lock_fs().unwrap();
             fs.journal.last_seq_ondisk.store(2, Ordering::Release);
         }
-        engine.reclaim_bucket(KeyPosition::new(0, 4, 0)).unwrap();
+        engine.discard_bucket(KeyPosition::new(0, 4, 0)).unwrap();
         assert!(engine.verify_bucket_indexes().is_ok());
         assert_eq!(
             engine.allocate_bucket(0).unwrap(),
