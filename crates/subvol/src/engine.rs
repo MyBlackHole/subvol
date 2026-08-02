@@ -432,6 +432,8 @@ struct EngineState {
     rcu: Rcu,
     reclaim: Arc<ReclaimControl>,
     discard_inflight: Mutex<(VecDeque<(u64, u64)>, BTreeSet<(u64, u64)>)>,
+    open_buckets: Mutex<BTreeSet<(u64, u64)>>,
+    rw_devs: Mutex<BTreeSet<u64>>,
 }
 
 /// A self-contained btree/transaction/journal storage engine.  Clones share
@@ -489,6 +491,8 @@ impl StorageEngine {
             rcu,
             reclaim: Arc::new(ReclaimControl::default()),
             discard_inflight: Mutex::new((VecDeque::new(), BTreeSet::new())),
+            open_buckets: Mutex::new(BTreeSet::new()),
+            rw_devs: Mutex::new(BTreeSet::from([0])),
         });
         start_reclaim_worker(&inner)?;
         Ok(Self { inner })
@@ -683,6 +687,15 @@ impl StorageEngine {
             if member.bucket_size == 0 || !crate::sb::bch2_member_alive(&member) {
                 return Err(EngineError::Transaction(-1));
             }
+            if !self
+                .inner
+                .rw_devs
+                .lock()
+                .map_err(|_| EngineError::Poisoned)?
+                .contains(&dev)
+            {
+                return Err(EngineError::Transaction(-1));
+            }
             let mut freespace_candidates = BTreeSet::new();
             for raw in scan_raw_locked(&mut **fs, BTREE_ID_FREESPACE)? {
                 let key = raw.words.as_ptr().cast::<bkey_i>();
@@ -758,6 +771,48 @@ impl StorageEngine {
         }
     }
 
+    /// Marks a bucket as open, mirroring an in-progress write claim in the
+    /// open_buckets hash (foreground.h:274-296).  While open, the bucket is
+    /// protected from reclamation: reclaim and discard both refuse it, like
+    /// bch2_bucket_is_open_safe() skipping open buckets in the discard path
+    /// (discard.c:344-347, 433-436).
+    pub fn open_bucket(&self, position: KeyPosition) -> Result<(), EngineError> {
+        self.inner
+            .open_buckets
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?
+            .insert((position.inode, position.offset));
+        Ok(())
+    }
+
+    /// Releases the open claim on a bucket, mirroring bch2_open_bucket_put().
+    pub fn close_open_bucket(&self, position: KeyPosition) -> Result<(), EngineError> {
+        self.inner
+            .open_buckets
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?
+            .remove(&(position.inode, position.offset));
+        Ok(())
+    }
+
+    /// Sets the writable state of a device, mirroring
+    /// bch2_dev_allocator_set_rw()'s rw_devs bitmap (background.c:1650-1667).
+    /// A non-rw device refuses allocation and free transitions, like
+    /// bch2_dev_get_ioref(WRITE) failing in the discard path (discard.c:357-365).
+    pub fn set_device_rw(&self, dev: u64, rw: bool) -> Result<(), EngineError> {
+        let mut rw_devs = self
+            .inner
+            .rw_devs
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?;
+        if rw {
+            rw_devs.insert(dev);
+        } else {
+            rw_devs.remove(&dev);
+        }
+        Ok(())
+    }
+
     /// Releases a bucket only after its reverse-reference btree has no live
     /// entries; the transition first records need_discard and then free.
     pub fn reclaim_bucket(&self, position: KeyPosition) -> Result<(), EngineError> {
@@ -773,6 +828,24 @@ impl StorageEngine {
             }
             if position.offset < member.first_bucket as u64 || position.offset >= member.nbuckets {
                 return Err(EngineError::Transaction(-1));
+            }
+            if self
+                .inner
+                .open_buckets
+                .lock()
+                .map_err(|_| EngineError::Poisoned)?
+                .contains(&(position.inode, position.offset))
+            {
+                return Err(EngineError::Transaction(-16));
+            }
+            if !self
+                .inner
+                .rw_devs
+                .lock()
+                .map_err(|_| EngineError::Poisoned)?
+                .contains(&position.inode)
+            {
+                return Err(EngineError::Transaction(-16));
             }
             let start = position.offset.saturating_mul(member.bucket_size as u64);
             let end = start.saturating_add(member.bucket_size as u64);
@@ -917,6 +990,24 @@ impl StorageEngine {
             {
                 return Err(EngineError::Transaction(-11));
             }
+        }
+        if self
+            .inner
+            .open_buckets
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?
+            .contains(&(position.inode, position.offset))
+        {
+            return Err(EngineError::Transaction(-11));
+        }
+        if !self
+            .inner
+            .rw_devs
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?
+            .contains(&position.inode)
+        {
+            return Err(EngineError::Transaction(-11));
         }
         drop(fs);
         self.reclaim_bucket(position)
@@ -2743,6 +2834,132 @@ mod tests {
     }
 
     #[test]
+    fn discard_worker_rejects_open_bucket_until_closed() {
+        let (engine, path) = prepared_bucket_engine("discard-open", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        engine.open_bucket(position).unwrap();
+        assert!(matches!(
+            engine.reclaim_bucket(position),
+            Err(EngineError::Transaction(-16))
+        ));
+        assert!(matches!(
+            engine.discard_bucket(position),
+            Err(EngineError::Transaction(-11))
+        ));
+        assert!(engine.verify_bucket_indexes().is_ok());
+        engine.close_open_bucket(position).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        assert!(engine.verify_bucket_indexes().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn discard_reclaim_transaction_fault_leaves_no_half_state() {
+        let (engine, path) = prepared_bucket_engine("discard-fault", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        engine
+            .inject_fault(FaultPoint::TransactionRestart, 1)
+            .unwrap();
+        assert!(engine.reclaim_bucket(position).is_ok());
+        assert!(engine.verify_bucket_indexes().is_ok());
+        engine.inject_fault(FaultPoint::JournalWrite, 1).unwrap();
+        assert!(engine.flush_journal().is_err());
+        assert!(engine.verify_bucket_indexes().is_ok());
+        engine.flush_journal().unwrap();
+        assert!(engine.discard_bucket(position).is_ok());
+        assert!(engine.verify_bucket_indexes().is_ok());
+        drop(engine);
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        assert!(recovered.verify_bucket_indexes().is_ok());
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn discard_worker_skips_open_and_notrw_but_drains_ready_buckets() {
+        let (engine, path) = prepared_bucket_engine("discard-guard", 4);
+        add_free_bucket(&engine, 5);
+        add_free_bucket(&engine, 6);
+        let open = engine.allocate_bucket(0).unwrap();
+        let ready = engine.allocate_bucket(0).unwrap();
+        engine.reclaim_bucket(open).unwrap();
+        engine.reclaim_bucket(ready).unwrap();
+        engine.open_bucket(open).unwrap();
+        engine.queue_discard_bucket(open).unwrap();
+        engine.queue_discard_bucket(ready).unwrap();
+        assert!(matches!(
+            engine.run_discard_worker(),
+            Err(EngineError::Transaction(-11))
+        ));
+        assert!(
+            matches!(
+                engine.queue_discard_bucket(open),
+                Err(EngineError::Transaction(-17))
+            ),
+            "open bucket should stay queued"
+        );
+        engine.close_open_bucket(open).unwrap();
+        assert!(engine.run_discard_worker().is_ok());
+        assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(engine.queue_discard_bucket(open).is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn discard_worker_rotates_notrw_device_buckets_until_rw_restored() {
+        let (engine, path) = prepared_bucket_engine("discard-notrw-rotate", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        engine.set_device_rw(0, false).unwrap();
+        engine.queue_discard_bucket(position).unwrap();
+        assert!(matches!(
+            engine.run_discard_worker(),
+            Err(EngineError::Transaction(-11))
+        ));
+        assert!(matches!(
+            engine.queue_discard_bucket(position),
+            Err(EngineError::Transaction(-17))
+        ));
+        engine.set_device_rw(0, true).unwrap();
+        assert!(engine.run_discard_worker().is_ok());
+        assert!(engine.verify_bucket_indexes().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn discard_worker_requires_rw_device() {
+        let (engine, path) = prepared_bucket_engine("discard-notrw", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        engine.set_device_rw(0, false).unwrap();
+        assert!(matches!(
+            engine.discard_bucket(position),
+            Err(EngineError::Transaction(-11))
+        ));
+        assert!(matches!(
+            engine.reclaim_bucket(position),
+            Err(EngineError::Transaction(-16))
+        ));
+        assert!(matches!(
+            engine.allocate_bucket(0),
+            Err(EngineError::Transaction(-1))
+        ));
+        assert!(engine.verify_bucket_indexes().is_ok());
+        engine.set_device_rw(0, true).unwrap();
+        engine.discard_bucket(position).unwrap();
+        assert!(engine.verify_bucket_indexes().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn discard_worker_fifo_pass_drains_entire_queue() {
         let (engine, path) = prepared_bucket_engine("discard-fifo", 4);
         add_free_bucket(&engine, 5);
@@ -2816,6 +3033,194 @@ mod tests {
         assert!(recovered.verify_bucket_indexes().is_ok());
         drop(recovered);
         fs::remove_file(path).unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            max_shrink_iters: 64,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn open_bucket_discard_model_protects_open_from_reuse(
+            operations in prop::collection::vec((0u8..7, 0u8..4), 1..=40),
+        ) {
+            let (engine, path) = prepared_bucket_engine("discard-open-model", 4);
+            add_free_bucket(&engine, 5);
+            add_free_bucket(&engine, 6);
+            add_free_bucket(&engine, 7);
+            let buckets = [
+                KeyPosition::new(0, 4, 0),
+                KeyPosition::new(0, 5, 0),
+                KeyPosition::new(0, 6, 0),
+                KeyPosition::new(0, 7, 0),
+            ];
+            let mut engine = engine;
+            let mut state = [0u8; 4]; // 0=free, 1=btree-owned, 2=need-discard
+            let mut open = [false; 4];
+            let mut queued = [false; 4];
+            let mut shadow_queue: VecDeque<usize> = VecDeque::new();
+            for (kind, bucket) in operations {
+                let index = bucket as usize;
+                match kind {
+                    0 => {
+                        let result = engine.queue_discard_bucket(buckets[index]);
+                        if queued[index] {
+                            prop_assert!(matches!(
+                                result,
+                                Err(EngineError::Transaction(-17))
+                            ));
+                        } else {
+                            prop_assert!(result.is_ok());
+                            queued[index] = true;
+                            shadow_queue.push_back(index);
+                        }
+                    }
+                    1 => {
+                        let mut deferred = false;
+                        let round = shadow_queue.len();
+                        for _ in 0..round {
+                            if let Some(head) = shadow_queue.pop_front() {
+                                if state[head] == 2 && !open[head] {
+                                    queued[head] = false;
+                                    state[head] = 0;
+                                } else {
+                                    shadow_queue.push_back(head);
+                                    deferred = true;
+                                }
+                            }
+                        }
+                        let result = engine.run_discard_worker();
+                        if deferred {
+                            prop_assert!(matches!(
+                                result,
+                                Err(EngineError::Transaction(-11))
+                            ));
+                        } else {
+                            prop_assert!(result.is_ok());
+                        }
+                    }
+                    2 => {
+                        let result = engine.reclaim_bucket(buckets[index]);
+                        if open[index] {
+                            prop_assert!(matches!(
+                                result,
+                                Err(EngineError::Transaction(-16))
+                            ));
+                        } else {
+                            prop_assert!(result.is_ok());
+                            state[index] = if state[index] == 2 { 0 } else { 2 };
+                        }
+                    }
+                    3 => {
+                        let result = engine.allocate_bucket(0);
+                        let free_count = state.iter().filter(|&&s| s == 0).count();
+                        if free_count == 0 {
+                            prop_assert!(result.is_err());
+                        } else {
+                            let position = result.unwrap();
+                            let allocated = buckets
+                                .iter()
+                                .position(|b| *b == position)
+                                .expect("allocated bucket is in the model");
+                            prop_assert_eq!(state[allocated], 0);
+                            state[allocated] = 1;
+                            open[allocated] = false;
+                        }
+                    }
+                    4 => {
+                        engine.flush_journal().unwrap();
+                        drop(engine);
+                        let recovered = StorageEngine::open_persistent(&path).unwrap();
+                        let discovered = recovered.discover_discard_buckets().unwrap();
+                        let expected = state.iter().filter(|&&s| s == 2).count();
+                        prop_assert_eq!(discovered, expected);
+                        state = [0u8; 4];
+                        queued = [false; 4];
+                        shadow_queue.clear();
+                        for index in 0..4 {
+                            let bucket = buckets[index];
+                            let mut fs = recovered.lock_fs().unwrap();
+                            let mut alloc = None;
+                            unsafe {
+                                for raw in scan_raw_locked(&mut **fs, 4).unwrap() {
+                                    let key = raw.words.as_ptr().cast::<bkey_i>();
+                                    if (*key).k.type_ == KEY_TYPE_alloc_v4
+                                        && (*key).k.p == bucket.raw()
+                                    {
+                                        let value = (key as *const u8)
+                                            .add(core::mem::size_of::<bkey>())
+                                            .cast::<bch_alloc_v4>();
+                                        alloc = Some(core::ptr::read_unaligned(value));
+                                        break;
+                                    }
+                                }
+                            }
+                            drop(fs);
+                            let alloc = alloc.expect("model bucket alloc exists");
+                            state[index] = if alloc.data_type == BCH_DATA_FREE {
+                                0
+                            } else if alloc.data_type == BCH_DATA_NEED_DISCARD {
+                                queued[index] = true;
+                                shadow_queue.push_back(index);
+                                2
+                            } else {
+                                1
+                            };
+                            open[index] = false;
+                        }
+                        engine = recovered;
+                    }
+                    5 => {
+                        if state[index] != 0 {
+                            engine.open_bucket(buckets[index]).unwrap();
+                            open[index] = true;
+                        }
+                    }
+                    6 => {
+                        if open[index] {
+                            engine.close_open_bucket(buckets[index]).unwrap();
+                            open[index] = false;
+                        }
+                    }
+                    _ => {}
+                }
+                prop_assert!(engine.verify_bucket_indexes().is_ok());
+                let mut fs = engine.lock_fs().unwrap();
+                for index in 0..4 {
+                    let mut alloc = None;
+                    unsafe {
+                        for raw in scan_raw_locked(&mut **fs, 4).unwrap() {
+                            let key = raw.words.as_ptr().cast::<bkey_i>();
+                            if (*key).k.type_ == KEY_TYPE_alloc_v4
+                                && (*key).k.p == buckets[index].raw()
+                            {
+                                let value = (key as *const u8)
+                                    .add(core::mem::size_of::<bkey>())
+                                    .cast::<bch_alloc_v4>();
+                                alloc = Some(core::ptr::read_unaligned(value));
+                                break;
+                            }
+                        }
+                    }
+                    let alloc = alloc.expect("model bucket alloc exists");
+                    if open[index] {
+                        prop_assert_ne!(
+                            alloc.data_type,
+                            BCH_DATA_FREE,
+                            "open bucket must not become free"
+                        );
+                    }
+                    if state[index] == 2 {
+                        prop_assert_eq!(alloc.data_type, BCH_DATA_NEED_DISCARD);
+                    }
+                }
+                drop(fs);
+            }
+            drop(engine);
+            fs::remove_file(path).unwrap();
+        }
     }
 
     proptest! {
