@@ -171,6 +171,25 @@ pub enum RecoveryFaultPoint {
     BeforePublication,
 }
 
+/// A fault injected into the fsck repair path (T0200), mirroring the
+/// `RecoveryFaultPoint` one-shot injection model: `fsck_image_with_fault`
+/// passes a single point, the first repair transaction consumes it.
+/// The points ride the existing error propagation paths, adding no new
+/// control flow: `DuringRepairRestart` injects -4 at the repair commit
+/// boundary, which the bch2_trans_begin retry loop resolves
+/// (trans_maybe_inject_restart, commit.c:1390; lockrestart_do,
+/// iter.h:1115-1127); `DuringRepairOom` injects a hard -12 with no
+/// realloc requirement (restarted == 0), which aborts the repair with
+/// the transaction error; `AfterRepairBeforeFlush` fails the journal
+/// flush that makes repairs durable, mirroring a failed fs.exit()
+/// shutdown (fsck.rs:457-460).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsckFaultPoint {
+    DuringRepairRestart,
+    DuringRepairOom,
+    AfterRepairBeforeFlush,
+}
+
 /// A durable journal image captured after successful flushes.  It models the
 /// state a fresh engine receives after a crash; unflushed transaction updates
 /// are intentionally absent.
@@ -2461,9 +2480,26 @@ pub enum FixErrors {
 /// guard-verdict errors (OpenBucketFree / NotRwBucketFree) are never
 /// repaired, matching the upstream skip semantics.
 pub fn fsck_image(path: impl AsRef<Path>, fix: FixErrors) -> Result<(), EngineError> {
+    fsck_image_with_fault(path, fix, None)
+}
+
+/// `fsck_image` with a one-shot repair-path fault injection (T0200).
+/// The public entry point passes `None`; the fault matrix tests pass a
+/// `FsckFaultPoint` and assert the image never falsely reports success
+/// (the `recovery_fault_matrix_never_publishes_success` pattern).
+fn fsck_image_with_fault(
+    path: impl AsRef<Path>,
+    fix: FixErrors,
+    fault: Option<FsckFaultPoint>,
+) -> Result<(), EngineError> {
     let engine = StorageEngine::open_persistent(path)?;
     if fix == FixErrors::Yes {
-        repair_derived_indexes(&engine)?;
+        repair_derived_indexes(&engine, fault)?;
+        if fault == Some(FsckFaultPoint::AfterRepairBeforeFlush) {
+            /* mirror a failed fs.exit() shutdown: the repairs were
+             * committed but never made durable (fsck.rs:457-460) */
+            return Err(EngineError::Journal(-5));
+        }
         /* make the repairs durable before reporting success, like the
          * upstream fsck flow's fs.exit() shutdown (fsck.rs:457-460) */
         engine.flush_journal()?;
@@ -2482,7 +2518,10 @@ pub fn fsck_image(path: impl AsRef<Path>, fix: FixErrors) -> Result<(), EngineEr
 /// `delete_freespace_key`'s single-transaction commit (alloc/check.c:366-371);
 /// a non-index failure aborts the repair (upstream ret propagation) instead
 /// of pretending success.
-fn repair_derived_indexes(engine: &StorageEngine) -> Result<(), EngineError> {
+fn repair_derived_indexes(
+    engine: &StorageEngine,
+    fault: Option<FsckFaultPoint>,
+) -> Result<(), EngineError> {
     let mut fs = engine.lock_fs()?;
     unsafe {
         if fs.disk_sb.sb.is_null() {
@@ -2524,8 +2563,15 @@ fn repair_derived_indexes(engine: &StorageEngine) -> Result<(), EngineError> {
                 missing.remove(&pos);
             }
         }
+        let mut fault_rest = fault;
         for position in stale {
-            bit_mod_sync(&mut **fs, BTREE_ID_FREESPACE, position, false)?;
+            bit_mod_sync(
+                &mut **fs,
+                BTREE_ID_FREESPACE,
+                position,
+                false,
+                &mut fault_rest,
+            )?;
         }
         for (inode, offset) in missing {
             bit_mod_sync(
@@ -2533,6 +2579,7 @@ fn repair_derived_indexes(engine: &StorageEngine) -> Result<(), EngineError> {
                 BTREE_ID_FREESPACE,
                 crate::btree::bkey::POS(inode, offset),
                 true,
+                &mut fault_rest,
             )?;
         }
         /* Delete stale need_discard entries, then insert missing ones. */
@@ -2549,7 +2596,13 @@ fn repair_derived_indexes(engine: &StorageEngine) -> Result<(), EngineError> {
             }
         }
         for position in stale {
-            bit_mod_sync(&mut **fs, BTREE_ID_NEED_DISCARD, position, false)?;
+            bit_mod_sync(
+                &mut **fs,
+                BTREE_ID_NEED_DISCARD,
+                position,
+                false,
+                &mut fault_rest,
+            )?;
         }
         for (inode, offset) in missing {
             bit_mod_sync(
@@ -2557,6 +2610,7 @@ fn repair_derived_indexes(engine: &StorageEngine) -> Result<(), EngineError> {
                 BTREE_ID_NEED_DISCARD,
                 crate::btree::bkey::POS(inode, offset),
                 true,
+                &mut fault_rest,
             )?;
         }
     }
@@ -2565,13 +2619,18 @@ fn repair_derived_indexes(engine: &StorageEngine) -> Result<(), EngineError> {
 
 /// One-transaction bit-map entry modification, mirroring
 /// `delete_freespace_key`'s commit flow (alloc/check.c:366-371): a -12
-/// (ENOMEM) restart grows the transaction and retries, any other failure
-/// aborts the repair with the transaction error.
+/// (ENOMEM) restart grows the transaction and retries, a -4 restart
+/// (trans restart) rides the bch2_trans_begin retry loop like
+/// lockrestart_do (iter.h:1115-1127), any other failure aborts the
+/// repair with the transaction error.  A one-shot `fault` (T0200) is
+/// consumed at the commit boundary (the trans_maybe_inject_restart
+/// position, commit.c:1390).
 unsafe fn bit_mod_sync(
     fs: &mut bch_fs,
     btree: u8,
     position: bpos,
     set: bool,
+    fault: &mut Option<FsckFaultPoint>,
 ) -> Result<(), EngineError> {
     let mut trans = btree_trans::default();
     bch2_trans_init(&mut trans, fs);
@@ -2579,11 +2638,26 @@ unsafe fn bit_mod_sync(
         bch2_trans_begin(&mut trans);
         let ret = bch2_btree_bit_mod(&mut trans, btree, position, set);
         let ret = if ret == 0 {
-            bch2_trans_commit(&mut trans)
+            match *fault {
+                Some(FsckFaultPoint::DuringRepairRestart) => {
+                    *fault = None;
+                    -4
+                }
+                Some(FsckFaultPoint::DuringRepairOom) => {
+                    *fault = None;
+                    /* hard ENOMEM with no realloc requirement: the -12
+                     * fails the realloc retry condition below and aborts
+                     * the repair (restarted == 0 semantics) */
+                    -12
+                }
+                Some(FsckFaultPoint::AfterRepairBeforeFlush) | None => {
+                    bch2_trans_commit(&mut trans)
+                }
+            }
         } else {
             ret
         };
-        if ret == -12 && trans.realloc_bytes_required != 0 {
+        if ret == -4 || (ret == -12 && trans.realloc_bytes_required != 0) {
             continue;
         }
         bch2_trans_put(&mut trans);
@@ -3289,6 +3363,97 @@ mod tests {
         drop(reopened);
         assert!(present, "missing need_discard entry must be re-inserted");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fsck_repair_restart_injected_retries_and_succeeds() {
+        /* T0200: a -4 restart injected at the first repair commit rides
+         * the bch2_trans_begin retry loop (lockrestart_do, iter.h:1115-1127)
+         * and the repair converges; the injected point is consumed once. */
+        let (engine, path) = prepared_bucket_engine("fsck-rt-inject", 4);
+        add_free_bucket(&engine, 5);
+        set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
+        engine.flush_journal().unwrap();
+        drop(engine);
+        assert!(fsck_image_with_fault(
+            &path,
+            FixErrors::Yes,
+            Some(FsckFaultPoint::DuringRepairRestart)
+        )
+        .is_ok());
+        let reopened = StorageEngine::open_persistent(&path).unwrap();
+        assert!(reopened.verify_all().is_ok());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fsck_repair_oom_injected_aborts_and_rerun_recovers() {
+        /* T0200: a hard -12 (restarted == 0, no realloc requirement)
+         * aborts the repair with the transaction error; the image keeps
+         * its inconsistency, so a clean rerun completes the repair. */
+        let (engine, path) = prepared_bucket_engine("fsck-oom-inject", 4);
+        add_free_bucket(&engine, 5);
+        set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
+        engine.flush_journal().unwrap();
+        drop(engine);
+        assert!(matches!(
+            fsck_image_with_fault(&path, FixErrors::Yes, Some(FsckFaultPoint::DuringRepairOom)),
+            Err(EngineError::Transaction(-12))
+        ));
+        assert!(fsck_image(&path, FixErrors::Yes).is_ok());
+        let reopened = StorageEngine::open_persistent(&path).unwrap();
+        assert!(reopened.verify_all().is_ok());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fsck_repair_flush_failure_injected_aborts_and_rerun_recovers() {
+        /* T0200: a flush failure after the repairs were committed (the
+         * fs.exit() shutdown point, fsck.rs:457-460) surfaces as a
+         * Journal error without falsely reporting success; the unflushed
+         * repairs are dropped by the reopen (journal replay only re-applies
+         * durable records), so a clean rerun repairs and verifies. */
+        let (engine, path) = prepared_bucket_engine("fsck-flush-inject", 4);
+        add_free_bucket(&engine, 5);
+        set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
+        engine.flush_journal().unwrap();
+        drop(engine);
+        assert!(matches!(
+            fsck_image_with_fault(
+                &path,
+                FixErrors::Yes,
+                Some(FsckFaultPoint::AfterRepairBeforeFlush)
+            ),
+            Err(EngineError::Journal(-5))
+        ));
+        assert!(fsck_image(&path, FixErrors::Yes).is_ok());
+        let reopened = StorageEngine::open_persistent(&path).unwrap();
+        assert!(reopened.verify_all().is_ok());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fsck_repair_fault_matrix_never_falsely_reports_success() {
+        /* T0200: every repair-path fault point must fail the repair
+         * instead of publishing success, mirroring the recovery fault
+         * matrix pattern (recovery_fault_matrix_never_publishes_success).
+         * DuringRepairRestart is excluded: a -4 restart is retried by the
+         * transaction loop, not a failure. */
+        for fault in [
+            FsckFaultPoint::DuringRepairOom,
+            FsckFaultPoint::AfterRepairBeforeFlush,
+        ] {
+            let (engine, path) = prepared_bucket_engine("fsck-fault-matrix", 4);
+            add_free_bucket(&engine, 5);
+            set_need_discard_index(&engine, crate::btree::bkey::POS(0, 9), true);
+            engine.flush_journal().unwrap();
+            drop(engine);
+            assert!(
+                fsck_image_with_fault(&path, FixErrors::Yes, Some(fault)).is_err(),
+                "fault {fault:?} unexpectedly reported repair success"
+            );
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
