@@ -2180,6 +2180,80 @@ mod tests {
     }
 
     #[test]
+    fn public_bucket_api_runs_allocate_reclaim_and_reuse_sequence() {
+        let path = persistent_test_path("bucket-api");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+
+        unsafe {
+            let mut fs = engine.lock_fs().unwrap();
+            let position = crate::btree::bkey::POS(0, 4);
+            let alloc = bch_alloc_v4::default();
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut **fs);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    position,
+                    KEY_TYPE_alloc_v4,
+                    (&alloc as *const bch_alloc_v4).cast(),
+                    core::mem::size_of::<bch_alloc_v4>(),
+                );
+                let ret = if ret == 0 {
+                    bch2_btree_bit_mod(
+                        &mut trans,
+                        BTREE_ID_FREESPACE,
+                        alloc_freespace_pos(position, &alloc),
+                        true,
+                    )
+                } else {
+                    ret
+                };
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+        }
+
+        assert!(matches!(
+            engine.allocate_bucket(1),
+            Err(EngineError::Transaction(-1))
+        ));
+        assert!(matches!(
+            engine.reclaim_bucket(KeyPosition::new(0, 8, 0)),
+            Err(EngineError::Transaction(-1))
+        ));
+        assert_eq!(
+            engine.allocate_bucket(0).unwrap(),
+            KeyPosition::new(0, 4, 0)
+        );
+        assert!(engine.verify_bucket_indexes().is_ok());
+        engine.reclaim_bucket(KeyPosition::new(0, 4, 0)).unwrap();
+        assert!(engine.verify_bucket_indexes().is_ok());
+        engine.reclaim_bucket(KeyPosition::new(0, 4, 0)).unwrap();
+        assert!(engine.verify_bucket_indexes().is_ok());
+        assert_eq!(
+            engine.allocate_bucket(0).unwrap(),
+            KeyPosition::new(0, 4, 0)
+        );
+
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn recovery_fault_matrix_never_publishes_success() {
         let engine = StorageEngine::new().unwrap();
         let mut tx = engine.transaction();
