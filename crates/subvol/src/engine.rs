@@ -431,6 +431,7 @@ struct EngineState {
     fs: Mutex<EngineFs>,
     rcu: Rcu,
     reclaim: Arc<ReclaimControl>,
+    discard_inflight: Mutex<BTreeSet<(u64, u64)>>,
 }
 
 /// A self-contained btree/transaction/journal storage engine.  Clones share
@@ -487,6 +488,7 @@ impl StorageEngine {
             fs: Mutex::new(EngineFs(fs)),
             rcu,
             reclaim: Arc::new(ReclaimControl::default()),
+            discard_inflight: Mutex::new(BTreeSet::new()),
         });
         start_reclaim_worker(&inner)?;
         Ok(Self { inner })
@@ -918,6 +920,49 @@ impl StorageEngine {
         }
         drop(fs);
         self.reclaim_bucket(position)
+    }
+
+    /// Queues one bucket for the engine-local discard worker.  A duplicate
+    /// in-flight request is rejected with the discard.c EEXIST boundary.
+    pub fn queue_discard_bucket(&self, position: KeyPosition) -> Result<(), EngineError> {
+        let mut inflight = self
+            .inner
+            .discard_inflight
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?;
+        if !inflight.insert((position.inode, position.offset)) {
+            return Err(EngineError::Transaction(-17));
+        }
+        Ok(())
+    }
+
+    /// Runs one queued discard.  EAGAIN keeps the request queued for a later
+    /// worker pass; terminal results remove it from the in-flight set.
+    pub fn run_discard_worker_once(&self) -> Result<(), EngineError> {
+        let position = {
+            let inflight = self
+                .inner
+                .discard_inflight
+                .lock()
+                .map_err(|_| EngineError::Poisoned)?;
+            inflight
+                .iter()
+                .next()
+                .copied()
+                .map(|(inode, offset)| KeyPosition::new(inode, offset, 0))
+                .ok_or(EngineError::Transaction(-11))?
+        };
+        match self.discard_bucket(position) {
+            Err(EngineError::Transaction(-11)) => Err(EngineError::Transaction(-11)),
+            result => {
+                self.inner
+                    .discard_inflight
+                    .lock()
+                    .map_err(|_| EngineError::Poisoned)?
+                    .remove(&(position.inode, position.offset));
+                result
+            }
+        }
     }
 
     /// Publishes the current journal buffer.  Only records returned by
@@ -2486,6 +2531,31 @@ mod tests {
         assert!(recovered.verify_bucket_indexes().is_ok());
 
         drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn discard_worker_deduplicates_and_retries_eagain() {
+        let (engine, path) = prepared_bucket_engine("discard-worker", 4);
+        let position = KeyPosition::new(0, 4, 0);
+        engine.queue_discard_bucket(position).unwrap();
+        assert!(matches!(
+            engine.queue_discard_bucket(position),
+            Err(EngineError::Transaction(-17))
+        ));
+        assert!(matches!(
+            engine.run_discard_worker_once(),
+            Err(EngineError::Transaction(-11))
+        ));
+        assert!(matches!(
+            engine.queue_discard_bucket(position),
+            Err(EngineError::Transaction(-17))
+        ));
+        engine.allocate_bucket(0).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        engine.run_discard_worker_once().unwrap();
+        assert!(engine.verify_bucket_indexes().is_ok());
+        drop(engine);
         fs::remove_file(path).unwrap();
     }
 
