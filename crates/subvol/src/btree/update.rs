@@ -3332,6 +3332,74 @@ mod tests {
     }
 
     #[test]
+    fn extent_overwrite_moves_derived_state_to_new_pointer() {
+        unsafe {
+            let mut c = pointer_trigger_test_fs();
+            let pos = SPOS(10, 104, 0);
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut c);
+            loop {
+                bch2_trans_begin(&mut trans);
+                assert_eq!(stage_extent_pointer(&mut trans, pos, 35, 4, 3, 0), 0);
+                let ret = bch2_trans_commit(&mut trans);
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+
+            let mut overwrite = btree_trans::default();
+            bch2_trans_init(&mut overwrite, &mut c);
+            loop {
+                bch2_trans_begin(&mut overwrite);
+                assert_eq!(stage_extent_pointer(&mut overwrite, pos, 44, 4, 5, 0), 0);
+                let ret = bch2_trans_commit(&mut overwrite);
+                if ret == -12 && overwrite.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut overwrite);
+
+            assert!(crate::engine::check_extents_to_backpointers(&mut c).is_ok());
+
+            let mut check = btree_trans::default();
+            bch2_trans_init(&mut check, &mut c);
+            bch2_trans_begin(&mut check);
+            let mut alloc = crate::btree::bset::bch_alloc_v4::default();
+            trigger_read_alloc(&mut check, POS(0, 2), &mut alloc);
+            assert_eq!(alloc.gen, 4);
+            assert_eq!(alloc.dirty_sectors, 5);
+            let mut old_bp = btree_iter::default();
+            bch2_trans_iter_init(&mut check, &mut old_bp, 8, POS(0, 35), BTREE_ITER_intent);
+            let found = bch2_btree_iter_peek_slot(&mut old_bp);
+            assert!(
+                found.k.is_null()
+                    || !bpos_eq((*found.k).p, POS(0, 35))
+                    || (*found.k).type_ == crate::btree::bset::KEY_TYPE_deleted
+            );
+            bch2_trans_iter_exit(&mut old_bp);
+            let mut new_bp = btree_iter::default();
+            bch2_trans_iter_init(&mut check, &mut new_bp, 8, POS(0, 44), BTREE_ITER_intent);
+            let bp = bch2_btree_iter_peek_slot(&mut new_bp);
+            assert!(!bp.k.is_null());
+            assert_eq!((*bp.k).type_, crate::btree::bset::KEY_TYPE_backpointer);
+            let bp_value =
+                core::ptr::read_unaligned(bp.v.cast::<crate::btree::bset::bch_backpointer>());
+            assert_eq!(bp_value.bucket_gen, 4);
+            assert_eq!(bp_value.bucket_len, 5);
+            assert_eq!(bp_value.pos, pos);
+            bch2_trans_iter_exit(&mut new_bp);
+            bch2_trans_put(&mut check);
+
+            bch2_free_super(&mut c.disk_sb);
+        }
+    }
+
+    #[test]
     fn bucket_state_and_freespace_index_follow_one_transaction() {
         unsafe {
             let mut c = pointer_trigger_test_fs();
