@@ -1608,8 +1608,16 @@ pub unsafe fn bch2_btree_path_traverse_one(
         return -1;
     }
     let mut level = bch2_btree_root_unpack_level(root_packed) as usize;
+    /* 树浅于路径停止层（min_level 语义）：bcachefs 的路径在下降
+     * 循环外锁定 root（iter.c:1528-1531），树浅时路径停在已锁定
+     * 的 root，而不是声称进入一个不存在的停止层。 */
     if level < depth_want {
-        (*path).level = depth_want as u8;
+        (*path).level = level as u8;
+        let ret = btree_node_lock(trans, path, root, level);
+        if ret != 0 {
+            return ret;
+        }
+        btree_path_level_init(trans, path, level);
         return 0;
     }
 

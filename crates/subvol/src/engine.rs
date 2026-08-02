@@ -35,10 +35,11 @@ use crate::{
         cache::bch2_fs_btree_cache_init,
         interior::{bch2_btree_node_check_topology, bch2_btree_root_alloc_fake},
         iter::{
-            bch2_btree_iter_next, bch2_btree_iter_peek, bch2_btree_iter_traverse, bch2_trans_begin,
-            bch2_trans_init, bch2_trans_iter_exit, bch2_trans_iter_init, bch2_trans_put,
-            btree_iter, btree_trans, BTREE_ITER_all_snapshots, BTREE_ITER_intent,
-            BTREE_ITER_not_extents, BTREE_ITER_snapshot_field,
+            bch2_btree_iter_next, bch2_btree_iter_peek, bch2_btree_iter_peek_node,
+            bch2_btree_iter_traverse, bch2_trans_begin, bch2_trans_init, bch2_trans_iter_exit,
+            bch2_trans_iter_init, bch2_trans_iter_init_common, bch2_trans_put, btree_iter,
+            btree_trans, BTREE_ITER_all_snapshots, BTREE_ITER_intent, BTREE_ITER_not_extents,
+            BTREE_ITER_snapshot_field,
         },
         types::{
             bch2_btree_id_root_b, bch_fs, clear_btree_node_fake, clear_btree_node_need_rewrite,
@@ -1406,6 +1407,37 @@ impl StorageEngine {
         self.durability_point()
     }
 
+    /// Rewrites the btree node at `position`/`level` with a fresh
+    /// allocation: format recomputation (falling back to the old format
+    /// when the new one does not fit), key sequence +1, full key relocation,
+    /// and a parent pivot replacement (or root replacement).  This is the
+    /// subvol counterpart of `bch2_btree_node_rewrite_pos`
+    /// (interior.c:3373): `level == 0` is a caller bug (BUG_ON(!level)).
+    pub fn rewrite_node(
+        &self,
+        btree: BtreeId,
+        level: u8,
+        position: KeyPosition,
+    ) -> Result<(), EngineError> {
+        assert!(level != 0, "rewrite_node requires level >= 1");
+        let mut fs = self.lock_fs()?;
+        unsafe { rewrite_node_locked(&mut **fs, btree, level, position) }
+    }
+
+    /// Rewrites the btree node whose pointer key hash matches `key`
+    /// (interior.c:3345 `bch2_btree_node_rewrite_key`): the node is located
+    /// at `key.position` and rewritten only when its `btree_ptr_v2.seq`
+    /// matches, otherwise `Transaction(-2)` (ENOENT) is returned.
+    pub fn rewrite_node_key(
+        &self,
+        btree: BtreeId,
+        level: u8,
+        key: &BtreeKey,
+    ) -> Result<(), EngineError> {
+        let mut fs = self.lock_fs()?;
+        unsafe { rewrite_node_key_locked(&mut **fs, btree, level, key) }
+    }
+
     /// Reclaims the journal through the durable flush path: flush any pending
     /// journal entry, force node pins to flush, then advance `last_seq` once
     /// the records they cover are durable.  This is the engine counterpart to
@@ -2041,6 +2073,101 @@ fn encode_key(position: KeyPosition, value: &[u64], deleted: bool) -> Vec<u64> {
         }
     }
     words
+}
+
+unsafe fn rewrite_node_locked(
+    fs: &mut bch_fs,
+    btree: BtreeId,
+    level: u8,
+    position: KeyPosition,
+) -> Result<(), EngineError> {
+    /* interior.c:3373 bch2_btree_node_rewrite_pos() 语义：定位到
+     * position 处的节点并重写。调用层的 level 表示"目标节点层数"，
+     * 内部路径停在 level-1 层（bcachefs 的 level+1/min_level=level-1
+     * 遍历约定），因此 level == 0 是调用方错误（BUG_ON(!level)，
+     * 由公共入口保证）。 */
+    let mut trans = btree_trans::default();
+    bch2_trans_init(&mut trans, fs);
+    bch2_trans_begin(&mut trans);
+
+    let mut iter = btree_iter::default();
+    bch2_trans_iter_init_common(
+        &mut trans,
+        &mut iter,
+        btree.as_u8(),
+        position.raw(),
+        crate::btree::bset::BTREE_MAX_DEPTH,
+        level - 1,
+        crate::btree::iter::BTREE_ITER_intent,
+    );
+    let b = crate::btree::iter::bch2_btree_iter_peek_node(&mut iter);
+    let ret = if b.is_null() || (*b).data.is_null() {
+        -5
+    } else {
+        crate::btree::interior::bch2_btree_node_rewrite(&mut trans, iter.path)
+    };
+    bch2_trans_iter_exit(&mut iter);
+    bch2_trans_put(&mut trans);
+    if ret != 0 {
+        Err(EngineError::Transaction(ret))
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn rewrite_node_key_locked(
+    fs: &mut bch_fs,
+    btree: BtreeId,
+    level: u8,
+    key: &BtreeKey,
+) -> Result<(), EngineError> {
+    /* interior.c:3345 bch2_btree_node_rewrite_key() 语义：仅当
+     * 定位节点的指针键 hash 与给定键匹配时才重写，否则 -ENOENT。
+     * 与 rewrite_node_locked 相同，level 为目标节点层数。 */
+    let mut trans = btree_trans::default();
+    bch2_trans_init(&mut trans, fs);
+    bch2_trans_begin(&mut trans);
+
+    let mut iter = btree_iter::default();
+    bch2_trans_iter_init_common(
+        &mut trans,
+        &mut iter,
+        btree.as_u8(),
+        key.position().raw(),
+        crate::btree::bset::BTREE_MAX_DEPTH,
+        level - 1,
+        crate::btree::iter::BTREE_ITER_intent,
+    );
+    let b = crate::btree::iter::bch2_btree_iter_peek_node(&mut iter);
+    /* 指针键必须为 btree_ptr_v2 类型（btree_ptr_hash_val 只对
+     * btree_ptr_v2 取 seq）；encode_key 的通用路径编码为 cookie。 */
+    let mut words = vec![0u64; BKEY_U64S as usize + key.value().len()];
+    let raw_key = words.as_mut_ptr().cast::<bkey_i>();
+    (*raw_key).k = bkey {
+        u64s: words.len() as u8,
+        format: KEY_FORMAT_CURRENT,
+        type_: KEY_TYPE_btree_ptr_v2,
+        p: key.position().raw(),
+        ..Default::default()
+    };
+    words[BKEY_U64S as usize..].copy_from_slice(key.value());
+    let raw_key = words.as_ptr().cast::<bkey_i>();
+    let found = !b.is_null()
+        && !(*b).data.is_null()
+        && crate::btree::cache::btree_ptr_hash_val(&(*b).key)
+            == crate::btree::cache::btree_ptr_hash_val(raw_key);
+    let ret = if found {
+        crate::btree::interior::bch2_btree_node_rewrite(&mut trans, iter.path)
+    } else {
+        -2
+    };
+    bch2_trans_iter_exit(&mut iter);
+    bch2_trans_put(&mut trans);
+    if ret != 0 {
+        Err(EngineError::Transaction(ret))
+    } else {
+        Ok(())
+    }
 }
 
 unsafe fn get_locked(
@@ -3709,6 +3836,22 @@ mod tests {
             1,
             "query API must report the leak before drop"
         );
+        /* The reclaim worker periodically upgrades its Weak handle and holds
+         * an Arc for the duration of one poll; dropping the engine inside
+         * that window would merely decrement the count and skip the leak
+         * assertion entirely.  Stop and join the worker first so this drop
+         * is the one that triggers EngineState::drop. */
+        {
+            let mut state = engine.inner.reclaim.state.lock().unwrap();
+            state.stopping = true;
+        }
+        engine.inner.reclaim.wake.notify_all();
+        {
+            let mut worker = engine.inner.reclaim.worker.lock().unwrap();
+            if let Some(worker) = worker.take() {
+                worker.join().unwrap();
+            }
+        }
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(engine);
         }));
@@ -5483,6 +5626,423 @@ mod tests {
                     continue;
                 }
                 txn.commit().unwrap();
+            }
+            engine.verify_all().unwrap();
+            assert_eq!(
+                engine.scan(BtreeId::DEFAULT).unwrap(),
+                model.values().cloned().collect::<Vec<_>>(),
+                "seed {seed}"
+            );
+        }
+    }
+
+    /// 沿 root 的 child 指针下行到指定 level，返回包含 pos 的节点。
+    unsafe fn find_node_at_level(
+        fs: &mut bch_fs,
+        level: u8,
+        pos: bpos,
+    ) -> *mut crate::btree::types::btree {
+        let c = fs as *mut bch_fs;
+        let mut b = crate::btree::types::bch2_btree_id_root_b(fs, 0);
+        assert!(!b.is_null(), "tree must have a root");
+        while (*b).c.level > level {
+            let mut iter = crate::btree::types::btree_node_iter::default();
+            crate::btree::node_iter::bch2_btree_node_iter_init(c, b, &mut iter, &pos);
+            let ptr = crate::btree::node_iter::bch2_btree_node_iter_peek(&mut iter, b);
+            assert!(!ptr.is_null(), "no child key covers pos at level {}", (*b).c.level);
+            let key_u64s = crate::btree::bkey::bkeyp_key_u64s(&(*b).format, &*ptr);
+            let child = *ptr.cast::<u64>().add(key_u64s as usize)
+                as usize as *mut crate::btree::types::btree;
+            assert!(!child.is_null(), "interior key without child");
+            b = child;
+        }
+        assert_eq!((*b).c.level, level);
+        b
+    }
+
+    unsafe fn node_value_words(b: *mut crate::btree::types::btree) -> Vec<u64> {
+        let n = bkey_val_u64s(&(*b).key.k) as usize;
+        (0..n)
+            .map(|i| *((&(*b).key.v as *const crate::btree::bkey::bch_val).cast::<u64>()).add(i))
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_leaf_node_pos_preserves_keyset_and_bumps_seq() {
+        /* T0205 T1（AC-1 §4）：rewrite_pos 重写叶节点。断言：键集
+         * 不变、scan 与重写前一致、seq+1、min/max 继承、parent
+         * pivot（level 1）指向新节点且 max_key 相同。 */
+        let path = persistent_test_path("rewrite-leaf");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        for offset in (0..768u64).collect::<Vec<_>>().chunks(16) {
+            let mut txn = engine.transaction();
+            for &o in offset {
+                txn.put(BtreeId::DEFAULT, key(o, &[o, o + 1]));
+            }
+            txn.commit().unwrap();
+        }
+        let before_scan = engine.scan(BtreeId::DEFAULT).unwrap();
+        let before_stats = unsafe { tree_stats(&mut *engine.lock_fs().unwrap()) };
+        assert!(
+            before_stats.max_depth >= 1,
+            "must have an internal root over leaves"
+        );
+        let pos = KeyPosition::new(1, 20, 0);
+        let before = unsafe {
+            let fs = &mut *engine.lock_fs().unwrap();
+            let leaf = find_node_at_level(fs, 0, pos.raw());
+            assert_eq!((*leaf).c.level, 0);
+            (
+                (*(*leaf).data).keys.seq,
+                (*(*leaf).data).min_key,
+                (*(*leaf).data).max_key,
+                (*leaf).key.k.p,
+            )
+        };
+        engine.rewrite_node(BtreeId::DEFAULT, 1, pos).unwrap();
+        let after = unsafe {
+            let fs = &mut *engine.lock_fs().unwrap();
+            let leaf = find_node_at_level(fs, 0, pos.raw());
+            assert_eq!((*leaf).c.level, 0);
+            let parent = find_node_at_level(fs, 1, pos.raw());
+            let seq = (*(*leaf).data).keys.seq;
+            let pivot_ok = {
+                let mut iter = crate::btree::types::btree_node_iter::default();
+                crate::btree::node_iter::bch2_btree_node_iter_init(
+                    (&mut **fs) as *mut bch_fs,
+                    parent,
+                    &mut iter,
+                    &pos.raw(),
+                );
+                let ptr = crate::btree::node_iter::bch2_btree_node_iter_peek(&mut iter, parent);
+                let key_u64s = crate::btree::bkey::bkeyp_key_u64s(&(*parent).format, &*ptr);
+                let child = *ptr.cast::<u64>().add(key_u64s as usize)
+                    as usize as *mut crate::btree::types::btree;
+                child == leaf && bpos_eq(crate::btree::node_iter::bkey_unpack_pos(parent, ptr), (*leaf).key.k.p)
+            };
+            (seq, pivot_ok, (*(*leaf).data).min_key, (*(*leaf).data).max_key)
+        };
+        assert_eq!(
+            after.0,
+            before.0 + 1,
+            "rewrite must bump the node key sequence"
+        );
+        assert!(after.1, "parent pivot must point at the rewritten node");
+        assert_eq!(after.2, before.1, "min_key must be inherited");
+        assert_eq!(after.3, before.2, "max_key must be inherited");
+        assert_eq!(
+            engine.scan(BtreeId::DEFAULT).unwrap(),
+            before_scan,
+            "keyset must be preserved"
+        );
+        engine.verify_all().unwrap();
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rewrite_internal_node_keeps_subtree_visible() {
+        /* T0205 T2（AC-1 §4）：rewrite_pos 重写带 parent 的内部节点
+         * （root level >= 2）。断言：子树全键可遍历、topology 校验
+         * 通过（tree_stats 遍历物理树）、键集一致。 */
+        let path = persistent_test_path("rewrite-internal");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        for offset in (0..8192u64).collect::<Vec<_>>().chunks(16) {
+            let mut txn = engine.transaction();
+            for &o in offset {
+                txn.put(BtreeId::DEFAULT, key(o, &[o, o + 1]));
+            }
+            txn.commit().unwrap();
+        }
+        let before_scan = engine.scan(BtreeId::DEFAULT).unwrap();
+        let before_stats = unsafe { tree_stats(&mut *engine.lock_fs().unwrap()) };
+        assert!(
+            before_stats.max_depth >= 2,
+            "must have an internal level above the leaves, got {before_stats:?}"
+        );
+        let pos = KeyPosition::new(1, 600, 0);
+        engine.rewrite_node(BtreeId::DEFAULT, 2, pos).unwrap();
+        let after_stats = unsafe { tree_stats(&mut *engine.lock_fs().unwrap()) };
+        assert!(
+            after_stats.max_depth == before_stats.max_depth,
+            "rewrite must not change tree depth"
+        );
+        assert_eq!(
+            engine.scan(BtreeId::DEFAULT).unwrap(),
+            before_scan,
+            "keyset must be preserved"
+        );
+        engine.verify_all().unwrap();
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rewrite_root_self_pointing_key_and_deep_scan() {
+        /* T0205 T3（AC-1 §4）：root 重写（parent == null 分支）。
+         * 断言：set_root 生效（root 指针更新）、root.key 为自身
+         * 指针（mem_ptr == root）、level 不变、深遍历键集一致。 */
+        let path = persistent_test_path("rewrite-root");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        for offset in (0..768u64).collect::<Vec<_>>().chunks(16) {
+            let mut txn = engine.transaction();
+            for &o in offset {
+                txn.put(BtreeId::DEFAULT, key(o, &[o, o + 1]));
+            }
+            txn.commit().unwrap();
+        }
+        let before_scan = engine.scan(BtreeId::DEFAULT).unwrap();
+        let root_level = unsafe {
+            let fs = &mut *engine.lock_fs().unwrap();
+            (*crate::btree::types::bch2_btree_id_root_b(&**fs, 0)).c.level
+        };
+        assert!(root_level >= 1, "root must be internal, got level {root_level}");
+        let pos = KeyPosition::new(1, 20, 0);
+        engine
+            .rewrite_node(BtreeId::DEFAULT, root_level + 1, pos)
+            .unwrap();
+        let (root_level_after, self_pointing) = unsafe {
+            let fs = &mut *engine.lock_fs().unwrap();
+            let root = crate::btree::types::bch2_btree_id_root_b(&**fs, 0);
+            let self_ptr = (*(core::ptr::addr_of!((*root).key.v).cast::<crate::btree::bset::bch_btree_ptr_v2>())).mem_ptr
+                == root as usize as u64;
+            ((*root).c.level, self_ptr)
+        };
+        assert_eq!(root_level_after, root_level, "root level must not change");
+        assert!(self_pointing, "root key must point at the root itself");
+        assert_eq!(
+            engine.scan(BtreeId::DEFAULT).unwrap(),
+            before_scan,
+            "deep traversal must be consistent"
+        );
+        engine.verify_all().unwrap();
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rewrite_key_hash_mismatch_returns_enoent() {
+        /* T0205 T4（AC-1 §4）：rewrite_key 的 hash 匹配语义
+         * （interior.c:3345-3359）。断言：seq 不匹配 → Transaction(-2)
+         * 且原节点不动；seq 匹配 → 重写成功且 seq+1。 */
+        let path = persistent_test_path("rewrite-key");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        for offset in (0..768u64).collect::<Vec<_>>().chunks(16) {
+            let mut txn = engine.transaction();
+            for &o in offset {
+                txn.put(BtreeId::DEFAULT, key(o, &[o, o + 1]));
+            }
+            txn.commit().unwrap();
+        }
+        let (stale_key, live_key, target_pos) = unsafe {
+            let fs = &mut *engine.lock_fs().unwrap();
+            let leaf = find_node_at_level(fs, 0, KeyPosition::new(1, 20, 0).raw());
+            let target_pos = KeyPosition::new(
+                (*leaf).key.k.p.inode,
+                (*leaf).key.k.p.offset,
+                (*leaf).key.k.p.snapshot,
+            );
+            let value = node_value_words(leaf);
+            let mut stale_value = value.clone();
+            /* btree_ptr_v2 布局：mem_ptr(0) seq(1) min_key(2,3,4)… */
+            stale_value[1] += 1;
+            (
+                BtreeKey::new(target_pos, stale_value).unwrap(),
+                BtreeKey::new(target_pos, value).unwrap(),
+                target_pos,
+            )
+        };
+        assert!(matches!(
+            engine.rewrite_node_key(BtreeId::DEFAULT, 1, &stale_key),
+            Err(EngineError::Transaction(-2))
+        ));
+        let seq_before = unsafe {
+            let fs = &mut *engine.lock_fs().unwrap();
+            (*(*find_node_at_level(fs, 0, target_pos.raw())).data).keys.seq
+        };
+        engine
+            .rewrite_node_key(BtreeId::DEFAULT, 1, &live_key)
+            .unwrap();
+        let seq_after = unsafe {
+            let fs = &mut *engine.lock_fs().unwrap();
+            (*(*find_node_at_level(fs, 0, target_pos.raw())).data).keys.seq
+        };
+        assert_eq!(seq_before, seq_after - 1, "matched key must rewrite");
+        engine.verify_all().unwrap();
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rewrite_invalid_path_and_double_rewrite_no_orphan_paths() {
+        /* T0205 T5（AC-1 §4）：失败注入。a) 无效路径（path 0 未分配）
+         * → Transaction(-5)，树不动；b) 连续两次重写同一叶 → 两次
+         * 成功、seq 单调、scan 一致、verify_all 通过（无悬挂路径/
+         * 悬挂引用）。 */
+        let path = persistent_test_path("rewrite-fail");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        for offset in (0..768u64).collect::<Vec<_>>().chunks(16) {
+            let mut txn = engine.transaction();
+            for &o in offset {
+                txn.put(BtreeId::DEFAULT, key(o, &[o, o + 1]));
+            }
+            txn.commit().unwrap();
+        }
+        let before_scan = engine.scan(BtreeId::DEFAULT).unwrap();
+        let invalid = unsafe {
+            let fs = &mut *engine.lock_fs().unwrap();
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut **fs);
+            let ret = crate::btree::interior::bch2_btree_node_rewrite(&mut trans, 0);
+            bch2_trans_put(&mut trans);
+            ret
+        };
+        assert_eq!(invalid, -5, "unallocated path must reject");
+        assert_eq!(
+            engine.scan(BtreeId::DEFAULT).unwrap(),
+            before_scan,
+            "rejected rewrite must not touch the tree"
+        );
+        let pos = KeyPosition::new(1, 20, 0);
+        let seq_before = unsafe {
+            let fs: &mut bch_fs = &mut *engine.lock_fs().unwrap();
+            (*(*find_node_at_level(fs, 0, pos.raw())).data).keys.seq
+        };
+        engine.rewrite_node(BtreeId::DEFAULT, 1, pos).unwrap();
+        engine.rewrite_node(BtreeId::DEFAULT, 1, pos).unwrap();
+        let seq_after = unsafe {
+            let fs: &mut bch_fs = &mut *engine.lock_fs().unwrap();
+            (*(*find_node_at_level(fs, 0, pos.raw())).data).keys.seq
+        };
+        assert_eq!(
+            seq_after, seq_before + 2,
+            "double rewrite must bump seq once per call"
+        );
+        assert_eq!(
+            engine.scan(BtreeId::DEFAULT).unwrap(),
+            before_scan,
+            "keyset must be preserved"
+        );
+        engine.verify_all().unwrap();
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rewrite_survives_crash_and_flush_reopen() {
+        /* T0205 T6（AC-1 §4）：崩溃恢复。a) 重写提交后 drop（不
+         * flush）→ 重开：journal replay 恢复精确键集、verify_all
+         * 通过；b) 重写 + sync（journal-first 持久化落盘）→ 重开：
+         * 键集一致、拓扑有效。
+         *
+         * 崩溃语义对齐 cc-flush-before（T0199）：只有已写盘的 journal
+         * 记录在崩溃后存活。因此 a) 中 rewrite 前必须先 sync() 把
+         * 512 键全部持久化（drop 不 flush 只保证"已持久化部分"不丢，
+         * 未 flush 的事务允许丢失，与并发崩溃测试同款原则）。 */
+        let path = persistent_test_path("rewrite-crash");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let mut model = BTreeMap::new();
+        {
+            let engine = StorageEngine::create_persistent(&path).unwrap();
+            for offset in (0..512u64).collect::<Vec<_>>().chunks(16) {
+                let mut txn = engine.transaction();
+                for &o in offset {
+                    let k = key(o, &[o, o + 1]);
+                    txn.put(BtreeId::DEFAULT, k.clone());
+                    model.insert(KeyPosition::new(1, o, 0), k);
+                }
+                txn.commit().unwrap();
+            }
+            engine.sync().unwrap();
+            engine.rewrite_node(BtreeId::DEFAULT, 1, KeyPosition::new(1, 20, 0)).unwrap();
+        }
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        recovered.verify_all().unwrap();
+        assert_eq!(
+            recovered.scan(BtreeId::DEFAULT).unwrap(),
+            model.values().cloned().collect::<Vec<_>>(),
+            "crash after rewrite of synced keys must replay the exact keyset"
+        );
+        drop(recovered);
+
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        {
+            let mut txn = recovered.transaction();
+            for o in 1000..1016u64 {
+                txn.put(BtreeId::DEFAULT, key(o, &[o]));
+            }
+            txn.commit().unwrap();
+        }
+        for o in 1000..1016u64 {
+            model.insert(KeyPosition::new(1, o, 0), key(o, &[o]));
+        }
+        recovered.sync().unwrap();
+        drop(recovered);
+
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        recovered.verify_all().unwrap();
+        assert_eq!(
+            recovered.scan(BtreeId::DEFAULT).unwrap(),
+            model.values().cloned().collect::<Vec<_>>(),
+            "flush + reopen must preserve the keyset"
+        );
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rewrite_random_operations_preserve_keyset_model() {
+        /* T0205 T7（AC-1 §4）：属性测试。确定性伪随机 put/delete +
+         * 随机节点重写（叶/内部/root 层），键级模型对比；重写只
+         * 改变物理布局，逻辑键集必须与模型完全一致。 */
+        for seed in 1..=4u64 {
+            let engine = StorageEngine::new().unwrap();
+            let mut model = BTreeMap::<KeyPosition, BtreeKey>::new();
+            let mut state = seed ^ 0x9e37_79b9;
+            for step in 0..256u64 {
+                state ^= state << 7;
+                state ^= state >> 11;
+                state ^= state << 9;
+                let position = KeyPosition::new(1, state % 200, 0);
+                let mut txn = engine.transaction();
+                if state & 1 == 0 {
+                    let k = key(position.offset, &[seed, step, state]);
+                    txn.put(BtreeId::DEFAULT, k.clone());
+                    model.insert(position, k);
+                } else if model.remove(&position).is_some() {
+                    txn.delete(BtreeId::DEFAULT, position);
+                } else {
+                    continue;
+                }
+                txn.commit().unwrap();
+                if step % 16 == 0 && step >= 32 {
+                    state ^= state >> 5;
+                    let target = KeyPosition::new(1, state % 200, 0);
+                    let level = 1 + ((state >> 8) % 2) as u8;
+                    let result = engine.rewrite_node(BtreeId::DEFAULT, level, target);
+                    assert!(
+                        result.is_ok()
+                            || matches!(result, Err(EngineError::Transaction(-5))),
+                        "rewrite must succeed or report no node, got {result:?}"
+                    );
+                }
             }
             engine.verify_all().unwrap();
             assert_eq!(

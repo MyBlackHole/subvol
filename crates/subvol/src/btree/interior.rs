@@ -1933,6 +1933,279 @@ unsafe fn __bch2_foreground_maybe_merge(
     0
 }
 
+pub(crate) unsafe fn bch2_btree_node_rewrite(
+    trans: *mut super::iter::btree_trans,
+    path_idx: super::iter::btree_path_idx_t,
+) -> i32 {
+    /* interior.c:3276 bch2_btree_node_rewrite()：为 path 指向的节点生成
+     * 替换节点（格式重算 + seq+1 + 全键搬移），经 parent pivot 更新
+     * （或 root 替换）提交，旧节点 retire。域内差异（D1/D2/D8）：
+     * pending_interior 提交语义 = 同步内存修改 + dirty（merge/split
+     * 已验证模式）；路径经 take_new_node 直接换新，不触发事务 restart。
+     * hash 匹配（rewrite_key 的 -ENOENT 语义）由调用方在定位时处理。 */
+    crate::rewrite_log_debug!("btree node rewrite begin path={path_idx}");
+    let path = (*trans).paths.add(path_idx as usize);
+    let b = (*path).l[(*path).level as usize].b;
+    if b.is_null() || (*b).data.is_null() {
+        crate::rewrite_log_error!("btree node rewrite rejected: no node at path");
+        return -5;
+    }
+    let c = (*trans).c;
+    let level = (*b).c.level;
+    let btree_id = (*b).c.btree_id;
+
+    /* update_start 的锁升级语义（interior.c:3068，同 merge 挂载点） */
+    if super::iter::bch2_btree_path_upgrade(trans, path, (level as usize + 2) as u8) != 0 {
+        return -7;
+    }
+
+    if bch2_btree_node_lock_write(trans, b) != 0 {
+        return -10;
+    }
+
+    let cache_ptr = &mut (*c).btree.cache as *mut super::types::bch_fs_btree_cache;
+    let cache_initialized = (*cache_ptr).table_init_done;
+    let release_node = |node: *mut btree| {
+        if node.is_null() {
+            return;
+        }
+        if cache_initialized {
+            super::types::clear_btree_node_dirty(node);
+            let _ = super::cache::bch2_btree_node_transition_state(
+                cache_ptr,
+                node,
+                super::types::btree_node_cache_state::BTREE_NODE_CACHE_FREEABLE,
+            );
+        } else {
+            super::cache::bch2_btree_node_data_free(node);
+        }
+        crate::lock::six::six_unlock_write(&(*node).c.lock);
+        crate::lock::six::six_unlock_intent(&(*node).c.lock);
+        if !cache_initialized {
+            super::cache::bch2_btree_node_mem_free(c, node);
+        }
+    };
+    let retire_node = |node: *mut btree| {
+        if node.is_null() {
+            return;
+        }
+        if !(*c)
+            .btree
+            .cache
+            .allocations
+            .lock()
+            .unwrap()
+            .contains(&(node as usize))
+        {
+            return;
+        }
+        super::types::clear_btree_node_permanent(node);
+        super::types::clear_btree_node_noevict(node);
+        if cache_initialized {
+            super::types::clear_btree_node_dirty(node);
+            let _ = super::cache::bch2_btree_node_transition_state(
+                cache_ptr,
+                node,
+                super::types::btree_node_cache_state::BTREE_NODE_CACHE_FREEABLE,
+            );
+        } else {
+            super::cache::bch2_btree_node_data_free(node);
+            super::cache::bch2_btree_node_mem_free(c, node);
+        }
+    };
+
+    /* bch2_btree_node_alloc_replacement（interior.c:593-616） */
+    let n = super::cache::bch2_btree_node_mem_alloc(trans, level != 0);
+    if n.is_null() {
+        crate::lock::six::six_unlock_write(&(*b).c.lock);
+        return -12;
+    }
+    assert_eq!(crate::lock::six::six_lock_intent(&(*n).c.lock), 0);
+    assert_eq!(crate::lock::six::six_lock_write(&(*n).c.lock), 0);
+    (*n).c.level = level;
+    (*n).c.btree_id = btree_id;
+    (*n).version_ondisk = crate::sb::bcachefs_metadata_version_current;
+    if (*n).byte_order < (*b).byte_order as u8 {
+        let new_data = std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(
+            1usize << (*b).byte_order as usize,
+            core::mem::align_of::<u64>(),
+        ))
+        .cast::<u64>();
+        let new_aux = std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(
+            super::types::__btree_aux_data_bytes((*b).byte_order as u32),
+            core::mem::align_of::<u64>(),
+        ))
+        .cast::<u64>();
+        assert!(!new_data.is_null() && !new_aux.is_null());
+        super::cache::bch2_btree_node_data_free(n);
+        (*n).data = new_data.cast::<super::bset::btree_node>();
+        (*n).aux_data = new_aux.cast();
+        (*n).byte_order = (*b).byte_order;
+    }
+    super::bset_build::bch2_bset_init_first(n, &mut (*(*n).data).keys);
+
+    /* 格式重算（interior.c:598-604）：calc_format → format_fits 回退
+     * 旧格式（严格小于，interior.c:346-361/2843） */
+    let mut state = super::bkey::bkey_format_state::default();
+    super::bkey::bch2_bkey_format_init(&mut state);
+    __bch2_btree_calc_format(&mut state, b);
+    let mut format = super::bkey::bch2_bkey_format_done(&mut state);
+    if core::mem::size_of::<super::bset::btree_node>()
+        + btree_node_u64s_with_format(b, &(*b).format, &format) * 8
+        >= btree_buf_bytes(&*b)
+    {
+        format = (*b).format;
+    }
+    (*(*n).data).format = format;
+    (*n).format = format;
+    (*n).nr_key_bits = super::bkey::bkey_format_key_bits(&format) as u8;
+    super::bkey::bch2_compute_bkey_unpack_consts(n);
+
+    /* interior.c:606 SET_BTREE_NODE_SEQ(旧+1) + min/max 继承 */
+    (*(*n).data).keys.seq = (*(*b).data).keys.seq + 1;
+    btree_set_min(n, (*(*b).data).min_key);
+    btree_set_max(n, (*(*b).data).max_key);
+
+    /* 全键搬移（interior.c:613 bch2_btree_sort_into）+ 容量诊断 +
+     * 拓扑校验 + sib 重置 */
+    super::bset_build::bch2_btree_sort_into(c, n, b);
+    assert!(
+        core::mem::size_of::<super::bset::btree_node>()
+            + (*(*n).data).keys.u64s as usize * 8
+            < btree_buf_bytes(&*n),
+        "rewrite replacement overflow"
+    );
+    assert_eq!(bch2_btree_node_check_topology(trans, n), 0);
+    btree_node_reset_sib_u64s(n);
+    super::bset_build::bch2_btree_build_aux_trees(n);
+
+    let child_ptr = |child: *mut btree| super::bset::bkey_i_btree_ptr_v2 {
+        k: super::bkey::bkey {
+            u64s: 10,
+            format: super::bkey::KEY_FORMAT_CURRENT,
+            type_: super::bset::KEY_TYPE_btree_ptr_v2,
+            p: (*(*child).data).max_key,
+            ..Default::default()
+        },
+        v: super::bset::bch_btree_ptr_v2 {
+            mem_ptr: child as usize as u64,
+            seq: (*(*child).data).keys.seq,
+            min_key: (*(*child).data).min_key,
+            ..Default::default()
+        },
+    };
+    let mut n_key = child_ptr(n);
+    super::bkey::bkey_copy(
+        &mut (*n).key,
+        (&n_key as *const super::bset::bkey_i_btree_ptr_v2).cast(),
+    );
+
+    /* 路径换新（interior.c:3299-3302 bch2_path_get_unlocked_mut +
+     * btree_path_take_new_node） */
+    let new_path = super::iter::bch2_path_get_unlocked_mut(trans, btree_id, level, (*n).key.k.p, false);
+    super::iter::btree_path_take_new_node(trans, (*trans).paths.add(new_path as usize), n);
+
+    let parent_level = level as usize + 1;
+    let parent = if parent_level < super::bset::BTREE_MAX_DEPTH as usize {
+        (*path).l[parent_level].b
+    } else {
+        core::ptr::null_mut()
+    };
+    if !parent.is_null() {
+        /* parent 分支（interior.c:3307-3310 bch2_btree_insert_node）：
+         * 定位旧键（b 的 max_key）→ 删除 → 插入 n 的新键（同位置
+         * 替换，同 merge 的 parent_keys 模式） */
+        if bch2_btree_node_lock_write(trans, parent) != 0 {
+            if new_path != 0 {
+                super::iter::bch2_path_put(trans, new_path, true);
+            }
+            release_node(n);
+            crate::lock::six::six_unlock_write(&(*b).c.lock);
+            return -10;
+        }
+        let src_key_p = (*(*b).data).max_key;
+        let last = super::types::bset_tree_last(parent);
+        let mut parent_iter = super::types::btree_node_iter::default();
+        super::node_iter::bch2_btree_node_iter_init(c, parent, &mut parent_iter, &src_key_p);
+        let old = super::node_iter::bch2_btree_node_iter_peek(&mut parent_iter, parent);
+        if old.is_null()
+            || !super::bkey::bpos_eq(super::node_iter::bkey_unpack_pos(parent, old), src_key_p)
+        {
+            if new_path != 0 {
+                super::iter::bch2_path_put(trans, new_path, true);
+            }
+            release_node(n);
+            crate::lock::six::six_unlock_write(&(*b).c.lock);
+            crate::lock::six::six_unlock_write(&(*parent).c.lock);
+            return -8;
+        }
+        let old_writeable = super::types::__btree_node_key_to_offset(parent, old)
+            >= super::types::btree_bkey_first_offset(last);
+        let old_set = super::types::bch2_bkey_to_bset_inlined(parent, old);
+        let old_set_idx = old_set.offset_from((*parent).set.as_ptr()) as usize;
+        super::bset_update::btree_keys_account_key(&mut (*parent).nr, old_set_idx, old, -1);
+        let old_u64s = (*old).u64s as u32;
+        (*old).type_ = 0;
+        if old_writeable {
+            super::bset_update::bch2_bset_delete(parent, old, old_u64s);
+        }
+        let mut insert_iter = super::types::btree_node_iter::default();
+        super::node_iter::bch2_btree_node_iter_init(c, parent, &mut insert_iter, &n_key.k.p);
+        let where_ = super::node_iter::bch2_btree_node_iter_bset_pos(&mut insert_iter, parent, last);
+        if (*trans).journal_replay_not_finished {
+            let journal_keys = core::ptr::addr_of!((*c).journal_keys);
+            let _overwrite_lock = (&(*journal_keys).overwrite_lock).lock().unwrap();
+            crate::journal::bch2_journal_key_check_or_overwrite(
+                c,
+                (*parent).c.btree_id,
+                (*parent).c.level,
+                n_key.k.p,
+                false,
+            );
+        }
+        super::bset_update::bch2_bset_insert(
+            parent,
+            where_,
+            (&mut n_key as *mut super::bset::bkey_i_btree_ptr_v2).cast(),
+            0,
+        );
+        super::cache::bch2_btree_node_set_dirty(c, parent);
+    } else {
+        /* root 分支（interior.c:3310-3312 bch2_btree_set_root）：
+         * root.key 更新为自身指针 + set_root_for_read（split root
+         * 分支模式 interior.rs:800-850） */
+        let root_ptr = child_ptr(n);
+        super::bkey::bkey_copy(
+            &mut (*n).key,
+            (&root_ptr as *const super::bset::bkey_i_btree_ptr_v2).cast(),
+        );
+        if cache_initialized {
+            let _ = super::cache::bch2_btree_node_transition_state(
+                cache_ptr,
+                n,
+                super::types::btree_node_cache_state::BTREE_NODE_CACHE_CLEAN,
+            );
+            super::cache::bch2_btree_node_set_dirty(c, n);
+        }
+        bch2_btree_set_root_for_read(c, n);
+    }
+
+    /* will_free_node + free_inmem（旧节点 retire，interior.c:3314-3320） */
+    retire_node(b);
+    crate::lock::six::six_unlock_write(&(*b).c.lock);
+    super::iter::bch2_trans_node_add(trans, n);
+    super::iter::bch2_trans_node_verify_not_in_iters(trans, b);
+    if new_path != 0 {
+        super::iter::bch2_path_put(trans, new_path, true);
+    }
+    if !parent.is_null() {
+        crate::lock::six::six_unlock_write(&(*parent).c.lock);
+    }
+    crate::lock::six::six_unlock_write(&(*n).c.lock);
+    crate::lock::six::six_unlock_intent(&(*n).c.lock);
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
