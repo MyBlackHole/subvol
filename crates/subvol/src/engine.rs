@@ -2170,6 +2170,29 @@ mod tests {
         }
     }
 
+    fn set_need_discard_index(engine: &StorageEngine, position: bpos, set: bool) {
+        unsafe {
+            let mut fs = engine.lock_fs().unwrap();
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut **fs);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = bch2_btree_bit_mod(&mut trans, BTREE_ID_NEED_DISCARD, position, set);
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+        }
+    }
+
     #[test]
     fn transaction_restart_retraverses_before_committing_once() {
         let engine = StorageEngine::new().unwrap();
@@ -2335,6 +2358,15 @@ mod tests {
         );
         assert!(engine.verify_bucket_indexes().is_ok());
         engine.reclaim_bucket(KeyPosition::new(0, 4, 0)).unwrap();
+        assert!(engine.verify_bucket_indexes().is_ok());
+        set_need_discard_index(&engine, crate::btree::bkey::POS(0, 4), false);
+        assert!(matches!(
+            engine.verify_bucket_indexes(),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::FreespaceSet
+            ))
+        ));
+        set_need_discard_index(&engine, crate::btree::bkey::POS(0, 4), true);
         assert!(engine.verify_bucket_indexes().is_ok());
         set_bucket_journal_seq(&engine, crate::btree::bkey::POS(0, 4), 2);
         {
