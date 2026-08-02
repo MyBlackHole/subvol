@@ -242,6 +242,7 @@ pub enum DerivedStateMismatch {
     DuplicateBackpointer,
     AllocSet,
     BackpointerSet,
+    FreespaceSet,
 }
 
 #[derive(Debug)]
@@ -607,6 +608,40 @@ impl StorageEngine {
     pub fn verify_derived_state(&self) -> Result<(), EngineError> {
         let mut fs = self.lock_fs()?;
         unsafe { check_extents_to_backpointers(&mut **fs) }
+    }
+
+    /// Checks the free alloc buckets against the freespace btree index.
+    pub fn verify_bucket_indexes(&self) -> Result<(), EngineError> {
+        let mut fs = self.lock_fs()?;
+        unsafe {
+            let mut alloc_free = BTreeSet::new();
+            for raw in scan_raw_locked(&mut **fs, 4)? {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ != KEY_TYPE_alloc_v4 {
+                    continue;
+                }
+                let value = (key as *const u8)
+                    .add(core::mem::size_of::<bkey>())
+                    .cast::<bch_alloc_v4>();
+                let alloc = core::ptr::read_unaligned(value);
+                if alloc.data_type == BCH_DATA_FREE {
+                    alloc_free.insert(((*key).k.p.inode, (*key).k.p.offset));
+                }
+            }
+            let mut indexed = BTreeSet::new();
+            for raw in scan_raw_locked(&mut **fs, BTREE_ID_FREESPACE)? {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set {
+                    indexed.insert(((*key).k.p.inode, (*key).k.p.offset & ((1u64 << 56) - 1)));
+                }
+            }
+            if alloc_free != indexed {
+                return Err(EngineError::DerivedState(
+                    DerivedStateMismatch::FreespaceSet,
+                ));
+            }
+            Ok(())
+        }
     }
 
     /// Selects the first free alloc bucket for a device and atomically marks
