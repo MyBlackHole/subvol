@@ -46,7 +46,7 @@ use crate::{
         },
         update::{
             bch2_clear_derived_tree, bch2_rebuild_derived_for_key, bch2_trans_commit,
-            bch2_trans_update,
+            bch2_trans_update, trigger_update_value,
         },
     },
     journal::{
@@ -81,6 +81,9 @@ const JOURNAL_BUCKETS: u64 = 4;
 const JOURNAL_BUCKET_SIZE: u16 = 2_048;
 const ENGINE_JOURNAL_UUID: [u8; 16] = [0x53; 16];
 const RECLAIM_WORKER_DELAY: Duration = Duration::from_millis(25);
+const BCH_DATA_FREE: u8 = 0;
+const BCH_DATA_BTREE: u8 = 3;
+const BCH_DATA_NEED_DISCARD: u8 = 9;
 
 /// A logical btree identifier.  The IDs are engine-local and need not expose
 /// the filesystem-specific `BCH_BTREE_IDS()` namespace.
@@ -595,6 +598,121 @@ impl StorageEngine {
     pub fn verify_derived_state(&self) -> Result<(), EngineError> {
         let mut fs = self.lock_fs()?;
         unsafe { check_extents_to_backpointers(&mut **fs) }
+    }
+
+    /// Selects the first free alloc bucket for a device and atomically marks
+    /// it as btree-owned, matching foreground.c's free-bucket candidate rule.
+    pub fn allocate_bucket(&self, dev: u64) -> Result<KeyPosition, EngineError> {
+        let mut fs = self.lock_fs()?;
+        unsafe {
+            let member = crate::sb::io::bch2_sb_member_get(fs.disk_sb.sb, dev as usize);
+            if member.bucket_size == 0 || !crate::sb::bch2_member_alive(&member) {
+                return Err(EngineError::Transaction(-1));
+            }
+            for raw in scan_raw_locked(&mut **fs, 4)? {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ != KEY_TYPE_alloc_v4
+                    || (*key).k.p.inode != dev
+                    || raw.words.len() < BKEY_U64S as usize + 1
+                {
+                    continue;
+                }
+                let value = (key as *mut u8)
+                    .add(core::mem::size_of::<bkey>())
+                    .cast::<bch_alloc_v4>();
+                let mut alloc = core::ptr::read_unaligned(value);
+                if alloc.data_type != BCH_DATA_FREE {
+                    continue;
+                }
+                alloc.data_type = BCH_DATA_BTREE;
+                let mut trans = btree_trans::default();
+                bch2_trans_init(&mut trans, &mut **fs);
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    (*key).k.p,
+                    KEY_TYPE_alloc_v4,
+                    (&alloc as *const bch_alloc_v4).cast(),
+                    core::mem::size_of::<bch_alloc_v4>(),
+                );
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                bch2_trans_put(&mut trans);
+                if ret != 0 {
+                    return Err(EngineError::Transaction(ret));
+                }
+                return Ok(KeyPosition::new((*key).k.p.inode, (*key).k.p.offset, 0));
+            }
+            Err(EngineError::Transaction(-28))
+        }
+    }
+
+    /// Releases a bucket only after its reverse-reference btree has no live
+    /// entries; the transition first records need_discard and then free.
+    pub fn reclaim_bucket(&self, position: KeyPosition) -> Result<(), EngineError> {
+        let mut fs = self.lock_fs()?;
+        unsafe {
+            let backpointers = scan_raw_locked(&mut **fs, 8)?;
+            let member = crate::sb::io::bch2_sb_member_get(fs.disk_sb.sb, position.inode as usize);
+            if member.bucket_size == 0 {
+                return Err(EngineError::Transaction(-1));
+            }
+            let start = position.offset.saturating_mul(member.bucket_size as u64);
+            let end = start.saturating_add(member.bucket_size as u64);
+            for raw in backpointers {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == KEY_TYPE_backpointer
+                    && (*key).k.p.inode == position.inode
+                    && (*key).k.p.offset >= start
+                    && (*key).k.p.offset < end
+                {
+                    return Err(EngineError::Transaction(-16));
+                }
+            }
+            let alloc_keys = scan_raw_locked(&mut **fs, 4)?;
+            for raw in alloc_keys {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ != KEY_TYPE_alloc_v4 || (*key).k.p != position.raw() {
+                    continue;
+                }
+                let value = (key as *mut u8)
+                    .add(core::mem::size_of::<bkey>())
+                    .cast::<bch_alloc_v4>();
+                let mut alloc = core::ptr::read_unaligned(value);
+                if alloc.dirty_sectors != 0 || alloc.cached_sectors != 0 {
+                    return Err(EngineError::Transaction(-16));
+                }
+                alloc.data_type = BCH_DATA_NEED_DISCARD;
+                alloc.data_type = BCH_DATA_FREE;
+                let mut trans = btree_trans::default();
+                bch2_trans_init(&mut trans, &mut **fs);
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    (*key).k.p,
+                    KEY_TYPE_alloc_v4,
+                    (&alloc as *const bch_alloc_v4).cast(),
+                    core::mem::size_of::<bch_alloc_v4>(),
+                );
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                bch2_trans_put(&mut trans);
+                return if ret == 0 {
+                    Ok(())
+                } else {
+                    Err(EngineError::Transaction(ret))
+                };
+            }
+            Err(EngineError::Transaction(-2))
+        }
     }
 
     /// Publishes the current journal buffer.  Only records returned by

@@ -2356,7 +2356,7 @@ unsafe fn trigger_read_alloc(
     bch2_trans_iter_exit(&mut iter);
 }
 
-unsafe fn trigger_update_value(
+pub(crate) unsafe fn trigger_update_value(
     trans: *mut btree_trans,
     btree: u8,
     pos: super::bkey::bpos,
