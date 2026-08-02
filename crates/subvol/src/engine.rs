@@ -1473,7 +1473,22 @@ unsafe fn rebuild_derived_state(
         return Ok(());
     }
 
-    for id in [4u8, 8u8] {
+    let mut preserved_alloc = BTreeMap::new();
+    for raw in scan_raw_locked(fs, 4)? {
+        let key = raw.words.as_ptr().cast::<bkey_i>();
+        if (*key).k.type_ == KEY_TYPE_alloc_v4 {
+            let value = (key as *const u8)
+                .add(core::mem::size_of::<bkey>())
+                .cast::<bch_alloc_v4>();
+            let position = (*key).k.p;
+            preserved_alloc.insert(
+                (position.inode, position.offset),
+                core::ptr::read_unaligned(value),
+            );
+        }
+    }
+
+    for id in [4u8, BTREE_ID_FREESPACE, 8u8] {
         let ret = bch2_clear_derived_tree(fs, id);
         if ret != 0 {
             return Err(EngineError::Transaction(ret));
@@ -1541,6 +1556,98 @@ unsafe fn rebuild_derived_state(
             if ret != 0 {
                 return Err(EngineError::Transaction(ret));
             }
+        }
+    }
+
+    let mut rebuilt_alloc = BTreeMap::new();
+    for raw in scan_raw_locked(fs, 4)? {
+        let key = raw.words.as_ptr().cast::<bkey_i>();
+        if (*key).k.type_ == KEY_TYPE_alloc_v4 {
+            let value = (key as *const u8)
+                .add(core::mem::size_of::<bkey>())
+                .cast::<bch_alloc_v4>();
+            rebuilt_alloc.insert(
+                ((*key).k.p.inode, (*key).k.p.offset),
+                core::ptr::read_unaligned(value),
+            );
+        }
+    }
+    for ((dev, bucket), old) in preserved_alloc {
+        let mut alloc = rebuilt_alloc.get(&(dev, bucket)).copied().unwrap_or(old);
+        alloc.data_type = old.data_type;
+        alloc.gen = old.gen;
+        alloc.oldest_gen = old.oldest_gen;
+        let position = crate::btree::bkey::POS(dev, bucket);
+        let mut trans = btree_trans::default();
+        bch2_trans_init(&mut trans, fs);
+        loop {
+            bch2_trans_begin(&mut trans);
+            let ret = trigger_update_value(
+                &mut trans,
+                4,
+                position,
+                KEY_TYPE_alloc_v4,
+                (&alloc as *const bch_alloc_v4).cast(),
+                core::mem::size_of::<bch_alloc_v4>(),
+            );
+            let ret = if ret == 0 {
+                bch2_trans_commit(&mut trans)
+            } else {
+                ret
+            };
+            if ret == -12 && trans.realloc_bytes_required != 0 {
+                continue;
+            }
+            bch2_trans_put(&mut trans);
+            if ret != 0 {
+                return Err(EngineError::Transaction(ret));
+            }
+            break;
+        }
+    }
+
+    /* Rebuild the freespace candidate index from the now-restored alloc
+     * primary records.  bcachefs keeps this as a derived tree and only
+     * indexes BCH_DATA_free buckets, with the generation delta encoded in
+     * the high position bits. */
+    let mut free_positions = Vec::new();
+    for raw in scan_raw_locked(fs, 4)? {
+        let key = raw.words.as_ptr().cast::<bkey_i>();
+        if (*key).k.type_ != KEY_TYPE_alloc_v4 {
+            continue;
+        }
+        let value = (key as *const u8)
+            .add(core::mem::size_of::<bkey>())
+            .cast::<bch_alloc_v4>();
+        let alloc = core::ptr::read_unaligned(value);
+        if alloc.data_type == BCH_DATA_FREE {
+            free_positions.push(((*key).k.p, alloc));
+        }
+    }
+    for (position, alloc) in free_positions {
+        let mut trans = btree_trans::default();
+        bch2_trans_init(&mut trans, fs);
+        loop {
+            bch2_trans_begin(&mut trans);
+            let ret = bch2_btree_bit_mod(
+                &mut trans,
+                BTREE_ID_FREESPACE,
+                alloc_freespace_pos(position, &alloc),
+                true,
+            );
+            let ret = if ret == 0 {
+                bch2_trans_commit(&mut trans)
+            } else {
+                ret
+            };
+            if ret == -12 && trans.realloc_bytes_required != 0 {
+                continue;
+            }
+            bch2_trans_put(&mut trans);
+            if ret != 0 {
+                return Err(EngineError::Transaction(ret));
+            }
+            break;
         }
     }
     Ok(())
