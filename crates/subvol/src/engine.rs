@@ -5294,4 +5294,202 @@ mod tests {
             fs::remove_file(path).unwrap();
         }
     }
+
+    #[derive(Default, Debug)]
+    struct TreeStats {
+        nodes: usize,
+        leaves: usize,
+        max_depth: usize,
+    }
+
+    /// 物理层统计：沿 root 的 child 指针遍历所有节点，逐节点做
+    /// bch2_btree_node_check_topology 校验（AC-1 §5 的物理层断言）。
+    unsafe fn tree_stats(fs: &mut bch_fs) -> TreeStats {
+        let mut trans = crate::btree::iter::btree_trans::default();
+        crate::btree::iter::bch2_trans_init(&mut trans, fs);
+        let mut stats = TreeStats::default();
+        let root = crate::btree::types::bch2_btree_id_root_b(fs, 0);
+        assert!(!root.is_null(), "tree must have a root");
+        unsafe fn walk(
+            trans: *mut crate::btree::iter::btree_trans,
+            b: *mut crate::btree::types::btree,
+            depth: usize,
+            stats: &mut TreeStats,
+        ) {
+            stats.nodes += 1;
+            stats.max_depth = stats.max_depth.max(depth);
+            assert_eq!(
+                crate::btree::interior::bch2_btree_node_check_topology(trans, b),
+                0,
+                "topology broken at depth {depth}"
+            );
+            if (*b).c.level == 0 {
+                stats.leaves += 1;
+                return;
+            }
+            let mut iter = crate::btree::types::btree_node_iter::default();
+            crate::btree::node_iter::bch2_btree_node_iter_init_from_start(&mut iter, b);
+            loop {
+                let ptr = crate::btree::node_iter::bch2_btree_node_iter_peek(&mut iter, b);
+                if ptr.is_null() {
+                    break;
+                }
+                let key_u64s = crate::btree::bkey::bkeyp_key_u64s(&(*b).format, &*ptr);
+                let child = *ptr.cast::<u64>().add(key_u64s as usize)
+                    as usize as *mut crate::btree::types::btree;
+                assert!(!child.is_null(), "interior key without child at depth {depth}");
+                walk(trans, child, depth + 1, stats);
+                crate::btree::node_iter::bch2_btree_node_iter_next_all(&mut iter, b);
+            }
+        }
+        walk(&mut trans, root, 0, &mut stats);
+        crate::btree::iter::bch2_trans_put(&mut trans);
+        stats
+    }
+
+    #[test]
+    fn merge_bulk_delete_shrinks_tree_and_preserves_keyset() {
+        /* T0204 delete_stress（AC-1 §5）：批量 put 撑起多层树 → 交错
+         * 批量 delete（3/4）收缩；断言：键集与 BTreeMap 模型一致、
+         * verify_all 通过、深度不增、叶/节点数减少（前台合并把半空
+         * 兄弟打包），全部物理节点拓扑有效。 */
+        let path = persistent_test_path("merge-delete-stress");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        let mut model = BTreeMap::new();
+        /* 单事务 update 数受路径池约束（BTREE_ITER_INITIAL=64，每
+         * update 持一条路径引用），批量取 16 键/批；批大小还需避开
+         * 叶容量谐振（叶容量 64 键，批 32 键 + split 后半叶 32 键
+         * = 恰好填满，导致无限 split 重放） */
+        for offset in (0..768u64).collect::<Vec<_>>().chunks(16) {
+            let mut txn = engine.transaction();
+            for &o in offset {
+                let k = key(o, &[o, o + 1]);
+                txn.put(BtreeId::DEFAULT, k.clone());
+                model.insert(KeyPosition::new(1, o, 0), k);
+            }
+            txn.commit().unwrap();
+        }
+        let before = unsafe { tree_stats(&mut *engine.lock_fs().unwrap()) };
+        assert!(
+            before.max_depth >= 1,
+            "stress must build a multi-level tree (root internal + leaves), got depth {}",
+            before.max_depth
+        );
+        for chunk in (0..768u64)
+            .filter(|o| o % 4 != 0)
+            .collect::<Vec<_>>()
+            .chunks(16)
+        {
+            let mut txn = engine.transaction();
+            for &o in chunk {
+                txn.delete(BtreeId::DEFAULT, KeyPosition::new(1, o, 0));
+                model.remove(&KeyPosition::new(1, o, 0));
+            }
+            txn.commit().unwrap();
+        }
+        let after = unsafe { tree_stats(&mut *engine.lock_fs().unwrap()) };
+        engine.verify_all().unwrap();
+        assert_eq!(
+            engine.scan(BtreeId::DEFAULT).unwrap(),
+            model.values().cloned().collect::<Vec<_>>()
+        );
+        assert!(
+            after.max_depth <= before.max_depth,
+            "merge must not deepen the tree: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.leaves < before.leaves,
+            "merge should shrink leaf count: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.nodes < before.nodes,
+            "merge should shrink node count: {before:?} -> {after:?}"
+        );
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn merge_delete_stress_survives_replay() {
+        /* T0204 崩溃恢复（AC-1 §5）：delete 压力后 sync 落盘，drop
+         * （不 flush）后 open_persistent，replay 必须恢复出精确键集
+         * 且拓扑有效。 */
+        let path = persistent_test_path("merge-delete-recovery");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let mut model = BTreeMap::new();
+        {
+            let engine = StorageEngine::create_persistent(&path).unwrap();
+            for offset in (0..512u64).collect::<Vec<_>>().chunks(16) {
+                let mut txn = engine.transaction();
+                for &o in offset {
+                    let k = key(o, &[o]);
+                    txn.put(BtreeId::DEFAULT, k.clone());
+                    model.insert(KeyPosition::new(1, o, 0), k);
+                }
+                txn.commit().unwrap();
+            }
+            engine.sync().unwrap();
+            for chunk in (0..512u64)
+                .filter(|o| o % 4 != 0)
+                .collect::<Vec<_>>()
+                .chunks(16)
+            {
+                let mut txn = engine.transaction();
+                for &o in chunk {
+                    txn.delete(BtreeId::DEFAULT, KeyPosition::new(1, o, 0));
+                    model.remove(&KeyPosition::new(1, o, 0));
+                }
+                txn.commit().unwrap();
+            }
+            engine.sync().unwrap();
+        }
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        recovered.verify_all().unwrap();
+        assert_eq!(
+            recovered.scan(BtreeId::DEFAULT).unwrap(),
+            model.values().cloned().collect::<Vec<_>>()
+        );
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn merge_random_operations_preserve_keyset_model() {
+        /* T0204 属性测试（AC-1 §5）：确定性伪随机 put/delete 序列，
+         * 键级模型（BTreeMap）对比；merge 的 restart（-4）由引擎
+         * commit 循环透明处理，物理布局对逻辑模型不可见。 */
+        for seed in 1..=4u64 {
+            let engine = StorageEngine::new().unwrap();
+            let mut model = BTreeMap::<KeyPosition, BtreeKey>::new();
+            let mut state = seed ^ 0x9e37_79b9;
+            for _step in 0..256u64 {
+                state ^= state << 7;
+                state ^= state >> 11;
+                state ^= state << 9;
+                let position = KeyPosition::new(1, state % 96, 0);
+                let mut txn = engine.transaction();
+                if state & 1 == 0 {
+                    let k = key(position.offset, &[seed, _step, state]);
+                    txn.put(BtreeId::DEFAULT, k.clone());
+                    model.insert(position, k);
+                } else if model.remove(&position).is_some() {
+                    txn.delete(BtreeId::DEFAULT, position);
+                } else {
+                    continue;
+                }
+                txn.commit().unwrap();
+            }
+            engine.verify_all().unwrap();
+            assert_eq!(
+                engine.scan(BtreeId::DEFAULT).unwrap(),
+                model.values().cloned().collect::<Vec<_>>(),
+                "seed {seed}"
+            );
+        }
+    }
 }

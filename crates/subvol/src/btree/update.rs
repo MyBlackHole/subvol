@@ -2908,6 +2908,7 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
      * commit.c bch2_trans_commit_write_locked (u64s += i->k->k.u64s
      * per same leaf). */
     let mut acc_u64s: u32 = 0;
+    let mut u64s_delta: i32 = 0;
     let mut last_leaf: *mut btree = core::ptr::null_mut();
     for idx in 0..(*trans).nr_updates as usize {
         let i = (*trans).updates.add(idx);
@@ -2986,6 +2987,50 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
             (*trans).restarted = 4;
             return -4;
         }
+
+        /* T0204 前台合并检查（fs/btree/commit.c:1460-1473）：
+         * u64s_delta 累计本叶净增（delete 计 0，与 required_u64s 同口径），
+         * 在本叶最后一个 update（!same_leaf_as_next）处按
+         * btree_node_needs_merge 门控触发 maybe_merge；成功后本事务
+         * restart，路径重遍历到合并后的新节点。subvol 无 interior_updates
+         * 概念（split 直接改树），对应条件省略（域内恒不成立）。 */
+        u64s_delta += if (*(*i).k).k.type_ == super::bset::KEY_TYPE_deleted {
+            0
+        } else {
+            (*(*i).k).k.u64s as i32
+        };
+        let next_idx = idx + 1;
+        let same_leaf_as_next = next_idx < (*trans).nr_updates as usize
+            && {
+                let ni = (*trans).updates.add(next_idx);
+                let np = (*trans).paths.add((*ni).path as usize);
+                (*np).l[(*ni).level as usize].b == b
+            };
+        if !same_leaf_as_next
+            && super::interior::btree_node_needs_merge((*trans).c, b, u64s_delta)
+        {
+            crate::rewrite_log_debug!("commit maybe_merge idx={idx} delta={u64s_delta}");
+            let mut merge_count = 0u64;
+            let ret = super::interior::bch2_foreground_maybe_merge(
+                trans,
+                (*i).path,
+                (*i).level as usize,
+                u64s_delta,
+                &mut merge_count,
+            );
+            if ret != 0 {
+                crate::rewrite_log_error!("transaction merge failed ret={ret}");
+                return ret;
+            }
+            if merge_count == 0 {
+                crate::rewrite_log_debug!("commit merge no-op idx={idx}");
+            } else {
+                crate::rewrite_log_debug!("transaction requested restart after merge");
+                (*trans).restarted = 4;
+                return -4;
+            }
+        }
+        u64s_delta = 0;
     }
 
     let mut journal_u64s = 0u32;

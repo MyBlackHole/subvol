@@ -190,7 +190,12 @@ pub unsafe fn bch2_sort_repack(
     out_f: *const super::bkey::bkey_format,
     filter_whiteouts: bool,
 ) -> super::types::btree_nr_keys {
-    let mut out = dst.cast::<u64>().add(3).cast::<bkey_packed_type>();
+    /* sort.c:132 out = vstruct_last(dst)：从 bset 已有内容之后追加，
+     * 供 bch2_btree_sort_into 多次调用（merge N→1 打包）逐 src 追加 */
+    let mut out = dst
+        .cast::<u64>()
+        .add(3 + (*dst).u64s as usize)
+        .cast::<bkey_packed_type>();
     let mut nr = super::types::btree_nr_keys::default();
     let transform = *out_f != (*src).format;
 
