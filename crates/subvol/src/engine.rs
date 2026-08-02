@@ -2058,6 +2058,28 @@ mod tests {
     }
 
     #[test]
+    fn freespace_index_position_round_trips_bucket_and_generation_bits() {
+        let alloc = bch_alloc_v4 {
+            gen: 0x31,
+            oldest_gen: 0x11,
+            ..Default::default()
+        };
+        let position = bpos {
+            inode: 2,
+            offset: 37,
+            snapshot: 0,
+        };
+        let indexed = alloc_freespace_pos(position, &alloc);
+        let position_inode = position.inode;
+        let position_offset = position.offset;
+        let indexed_inode = indexed.inode;
+        let indexed_offset = indexed.offset;
+        assert_eq!(indexed_inode, position_inode);
+        assert_eq!(indexed_offset & ((1u64 << 56) - 1), position_offset);
+        assert_eq!(indexed_offset >> 56, 2);
+    }
+
+    #[test]
     fn generated_transaction_journal_recovery_matches_the_model() {
         for seed in 1..=12u64 {
             let engine = StorageEngine::new().unwrap();
