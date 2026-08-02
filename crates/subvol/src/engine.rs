@@ -245,6 +245,8 @@ pub enum DerivedStateMismatch {
     BackpointerSet,
     FreespaceSet,
     NeedDiscardSet,
+    OpenBucketFree,
+    NotRwBucketFree,
 }
 
 #[derive(Debug)]
@@ -673,6 +675,85 @@ impl StorageEngine {
             }
             Ok(())
         }
+    }
+
+    /// Verifies the guard invariants as one aggregated pass, mirroring
+    /// bch2_check_allocations() re-deriving and checking allocation state
+    /// in a single recovery pass (check.c:1097-1160).  Two invariants are
+    /// enforced, both expressed upstream as skip guards in the discard path:
+    /// - no bucket in open_buckets may be FREE: bch2_bucket_is_open_safe()
+    ///   skips open buckets (discard.c:344-347, 433-436, 743)
+    /// - no FREE bucket may live on a non-rw device: bch2_dev_get_ioref()
+    ///   WRITE failing skips the bucket (discard.c:349-357, 654, 871)
+    pub fn verify_guard_invariants(&self) -> Result<(), EngineError> {
+        let mut fs = self.lock_fs()?;
+        unsafe {
+            if fs.disk_sb.sb.is_null() {
+                return Err(EngineError::Transaction(-1));
+            }
+            let open_buckets = self
+                .inner
+                .open_buckets
+                .lock()
+                .map_err(|_| EngineError::Poisoned)?;
+            let rw_devs = self
+                .inner
+                .rw_devs
+                .lock()
+                .map_err(|_| EngineError::Poisoned)?;
+            for raw in scan_raw_locked(&mut **fs, 4)? {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ != KEY_TYPE_alloc_v4 {
+                    continue;
+                }
+                let value = (key as *const u8)
+                    .add(core::mem::size_of::<bkey>())
+                    .cast::<bch_alloc_v4>();
+                let alloc = core::ptr::read_unaligned(value);
+                if alloc.data_type != BCH_DATA_FREE {
+                    continue;
+                }
+                let pos = ((*key).k.p.inode, (*key).k.p.offset);
+                if open_buckets.contains(&pos) {
+                    return Err(EngineError::DerivedState(
+                        DerivedStateMismatch::OpenBucketFree,
+                    ));
+                }
+                if !rw_devs.contains(&pos.0) {
+                    return Err(EngineError::DerivedState(
+                        DerivedStateMismatch::NotRwBucketFree,
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Queries the number of currently open buckets, the engine-local
+    /// counterpart of the bch2_open_buckets_stop() close-all-on-umount
+    /// invariant (fs.c:324, foreground.c:1171-1230): a caller may check
+    /// before dropping the engine that no open bucket would leak.
+    pub fn open_bucket_count(&self) -> Result<usize, EngineError> {
+        Ok(self
+            .inner
+            .open_buckets
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?
+            .len())
+    }
+
+    /// Queries whether the discard queue is empty.  The worker returns Ok
+    /// only when it has drained the queue, matching the fast_work while
+    /// loop (discard.c:605-633); a queue left non-empty after an EAGAIN
+    /// rotation is legal (T0191), so this is a query, not an auto-check.
+    pub fn discard_queue_empty(&self) -> Result<bool, EngineError> {
+        Ok(self
+            .inner
+            .discard_inflight
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?
+            .0
+            .is_empty())
     }
 
     /// Selects the first free alloc bucket for a device and atomically marks
@@ -2884,6 +2965,64 @@ mod tests {
     }
 
     #[test]
+    fn verify_guard_invariants_rejects_open_free_bucket() {
+        let (engine, path) = prepared_bucket_engine("guard-open-free", 4);
+        add_free_bucket(&engine, 5);
+        let position = KeyPosition::new(0, 5, 0);
+        assert!(engine.verify_guard_invariants().is_ok());
+        engine.open_bucket(position).unwrap();
+        assert!(matches!(
+            engine.verify_guard_invariants(),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::OpenBucketFree
+            ))
+        ));
+        engine.close_open_bucket(position).unwrap();
+        assert!(engine.verify_guard_invariants().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verify_guard_invariants_rejects_notrw_free_bucket() {
+        let (engine, path) = prepared_bucket_engine("guard-notrw-free", 4);
+        add_free_bucket(&engine, 5);
+        assert!(engine.verify_guard_invariants().is_ok());
+        engine.set_device_rw(0, false).unwrap();
+        assert!(matches!(
+            engine.verify_guard_invariants(),
+            Err(EngineError::DerivedState(
+                DerivedStateMismatch::NotRwBucketFree
+            ))
+        ));
+        engine.set_device_rw(0, true).unwrap();
+        assert!(engine.verify_guard_invariants().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn guard_query_open_bucket_count_and_queue_empty() {
+        let (engine, path) = prepared_bucket_engine("guard-query", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        assert_eq!(engine.open_bucket_count().unwrap(), 0);
+        assert!(engine.discard_queue_empty().unwrap());
+        engine.open_bucket(position).unwrap();
+        assert_eq!(engine.open_bucket_count().unwrap(), 1);
+        engine.close_open_bucket(position).unwrap();
+        assert_eq!(engine.open_bucket_count().unwrap(), 0);
+        engine.reclaim_bucket(position).unwrap();
+        engine.queue_discard_bucket(position).unwrap();
+        assert!(!engine.discard_queue_empty().unwrap());
+        engine.run_discard_worker().unwrap();
+        assert!(engine.discard_queue_empty().unwrap());
+        assert!(engine.verify_guard_invariants().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn discard_worker_rejects_open_bucket_until_closed() {
         let (engine, path) = prepared_bucket_engine("discard-open", 4);
         add_free_bucket(&engine, 5);
@@ -2979,6 +3118,11 @@ mod tests {
         add_free_bucket(&engine, 5);
         let position = engine.allocate_bucket(0).unwrap();
         engine.open_bucket(position).unwrap();
+        assert_eq!(
+            engine.open_bucket_count().unwrap(),
+            1,
+            "query API must report the leak before drop"
+        );
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(engine);
         }));
@@ -3060,6 +3204,10 @@ mod tests {
         engine.close_open_bucket(open).unwrap();
         assert!(engine.run_discard_worker().is_ok());
         assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(
+            engine.discard_queue_empty().unwrap(),
+            "worker Ok implies drained queue"
+        );
         assert!(engine.queue_discard_bucket(open).is_ok());
         drop(engine);
         fs::remove_file(path).unwrap();
@@ -3084,6 +3232,10 @@ mod tests {
         engine.set_device_rw(0, true).unwrap();
         assert!(engine.run_discard_worker().is_ok());
         assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(
+            engine.discard_queue_empty().unwrap(),
+            "worker Ok implies drained queue"
+        );
         drop(engine);
         fs::remove_file(path).unwrap();
     }
@@ -3164,6 +3316,10 @@ mod tests {
         engine.reclaim_bucket(not_ready).unwrap();
         assert!(engine.run_discard_worker().is_ok());
         assert!(engine.verify_bucket_indexes().is_ok());
+        assert!(
+            engine.discard_queue_empty().unwrap(),
+            "worker Ok implies drained queue"
+        );
         for position in [ready, not_ready] {
             assert!(
                 engine.queue_discard_bucket(position).is_ok(),
@@ -3367,18 +3523,15 @@ mod tests {
                         }
                     }
                     let alloc = alloc.expect("model bucket alloc exists");
-                    if open[index] {
-                        prop_assert_ne!(
-                            alloc.data_type,
-                            BCH_DATA_FREE,
-                            "open bucket must not become free"
-                        );
-                    }
                     if state[index] == 2 {
                         prop_assert_eq!(alloc.data_type, BCH_DATA_NEED_DISCARD);
                     }
                 }
                 drop(fs);
+                prop_assert!(
+                    engine.verify_guard_invariants().is_ok(),
+                    "guard invariants: no open or not_rw bucket may be free"
+                );
             }
             for index in 0..4 {
                 if open[index] {
