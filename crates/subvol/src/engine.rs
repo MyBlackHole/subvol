@@ -7,7 +7,7 @@
 //! core, not a filesystem-compatibility layer.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     fs::OpenOptions,
     io,
@@ -431,7 +431,7 @@ struct EngineState {
     fs: Mutex<EngineFs>,
     rcu: Rcu,
     reclaim: Arc<ReclaimControl>,
-    discard_inflight: Mutex<BTreeSet<(u64, u64)>>,
+    discard_inflight: Mutex<(VecDeque<(u64, u64)>, BTreeSet<(u64, u64)>)>,
 }
 
 /// A self-contained btree/transaction/journal storage engine.  Clones share
@@ -488,7 +488,7 @@ impl StorageEngine {
             fs: Mutex::new(EngineFs(fs)),
             rcu,
             reclaim: Arc::new(ReclaimControl::default()),
-            discard_inflight: Mutex::new(BTreeSet::new()),
+            discard_inflight: Mutex::new((VecDeque::new(), BTreeSet::new())),
         });
         start_reclaim_worker(&inner)?;
         Ok(Self { inner })
@@ -924,43 +924,116 @@ impl StorageEngine {
 
     /// Queues one bucket for the engine-local discard worker.  A duplicate
     /// in-flight request is rejected with the discard.c EEXIST boundary.
+    /// The FIFO order of the queue is the submission order, matching the
+    /// per-device darray in bch2_fast_discard_bucket_add (discard.c:643).
     pub fn queue_discard_bucket(&self, position: KeyPosition) -> Result<(), EngineError> {
         let mut inflight = self
             .inner
             .discard_inflight
             .lock()
             .map_err(|_| EngineError::Poisoned)?;
-        if !inflight.insert((position.inode, position.offset)) {
+        if !inflight.1.insert((position.inode, position.offset)) {
             return Err(EngineError::Transaction(-17));
         }
+        inflight.0.push_back((position.inode, position.offset));
         Ok(())
     }
 
     /// Runs one queued discard.  EAGAIN keeps the request queued for a later
-    /// worker pass; terminal results remove it from the in-flight set.
     pub fn run_discard_worker_once(&self) -> Result<(), EngineError> {
         let position = {
-            let inflight = self
+            let mut inflight = self
                 .inner
                 .discard_inflight
                 .lock()
                 .map_err(|_| EngineError::Poisoned)?;
             inflight
-                .iter()
-                .next()
-                .copied()
+                .0
+                .pop_front()
                 .map(|(inode, offset)| KeyPosition::new(inode, offset, 0))
                 .ok_or(EngineError::Transaction(-11))?
         };
         match self.discard_bucket(position) {
-            Err(EngineError::Transaction(-11)) => Err(EngineError::Transaction(-11)),
+            Err(EngineError::Transaction(-11)) => {
+                self.inner
+                    .discard_inflight
+                    .lock()
+                    .map_err(|_| EngineError::Poisoned)?
+                    .0
+                    .push_back((position.inode, position.offset));
+                Err(EngineError::Transaction(-11))
+            }
             result => {
                 self.inner
                     .discard_inflight
                     .lock()
                     .map_err(|_| EngineError::Poisoned)?
+                    .1
                     .remove(&(position.inode, position.offset));
                 result
+            }
+        }
+    }
+
+    /// Runs one worker pass over the whole discard queue: every queued bucket
+    /// is attempted once in FIFO order.  A bucket not yet ready (EAGAIN) is
+    /// rotated to the queue tail instead of blocking the pass, mirroring the
+    /// main-path advance-and-continue semantics for a bucket that cannot be
+    /// completed right now (discard.c:488-491); a terminal error aborts the
+    /// pass like the fastpath break (discard.c:631-633).  The pass keeps
+    /// draining until the queue is empty, matching the fast_work while loop
+    /// (discard.c:605-633), so buckets queued by a concurrent producer while
+    /// the pass runs are picked up in the same pass.  Returns EAGAIN when
+    /// buckets remain queued, Ok(()) once the queue is fully drained.
+    pub fn run_discard_worker(&self) -> Result<(), EngineError> {
+        loop {
+            let round = {
+                let inflight = self
+                    .inner
+                    .discard_inflight
+                    .lock()
+                    .map_err(|_| EngineError::Poisoned)?;
+                inflight.0.len()
+            };
+            if round == 0 {
+                return Ok(());
+            }
+            let mut deferred = false;
+            for _ in 0..round {
+                let position = {
+                    let mut inflight = self
+                        .inner
+                        .discard_inflight
+                        .lock()
+                        .map_err(|_| EngineError::Poisoned)?;
+                    match inflight.0.pop_front() {
+                        Some((inode, offset)) => KeyPosition::new(inode, offset, 0),
+                        None => break,
+                    }
+                };
+                match self.discard_bucket(position) {
+                    Err(EngineError::Transaction(-11)) => {
+                        self.inner
+                            .discard_inflight
+                            .lock()
+                            .map_err(|_| EngineError::Poisoned)?
+                            .0
+                            .push_back((position.inode, position.offset));
+                        deferred = true;
+                    }
+                    result => {
+                        self.inner
+                            .discard_inflight
+                            .lock()
+                            .map_err(|_| EngineError::Poisoned)?
+                            .1
+                            .remove(&(position.inode, position.offset));
+                        result?;
+                    }
+                }
+            }
+            if deferred {
+                return Err(EngineError::Transaction(-11));
             }
         }
     }
@@ -986,7 +1059,8 @@ impl StorageEngine {
             .map_err(|_| EngineError::Poisoned)?;
         let mut inserted = 0;
         for position in positions {
-            if inflight.insert(position) {
+            if inflight.1.insert(position) {
+                inflight.0.push_back(position);
                 inserted += 1;
             }
         }
@@ -2588,6 +2662,146 @@ mod tests {
     }
 
     #[test]
+    fn discard_worker_concurrent_queue_single_worker_drains_all() {
+        let (engine, path) = prepared_bucket_engine("discard-concurrent", 4);
+        add_free_bucket(&engine, 5);
+        add_free_bucket(&engine, 6);
+        add_free_bucket(&engine, 7);
+        let mut positions = Vec::new();
+        for _ in 0..4 {
+            let position = engine.allocate_bucket(0).unwrap();
+            engine.reclaim_bucket(position).unwrap();
+            positions.push(position);
+        }
+        let engine = Arc::new(engine);
+        let barrier = Arc::new(std::sync::Barrier::new(positions.len()));
+        let mut workers = Vec::new();
+        for position in &positions {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            let position = *position;
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                engine.queue_discard_bucket(position).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        engine.run_discard_worker().unwrap();
+        engine.verify_bucket_indexes().unwrap();
+        for position in &positions {
+            assert!(
+                engine.queue_discard_bucket(*position).is_ok(),
+                "queue should be drained: {position:?}"
+            );
+        }
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    fn add_free_bucket(engine: &StorageEngine, bucket_offset: u64) {
+        unsafe {
+            let mut fs = engine.lock_fs().unwrap();
+            let position = crate::btree::bkey::POS(0, bucket_offset);
+            let alloc = bch_alloc_v4::default();
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut **fs);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    position,
+                    KEY_TYPE_alloc_v4,
+                    (&alloc as *const bch_alloc_v4).cast(),
+                    core::mem::size_of::<bch_alloc_v4>(),
+                );
+                let ret = if ret == 0 {
+                    bch2_btree_bit_mod(
+                        &mut trans,
+                        BTREE_ID_FREESPACE,
+                        alloc_freespace_pos(position, &alloc),
+                        true,
+                    )
+                } else {
+                    ret
+                };
+                let ret = if ret == 0 {
+                    bch2_trans_commit(&mut trans)
+                } else {
+                    ret
+                };
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+        }
+    }
+
+    #[test]
+    fn discard_worker_fifo_pass_drains_entire_queue() {
+        let (engine, path) = prepared_bucket_engine("discard-fifo", 4);
+        add_free_bucket(&engine, 5);
+        add_free_bucket(&engine, 6);
+        add_free_bucket(&engine, 7);
+        let mut positions = Vec::new();
+        for _ in 0..3 {
+            let position = engine.allocate_bucket(0).unwrap();
+            engine.reclaim_bucket(position).unwrap();
+            engine.queue_discard_bucket(position).unwrap();
+            positions.push(position);
+        }
+        engine.run_discard_worker().unwrap();
+        engine.verify_bucket_indexes().unwrap();
+        for position in &positions {
+            assert!(
+                engine.queue_discard_bucket(*position).is_ok(),
+                "queue should be drained after one pass: {position:?}"
+            );
+        }
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn discard_worker_eagain_rotates_to_tail_without_blocking_ready_buckets() {
+        let (engine, path) = prepared_bucket_engine("discard-eagain", 4);
+        add_free_bucket(&engine, 5);
+        let ready = engine.allocate_bucket(0).unwrap();
+        let not_ready = KeyPosition::new(0, if ready.offset == 4 { 5 } else { 4 }, 0);
+        engine.reclaim_bucket(ready).unwrap();
+        engine.queue_discard_bucket(ready).unwrap();
+        engine.queue_discard_bucket(not_ready).unwrap();
+        assert!(matches!(
+            engine.run_discard_worker(),
+            Err(EngineError::Transaction(-11))
+        ));
+        assert!(
+            matches!(
+                engine.queue_discard_bucket(not_ready),
+                Err(EngineError::Transaction(-17))
+            ),
+            "not-ready bucket should stay queued"
+        );
+        engine.allocate_bucket(0).unwrap();
+        engine.reclaim_bucket(not_ready).unwrap();
+        assert!(engine.run_discard_worker().is_ok());
+        assert!(engine.verify_bucket_indexes().is_ok());
+        for position in [ready, not_ready] {
+            assert!(
+                engine.queue_discard_bucket(position).is_ok(),
+                "queue should be drained: {position:?}"
+            );
+        }
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn discard_worker_rediscovers_need_discard_after_restart() {
         let (engine, path) = prepared_bucket_engine("discard-restart", 4);
         let position = KeyPosition::new(0, 4, 0);
@@ -2612,30 +2826,126 @@ mod tests {
         })]
 
         #[test]
-        fn public_bucket_api_operation_model_stays_consistent(
-            operations in prop::collection::vec(0u8..3, 1..=30),
+        fn multi_bucket_discard_worker_model_converges(
+            operations in prop::collection::vec((0u8..6, 0u8..4), 1..=40),
         ) {
-            let (engine, path) = prepared_bucket_engine("bucket-api-prop", 4);
-            let position = KeyPosition::new(0, 4, 0);
-            let mut state = 0u8; // free, btree-owned, need-discard
-            for operation in operations {
-                match operation {
+            let (engine, path) = prepared_bucket_engine("discard-model", 4);
+            add_free_bucket(&engine, 5);
+            add_free_bucket(&engine, 6);
+            add_free_bucket(&engine, 7);
+            let buckets = [
+                KeyPosition::new(0, 4, 0),
+                KeyPosition::new(0, 5, 0),
+                KeyPosition::new(0, 6, 0),
+                KeyPosition::new(0, 7, 0),
+            ];
+            let mut engine = engine;
+            let mut state = [0u8; 4]; // 0=free, 1=btree-owned, 2=need-discard
+            let mut queued = [false; 4];
+            let mut shadow_queue: VecDeque<usize> = VecDeque::new();
+            for (kind, bucket) in operations {
+                match kind {
                     0 => {
-                        let result = engine.allocate_bucket(0);
-                        if state == 0 {
-                            prop_assert_eq!(result.unwrap(), position);
-                            state = 1;
+                        let result = engine.queue_discard_bucket(buckets[bucket as usize]);
+                        if queued[bucket as usize] {
+                            prop_assert!(matches!(
+                                result,
+                                Err(EngineError::Transaction(-17))
+                            ));
                         } else {
-                            prop_assert!(result.is_err());
+                            prop_assert!(result.is_ok());
+                            queued[bucket as usize] = true;
+                            shadow_queue.push_back(bucket as usize);
                         }
                     }
                     1 => {
-                        prop_assert!(engine.reclaim_bucket(position).is_ok());
-                        state = if state == 2 { 0 } else { 2 };
+                        let mut deferred = false;
+                        let round = shadow_queue.len();
+                        for _ in 0..round {
+                            if let Some(head) = shadow_queue.pop_front() {
+                                if state[head] == 2 {
+                                    queued[head] = false;
+                                    state[head] = 0;
+                                } else {
+                                    shadow_queue.push_back(head);
+                                    deferred = true;
+                                }
+                            }
+                        }
+                        let result = engine.run_discard_worker();
+                        if deferred {
+                            prop_assert!(matches!(
+                                result,
+                                Err(EngineError::Transaction(-11))
+                            ));
+                        } else {
+                            prop_assert!(result.is_ok());
+                        }
                     }
-                    _ => {
-                        prop_assert!(engine.reclaim_bucket(KeyPosition::new(0, 8, 0)).is_err());
+                    2 => {
+                        let index = bucket as usize;
+                        let result = engine.reclaim_bucket(buckets[index]);
+                        prop_assert!(result.is_ok());
+                        state[index] = if state[index] == 2 { 0 } else { 2 };
                     }
+                    3 => {
+                        let result = engine.allocate_bucket(0);
+                        let free_count = state.iter().filter(|&&s| s == 0).count();
+                        if free_count == 0 {
+                            prop_assert!(result.is_err());
+                        } else {
+                            let position = result.unwrap();
+                            let index = buckets
+                                .iter()
+                                .position(|b| *b == position)
+                                .expect("allocated bucket is in the model");
+                            prop_assert_eq!(state[index], 0);
+                            state[index] = 1;
+                        }
+                    }
+                    4 => {
+                        engine.flush_journal().unwrap();
+                        drop(engine);
+                        let recovered = StorageEngine::open_persistent(&path).unwrap();
+                        let discovered = recovered.discover_discard_buckets().unwrap();
+                        let expected = state.iter().filter(|&&s| s == 2).count();
+                        prop_assert_eq!(discovered, expected);
+                        state = [0u8; 4];
+                        queued = [false; 4];
+                        shadow_queue.clear();
+                        for index in 0..4 {
+                            let bucket = buckets[index];
+                            let mut fs = recovered.lock_fs().unwrap();
+                            let mut alloc = None;
+                            unsafe {
+                                for raw in scan_raw_locked(&mut **fs, 4).unwrap() {
+                                    let key = raw.words.as_ptr().cast::<bkey_i>();
+                                    if (*key).k.type_ == KEY_TYPE_alloc_v4
+                                        && (*key).k.p == bucket.raw()
+                                    {
+                                        let value = (key as *const u8)
+                                            .add(core::mem::size_of::<bkey>())
+                                            .cast::<bch_alloc_v4>();
+                                        alloc = Some(core::ptr::read_unaligned(value));
+                                        break;
+                                    }
+                                }
+                            }
+                            drop(fs);
+                            let alloc = alloc.expect("model bucket alloc exists");
+                            state[index] = if alloc.data_type == BCH_DATA_FREE {
+                                0
+                            } else if alloc.data_type == BCH_DATA_NEED_DISCARD {
+                                queued[index] = true;
+                                shadow_queue.push_back(index);
+                                2
+                            } else {
+                                1
+                            };
+                        }
+                        engine = recovered;
+                    }
+                    _ => {}
                 }
                 prop_assert!(engine.verify_bucket_indexes().is_ok());
             }
