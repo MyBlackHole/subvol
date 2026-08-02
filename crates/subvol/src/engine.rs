@@ -492,7 +492,7 @@ impl StorageEngine {
             reclaim: Arc::new(ReclaimControl::default()),
             discard_inflight: Mutex::new((VecDeque::new(), BTreeSet::new())),
             open_buckets: Mutex::new(BTreeSet::new()),
-            rw_devs: Mutex::new(BTreeSet::from([0])),
+            rw_devs: Mutex::new(BTreeSet::new()),
         });
         start_reclaim_worker(&inner)?;
         Ok(Self { inner })
@@ -800,6 +800,13 @@ impl StorageEngine {
     /// A non-rw device refuses allocation and free transitions, like
     /// bch2_dev_get_ioref(WRITE) failing in the discard path (discard.c:357-365).
     pub fn set_device_rw(&self, dev: u64, rw: bool) -> Result<(), EngineError> {
+        /* lock order open_buckets -> rw_devs, matching reclaim_bucket and
+         * discard_bucket, so a concurrent reclaim can never deadlock */
+        let open_buckets = self
+            .inner
+            .open_buckets
+            .lock()
+            .map_err(|_| EngineError::Poisoned)?;
         let mut rw_devs = self
             .inner
             .rw_devs
@@ -807,9 +814,17 @@ impl StorageEngine {
             .map_err(|_| EngineError::Poisoned)?;
         if rw {
             rw_devs.insert(dev);
-        } else {
-            rw_devs.remove(&dev);
+            return Ok(());
         }
+        /* bch2_dev_allocator_remove() first marks the device ro, then stops
+         * its open buckets and waits for open write points to drain
+         * (background.c:1690-1722, bch2_dev_has_open_write_point
+         * background.c:1650-1662).  Without concurrent I/O the wait is
+         * expressed as a refusal while any open bucket remains. */
+        if open_buckets.iter().any(|&(d, _)| d == dev) {
+            return Err(EngineError::Transaction(-16));
+        }
+        rw_devs.remove(&dev);
         Ok(())
     }
 
@@ -1546,6 +1561,27 @@ impl StorageEngine {
         let mut fs = self.lock_fs()?;
         unsafe {
             configure_persistent_journal(&mut fs, file)?;
+            /* Devices come online here: bch2_dev_allocator_add() marks them
+             * rw (background.c:1723-1728), so derive the initial rw_devs set
+             * from devs_online instead of a hardcoded device 0. */
+            let mut rw_devs = self
+                .inner
+                .rw_devs
+                .lock()
+                .map_err(|_| EngineError::Poisoned)?;
+            rw_devs.clear();
+            for word in 0..fs.devs_online.d.len() {
+                let mut bits = fs.devs_online.d[word];
+                let mut bit = 0;
+                while bits != 0 {
+                    if bits & 1 != 0 {
+                        rw_devs.insert((word * usize::BITS as usize + bit) as u64);
+                    }
+                    bits >>= 1;
+                    bit += 1;
+                }
+            }
+            drop(rw_devs);
             let mut info = journal_start_info::default();
             let ret = bch2_journal_read(&mut **fs, &mut info);
             if ret != 0 {
@@ -1619,6 +1655,20 @@ impl Drop for EngineState {
             }
         }
         self.rcu.barrier();
+        /* umount semantics: bch2_open_buckets_stop(c, NULL, true) closes all
+         * open buckets when the fs goes read-only (fs.c:324).  An engine
+         * dropping with unpaired open buckets is a caller leak. */
+        {
+            let open = match self.open_buckets.lock() {
+                Ok(open) => open,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert!(
+                open.is_empty(),
+                "open bucket leak: {} bucket(s) never closed",
+                open.len()
+            );
+        }
         let fs = match self.fs.get_mut() {
             Ok(fs) => fs,
             Err(poisoned) => poisoned.into_inner(),
@@ -2856,6 +2906,112 @@ mod tests {
     }
 
     #[test]
+    fn set_device_rw_false_refuses_open_bucket_on_device() {
+        let (engine, path) = prepared_bucket_engine("rw-open-guard", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        engine.open_bucket(position).unwrap();
+        assert!(matches!(
+            engine.set_device_rw(0, false),
+            Err(EngineError::Transaction(-16))
+        ));
+        assert!(engine.verify_bucket_indexes().is_ok());
+        engine.close_open_bucket(position).unwrap();
+        engine.set_device_rw(0, false).unwrap();
+        assert!(matches!(
+            engine.allocate_bucket(0),
+            Err(EngineError::Transaction(-1))
+        ));
+        engine.set_device_rw(0, true).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        engine.discard_bucket(position).unwrap();
+        assert!(engine.verify_bucket_indexes().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rw_devs_initialized_from_devs_online() {
+        let engine = StorageEngine::new().unwrap();
+        assert!(
+            engine.inner.rw_devs.lock().unwrap().is_empty(),
+            "memory engine has no online devices, rw_devs must derive from devs_online"
+        );
+        drop(engine);
+        let path = persistent_test_path("rw-init");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        assert_eq!(
+            *engine.inner.rw_devs.lock().unwrap(),
+            BTreeSet::from([0]),
+            "create_persistent puts dev 0 online (devs_online.d[0]), rw_devs must follow"
+        );
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persistent_engine_derives_rw_devs_from_devs_online() {
+        let (engine, path) = prepared_bucket_engine("rw-derive", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        assert_eq!(position.inode, 0);
+        engine.set_device_rw(0, false).unwrap();
+        assert!(matches!(
+            engine.allocate_bucket(0),
+            Err(EngineError::Transaction(-1))
+        ));
+        engine.set_device_rw(0, true).unwrap();
+        let position = engine.allocate_bucket(0).unwrap();
+        assert_eq!(position.inode, 0);
+        engine.close_open_bucket(position).unwrap();
+        engine.reclaim_bucket(position).unwrap();
+        assert!(engine.verify_bucket_indexes().is_ok());
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn drop_detects_unclosed_open_bucket_leak() {
+        let (engine, path) = prepared_bucket_engine("drop-leak", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        engine.open_bucket(position).unwrap();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(engine);
+        }));
+        let message = caught
+            .err()
+            .expect("drop with unclosed open bucket must panic");
+        let message = message
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| message.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("open bucket leak"),
+            "unexpected panic message: {message}"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn close_open_bucket_then_drop_is_clean() {
+        let (engine, path) = prepared_bucket_engine("drop-clean", 4);
+        add_free_bucket(&engine, 5);
+        let position = engine.allocate_bucket(0).unwrap();
+        engine.open_bucket(position).unwrap();
+        engine.close_open_bucket(position).unwrap();
+        drop(engine);
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        assert!(recovered.verify_bucket_indexes().is_ok());
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn discard_reclaim_transaction_fault_leaves_no_half_state() {
         let (engine, path) = prepared_bucket_engine("discard-fault", 4);
         add_free_bucket(&engine, 5);
@@ -3131,6 +3287,12 @@ mod tests {
                     }
                     4 => {
                         engine.flush_journal().unwrap();
+                        for index in 0..4 {
+                            if open[index] {
+                                engine.close_open_bucket(buckets[index]).unwrap();
+                                open[index] = false;
+                            }
+                        }
                         drop(engine);
                         let recovered = StorageEngine::open_persistent(&path).unwrap();
                         let discovered = recovered.discover_discard_buckets().unwrap();
@@ -3217,6 +3379,12 @@ mod tests {
                     }
                 }
                 drop(fs);
+            }
+            for index in 0..4 {
+                if open[index] {
+                    engine.close_open_bucket(buckets[index]).unwrap();
+                    open[index] = false;
+                }
             }
             drop(engine);
             fs::remove_file(path).unwrap();
