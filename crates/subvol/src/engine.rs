@@ -618,11 +618,24 @@ impl StorageEngine {
             if member.bucket_size == 0 || !crate::sb::bch2_member_alive(&member) {
                 return Err(EngineError::Transaction(-1));
             }
+            let mut freespace_candidates = BTreeSet::new();
+            for raw in scan_raw_locked(&mut **fs, BTREE_ID_FREESPACE)? {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set && (*key).k.p.inode == dev {
+                    freespace_candidates.insert((*key).k.p.offset & ((1u64 << 56) - 1));
+                }
+            }
             for raw in scan_raw_locked(&mut **fs, 4)? {
                 let key = raw.words.as_ptr().cast::<bkey_i>();
                 if (*key).k.type_ != KEY_TYPE_alloc_v4
                     || (*key).k.p.inode != dev
                     || raw.words.len() < BKEY_U64S as usize + 1
+                {
+                    continue;
+                }
+                let bucket_offset = (*key).k.p.offset;
+                if !freespace_candidates.is_empty()
+                    && !freespace_candidates.contains(&bucket_offset)
                 {
                     continue;
                 }
