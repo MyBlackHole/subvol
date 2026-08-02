@@ -3332,6 +3332,63 @@ mod tests {
     }
 
     #[test]
+    fn bucket_state_and_freespace_index_follow_one_transaction() {
+        unsafe {
+            let mut c = pointer_trigger_test_fs();
+            let bucket = SPOS(0, 2, 0);
+            let mut alloc = crate::btree::bset::bch_alloc_v4::default();
+            alloc.gen = 7;
+            alloc.oldest_gen = 7;
+            alloc.data_type = 0;
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut c);
+            loop {
+                bch2_trans_begin(&mut trans);
+                let ret = trigger_update_value(
+                    &mut trans,
+                    4,
+                    bucket,
+                    crate::btree::bset::KEY_TYPE_alloc_v4,
+                    (&alloc as *const crate::btree::bset::bch_alloc_v4).cast(),
+                    core::mem::size_of::<crate::btree::bset::bch_alloc_v4>(),
+                );
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                let ret = bch2_btree_bit_mod(&mut trans, 5, bucket, true);
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                let ret = bch2_trans_commit(&mut trans);
+                if ret == -12 && trans.realloc_bytes_required != 0 {
+                    continue;
+                }
+                assert_eq!(ret, 0);
+                break;
+            }
+            bch2_trans_put(&mut trans);
+
+            let mut verify = btree_trans::default();
+            bch2_trans_init(&mut verify, &mut c);
+            bch2_trans_begin(&mut verify);
+            let mut read = crate::btree::bset::bch_alloc_v4::default();
+            trigger_read_alloc(&mut verify, bucket, &mut read);
+            assert_eq!(read.data_type, 0);
+            let mut iter = btree_iter::default();
+            bch2_trans_iter_init(&mut verify, &mut iter, 5, bucket, BTREE_ITER_intent);
+            assert_eq!(
+                (*bch2_btree_iter_peek_slot(&mut iter).k).type_,
+                crate::btree::bset::KEY_TYPE_set
+            );
+            bch2_trans_iter_exit(&mut iter);
+            bch2_trans_put(&mut verify);
+            bch2_free_super(&mut c.disk_sb);
+        }
+    }
+
+    #[test]
     fn pointer_insert_rejects_unavailable_or_invalid_member_without_derived_updates() {
         unsafe {
             for invalid_member in 0..4 {
