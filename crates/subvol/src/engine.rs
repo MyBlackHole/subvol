@@ -85,6 +85,7 @@ const BCH_DATA_FREE: u8 = 0;
 const BCH_DATA_BTREE: u8 = 3;
 const BCH_DATA_NEED_DISCARD: u8 = 9;
 const BTREE_ID_FREESPACE: u8 = 5;
+const BTREE_ID_NEED_DISCARD: u8 = 6;
 
 fn alloc_freespace_pos(position: bpos, alloc: &bch_alloc_v4) -> bpos {
     let gc_gen = alloc.gen.wrapping_sub(alloc.oldest_gen);
@@ -616,6 +617,7 @@ impl StorageEngine {
         unsafe {
             let mut alloc_free = BTreeSet::new();
             let mut expected_index = BTreeSet::new();
+            let mut expected_need_discard = BTreeSet::new();
             for raw in scan_raw_locked(&mut **fs, 4)? {
                 let key = raw.words.as_ptr().cast::<bkey_i>();
                 if (*key).k.type_ != KEY_TYPE_alloc_v4 {
@@ -629,6 +631,8 @@ impl StorageEngine {
                     alloc_free.insert(((*key).k.p.inode, (*key).k.p.offset));
                     let indexed = alloc_freespace_pos((*key).k.p, &alloc);
                     expected_index.insert((indexed.inode, indexed.offset));
+                } else if alloc.data_type == BCH_DATA_NEED_DISCARD {
+                    expected_need_discard.insert(((*key).k.p.inode, (*key).k.p.offset));
                 }
             }
             let mut indexed = BTreeSet::new();
@@ -644,6 +648,18 @@ impl StorageEngine {
                     .iter()
                     .any(|(dev, offset)| !alloc_free.contains(&(*dev, offset & ((1u64 << 56) - 1))))
             {
+                return Err(EngineError::DerivedState(
+                    DerivedStateMismatch::FreespaceSet,
+                ));
+            }
+            let mut actual_need_discard = BTreeSet::new();
+            for raw in scan_raw_locked(&mut **fs, BTREE_ID_NEED_DISCARD)? {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set {
+                    actual_need_discard.insert(((*key).k.p.inode, (*key).k.p.offset));
+                }
+            }
+            if expected_need_discard != actual_need_discard {
                 return Err(EngineError::DerivedState(
                     DerivedStateMismatch::FreespaceSet,
                 ));
@@ -781,6 +797,11 @@ impl StorageEngine {
                     return Err(EngineError::Transaction(-16));
                 }
                 let old_alloc = alloc;
+                if alloc.data_type == BCH_DATA_NEED_DISCARD
+                    && alloc.journal_seq_empty > fs.journal.last_seq_ondisk.load(Ordering::Acquire)
+                {
+                    return Err(EngineError::Transaction(-11));
+                }
                 if alloc.data_type != BCH_DATA_NEED_DISCARD {
                     /* background.c first moves an empty bucket into
                      * need_discard; discard.c performs the later free
@@ -807,19 +828,39 @@ impl StorageEngine {
                     );
                     let ret = if ret == 0 {
                         if alloc.data_type == BCH_DATA_FREE {
-                            bch2_btree_bit_mod(
+                            let ret = bch2_btree_bit_mod(
                                 &mut trans,
                                 BTREE_ID_FREESPACE,
                                 alloc_freespace_pos((*key).k.p, &alloc),
                                 true,
-                            )
+                            );
+                            if ret == 0 {
+                                bch2_btree_bit_mod(
+                                    &mut trans,
+                                    BTREE_ID_NEED_DISCARD,
+                                    (*key).k.p,
+                                    false,
+                                )
+                            } else {
+                                ret
+                            }
                         } else {
-                            bch2_btree_bit_mod(
+                            let ret = bch2_btree_bit_mod(
                                 &mut trans,
                                 BTREE_ID_FREESPACE,
                                 alloc_freespace_pos((*key).k.p, &old_alloc),
                                 false,
-                            )
+                            );
+                            if ret == 0 {
+                                bch2_btree_bit_mod(
+                                    &mut trans,
+                                    BTREE_ID_NEED_DISCARD,
+                                    (*key).k.p,
+                                    true,
+                                )
+                            } else {
+                                ret
+                            }
                         }
                     } else {
                         ret
