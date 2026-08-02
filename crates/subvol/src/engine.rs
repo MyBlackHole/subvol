@@ -838,7 +838,6 @@ impl StorageEngine {
                     continue;
                 }
                 let bucket_offset = (*key).k.p.offset;
-                let bucket_offset = (*key).k.p.offset;
                 if bucket_offset < member.first_bucket as u64 || bucket_offset >= member.nbuckets {
                     continue;
                 }
@@ -898,7 +897,8 @@ impl StorageEngine {
         }
     }
 
-    /// Marks a bucket as open, mirroring an in-progress write claim in the    /// open_buckets hash (foreground.h:274-296).  While open, the bucket is
+    /// Marks a bucket as open, mirroring an in-progress write claim in the
+    /// open_buckets hash (foreground.h:274-296).  While open, the bucket is
     /// protected from reclamation: reclaim and discard both refuse it, like
     /// bch2_bucket_is_open_safe() skipping open buckets in the discard path
     /// (discard.c:344-347, 433-436).
@@ -1083,7 +1083,22 @@ impl StorageEngine {
                         ret
                     };
                     let ret = if ret == 0 {
-                        bch2_trans_commit(&mut trans)
+                        if fs
+                            .fault_inject_discard_restarts
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                                count.checked_sub(1)
+                            })
+                            .is_ok()
+                        {
+                            /* T0199: per-bucket restart injection at the
+                             * discard worker transaction commit boundary,
+                             * the trans_maybe_inject_restart position
+                             * (commit.c:1390); -4 rides the existing
+                             * bch2_trans_begin retry loop below. */
+                            -4
+                        } else {
+                            bch2_trans_commit(&mut trans)
+                        }
                     } else {
                         ret
                     };
@@ -2564,22 +2579,7 @@ unsafe fn bit_mod_sync(
         bch2_trans_begin(&mut trans);
         let ret = bch2_btree_bit_mod(&mut trans, btree, position, set);
         let ret = if ret == 0 {
-            if fs
-                .fault_inject_discard_restarts
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_sub(1)
-                })
-                .is_ok()
-            {
-                /* T0199: per-bucket restart injection at the
-                 * discard transaction commit boundary, the
-                 * trans_maybe_inject_restart position
-                 * (commit.c:1390); -4 rides the existing
-                 * bch2_trans_begin retry loop below. */
-                -4
-            } else {
-                bch2_trans_commit(&mut trans)
-            }
+            bch2_trans_commit(&mut trans)
         } else {
             ret
         };
