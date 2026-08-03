@@ -1867,6 +1867,13 @@ impl StorageEngine {
             if ret != 0 {
                 return Err(EngineError::Journal(ret));
             }
+            /* Rebuild the in-memory snapshot table from the replayed keys,
+             * matching snapshots/snapshot.c:bch2_snapshots_read() which runs
+             * after replay and before going rw. */
+            let ret = crate::snapshot::bch2_snapshots_read(&mut **fs);
+            if ret != 0 {
+                return Err(EngineError::Transaction(ret));
+            }
             rebuild_derived_state(&mut **fs, None)?;
             check_extents_to_backpointers(&mut **fs)?;
         }
@@ -6309,5 +6316,221 @@ mod tests {
                 "seed {seed}"
             );
         }
+    }
+
+    /// T0209 AC-1/2/3: snapshot keys committed through the raw transaction
+    /// path (encode_key only emits cookie/deleted) must survive a crash
+    /// reopen via journal replay, rebuild the in-memory snapshot table
+    /// (snapshots/snapshot.c:bch2_snapshots_read reverse scan), and make
+    /// the filtered iterator's ancestor view match the pre-crash one.
+    #[test]
+    fn snapshot_table_rebuilds_on_reopen_preserves_ancestor_semantics() {
+        use crate::btree::bkey::SPOS;
+        use crate::btree::iter::{bch2_btree_iter_advance, bch2_btree_iter_set_snapshot};
+        use crate::snapshot::{
+            __snapshot_t, bch2_snapshot_is_ancestor, bch2_snapshot_parent,
+            bch2_snapshots_same_tree, bch_snapshot, bkey_i_snapshot, snapshot_id_state, snapshot_t,
+            KEY_TYPE_snapshot, BCH_SNAPSHOT_SUBVOL,
+        };
+
+        const ROOT: u32 = u32::MAX;
+        const LEFT: u32 = u32::MAX - 1;
+        const LEAF: u32 = u32::MAX - 2;
+        const RIGHT: u32 = u32::MAX - 3;
+
+        unsafe fn write_snapshot_key(
+            fs: &mut bch_fs,
+            id: u32,
+            parent: u32,
+            children: [u32; 2],
+            subvol: u32,
+            tree: u32,
+            depth: u32,
+            skip: [u32; 3],
+        ) {
+            let mut key = bkey_i_snapshot {
+                k: bkey {
+                    u64s: 12,
+                    format: KEY_FORMAT_CURRENT,
+                    type_: KEY_TYPE_snapshot,
+                    p: SPOS(0, id as u64, 0),
+                    ..Default::default()
+                },
+                v: bch_snapshot {
+                    flags: if subvol != 0 { BCH_SNAPSHOT_SUBVOL } else { 0 },
+                    parent,
+                    children,
+                    subvol,
+                    tree,
+                    depth,
+                    skip,
+                    ..Default::default()
+                },
+            };
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, fs);
+            bch2_trans_begin(&mut trans);
+            let mut iter = btree_iter::default();
+            bch2_trans_iter_init(&mut trans, &mut iter, 0, key.k.p, BTREE_ITER_intent);
+            assert_eq!(bch2_btree_iter_traverse(&mut iter), 0);
+            assert_eq!(
+                bch2_trans_update(
+                    &mut trans,
+                    &mut iter,
+                    (&mut key as *mut bkey_i_snapshot).cast(),
+                    0,
+                ),
+                0
+            );
+            assert_eq!(bch2_trans_commit(&mut trans), 0);
+            bch2_trans_iter_exit(&mut iter);
+            bch2_trans_put(&mut trans);
+        }
+
+        unsafe fn snapshot_entry(c: &bch_fs, id: u32) -> snapshot_t {
+            let table = c.snapshots.table.read().unwrap();
+            __snapshot_t(&table, id).copied().unwrap_or_default()
+        }
+
+        unsafe fn filtered_view(c: &mut bch_fs, view: u32) -> Vec<(u64, u32)> {
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, c);
+            bch2_trans_begin(&mut trans);
+            let mut iter = btree_iter::default();
+            bch2_trans_iter_init(
+                &mut trans,
+                &mut iter,
+                0,
+                POS_MIN,
+                BTREE_ITER_not_extents | BTREE_ITER_snapshot_field,
+            );
+            bch2_btree_iter_set_snapshot(&mut iter, view);
+            let mut seen = Vec::new();
+            let mut k = bch2_btree_iter_peek(&mut iter);
+            while !k.k.is_null() {
+                assert_eq!(bkey_err(k), 0);
+                if (*k.k).type_ != KEY_TYPE_snapshot {
+                    seen.push(((*k.k).p.offset, (*k.k).p.snapshot));
+                }
+                if !bch2_btree_iter_advance(&mut iter) {
+                    break;
+                }
+                k = bch2_btree_iter_peek(&mut iter);
+            }
+            bch2_trans_iter_exit(&mut iter);
+            bch2_trans_put(&mut trans);
+            seen
+        }
+
+        let path = persistent_test_path("snapshot-reload");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        let before_seen;
+        {
+            {
+                let mut fs = engine.lock_fs().unwrap();
+                unsafe {
+                    write_snapshot_key(&mut fs, ROOT, 0, [LEFT, RIGHT], 0, 1, 0, [0, 0, 0]);
+                    write_snapshot_key(&mut fs, LEFT, ROOT, [LEAF, 0], 0, 1, 1, [ROOT, ROOT, ROOT]);
+                    write_snapshot_key(&mut fs, LEAF, LEFT, [0, 0], 0, 1, 2, [LEFT, ROOT, ROOT]);
+                    write_snapshot_key(&mut fs, RIGHT, ROOT, [0, 0], 0, 2, 1, [ROOT, ROOT, ROOT]);
+                }
+            }
+            engine
+                .put(
+                    BtreeId::DEFAULT,
+                    BtreeKey::new(KeyPosition::new(1, 1, ROOT), vec![1]).unwrap(),
+                )
+                .unwrap();
+            engine
+                .put(
+                    BtreeId::DEFAULT,
+                    BtreeKey::new(KeyPosition::new(1, 2, LEFT), vec![2]).unwrap(),
+                )
+                .unwrap();
+            engine
+                .put(
+                    BtreeId::DEFAULT,
+                    BtreeKey::new(KeyPosition::new(1, 3, LEAF), vec![3]).unwrap(),
+                )
+                .unwrap();
+            engine.sync().unwrap();
+            {
+                let mut fs = engine.lock_fs().unwrap();
+                unsafe {
+                    assert_eq!(snapshot_entry(&fs, ROOT).parent, 0);
+                    assert_eq!(snapshot_entry(&fs, ROOT).children, [LEFT, RIGHT]);
+                    assert_eq!(snapshot_entry(&fs, ROOT).tree, 1);
+                    assert_eq!(snapshot_entry(&fs, LEFT).parent, ROOT);
+                    assert_eq!(snapshot_entry(&fs, LEFT).depth, 1);
+                    assert_eq!(snapshot_entry(&fs, LEFT).skip, [ROOT, ROOT, ROOT]);
+                    assert_eq!(snapshot_entry(&fs, LEAF).parent, LEFT);
+                    assert_eq!(snapshot_entry(&fs, LEAF).depth, 2);
+                    assert_eq!(snapshot_entry(&fs, LEAF).skip, [LEFT, ROOT, ROOT]);
+                    assert_eq!(snapshot_entry(&fs, RIGHT).parent, ROOT);
+                    assert_eq!(snapshot_entry(&fs, RIGHT).tree, 2);
+                    for id in [ROOT, LEFT, LEAF, RIGHT] {
+                        assert_eq!(
+                            snapshot_entry(&fs, id).state,
+                            snapshot_id_state::SNAPSHOT_ID_live,
+                            "state of snapshot {id}"
+                        );
+                    }
+                    assert!(bch2_snapshot_is_ancestor(&fs, LEAF, LEFT));
+                    assert!(bch2_snapshot_is_ancestor(&fs, LEAF, ROOT));
+                    assert!(bch2_snapshot_is_ancestor(&fs, LEFT, ROOT));
+                    assert!(!bch2_snapshot_is_ancestor(&fs, RIGHT, LEFT));
+                    assert!(bch2_snapshots_same_tree(&fs, LEFT, ROOT));
+                    assert!(!bch2_snapshots_same_tree(&fs, LEFT, RIGHT));
+                    assert_eq!(bch2_snapshot_parent(&fs, LEAF), LEFT);
+                    before_seen = filtered_view(&mut fs, LEFT);
+                }
+            }
+        }
+        let engine = StorageEngine::open_persistent(&path).unwrap();
+        {
+            let mut fs = engine.lock_fs().unwrap();
+            unsafe {
+                assert_eq!(snapshot_entry(&fs, ROOT).parent, 0);
+                assert_eq!(snapshot_entry(&fs, ROOT).children, [LEFT, RIGHT]);
+                assert_eq!(snapshot_entry(&fs, ROOT).tree, 1);
+                assert_eq!(snapshot_entry(&fs, LEFT).parent, ROOT);
+                assert_eq!(snapshot_entry(&fs, LEFT).depth, 1);
+                assert_eq!(snapshot_entry(&fs, LEFT).skip, [ROOT, ROOT, ROOT]);
+                assert_eq!(snapshot_entry(&fs, LEAF).parent, LEFT);
+                assert_eq!(snapshot_entry(&fs, LEAF).depth, 2);
+                assert_eq!(snapshot_entry(&fs, LEAF).skip, [LEFT, ROOT, ROOT]);
+                assert_eq!(snapshot_entry(&fs, RIGHT).parent, ROOT);
+                assert_eq!(snapshot_entry(&fs, RIGHT).tree, 2);
+                for id in [ROOT, LEFT, LEAF, RIGHT] {
+                    assert_eq!(
+                        snapshot_entry(&fs, id).state,
+                        snapshot_id_state::SNAPSHOT_ID_live,
+                        "state of snapshot {id}"
+                    );
+                }
+                assert!(bch2_snapshot_is_ancestor(&fs, LEAF, LEFT));
+                assert!(bch2_snapshot_is_ancestor(&fs, LEAF, ROOT));
+                assert!(!bch2_snapshot_is_ancestor(&fs, RIGHT, LEFT));
+                assert!(bch2_snapshots_same_tree(&fs, LEFT, ROOT));
+                assert!(!bch2_snapshots_same_tree(&fs, LEFT, RIGHT));
+                assert_eq!(bch2_snapshot_parent(&fs, LEAF), LEFT);
+                let after_seen = filtered_view(&mut fs, LEFT);
+                assert_eq!(
+                    after_seen, before_seen,
+                    "filtered view must match pre-crash"
+                );
+                assert_eq!(after_seen, vec![(1, ROOT), (2, LEFT)]);
+                const CHILD: u32 = u32::MAX - 4;
+                write_snapshot_key(&mut fs, CHILD, LEAF, [0, 0], 0, 1, 3, [LEAF, LEFT, ROOT]);
+                assert_eq!(snapshot_entry(&fs, CHILD).parent, LEAF);
+                assert_eq!(snapshot_entry(&fs, CHILD).depth, 3);
+                assert!(bch2_snapshot_is_ancestor(&fs, CHILD, ROOT));
+                assert!(bch2_snapshot_is_ancestor(&fs, CHILD, LEFT));
+            }
+        }
+        let _ = fs::remove_file(&path);
     }
 }

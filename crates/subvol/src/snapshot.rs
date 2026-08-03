@@ -527,6 +527,74 @@ pub unsafe fn bch2_mark_snapshot(
     0
 }
 
+/// snapshots/snapshot.c:bch2_snapshots_read().  Startup path: rebuild the
+/// in-memory snapshot table by scanning the snapshot tree in reverse
+/// (is_ancestor bitmaps require ancestors to be initialized first), feeding
+/// each snapshot key through the same mark path the commit trigger uses.
+///
+/// The domain keeps its own btree id layout (constraint 14): snapshot keys
+/// (KEY_TYPE_snapshot) are carried in btree id 0, so the reverse scan covers
+/// id 0 and filters KEY_TYPE_snapshot keys - the equivalent of iterating the
+/// upstream BTREE_ID_snapshots tree whose keys are all snapshot nodes.
+pub unsafe fn bch2_snapshots_read(c: *mut bch_fs) -> i32 {
+    use crate::btree::bkey::{bkey_err, bkey_s, bkey_s_c, POS_MAX};
+    use crate::btree::iter::{
+        bch2_btree_iter_peek_prev, bch2_btree_iter_rewind, bch2_trans_begin, bch2_trans_init,
+        bch2_trans_iter_exit, bch2_trans_iter_init, bch2_trans_put, btree_iter, btree_trans,
+        BTREE_ITER_all_snapshots, BTREE_ITER_not_extents, BTREE_ITER_snapshot_field,
+    };
+    use crate::btree::update::btree_trigger_op;
+
+    let mut trans = btree_trans::default();
+    bch2_trans_init(&mut trans, c);
+    bch2_trans_begin(&mut trans);
+    let mut iter = btree_iter::default();
+    bch2_trans_iter_init(
+        &mut trans,
+        &mut iter,
+        0,
+        POS_MAX,
+        BTREE_ITER_not_extents | BTREE_ITER_snapshot_field | BTREE_ITER_all_snapshots,
+    );
+    loop {
+        let k = bch2_btree_iter_peek_prev(&mut iter);
+        let err = bkey_err(k);
+        if err != 0 {
+            bch2_trans_iter_exit(&mut iter);
+            bch2_trans_put(&mut trans);
+            return err;
+        }
+        if k.k.is_null() {
+            break;
+        }
+        if (*k.k).type_ == KEY_TYPE_snapshot {
+            let op = btree_trigger_op {
+                btree: 0,
+                level: 0,
+                old: bkey_s_c::default(),
+                new: bkey_s {
+                    k: k.k.cast_mut(),
+                    v: k.v.cast_mut(),
+                },
+                new_buf_u64s: 0,
+                flags: 0,
+            };
+            let ret = bch2_mark_snapshot(&mut trans, op);
+            if ret != 0 {
+                bch2_trans_iter_exit(&mut iter);
+                bch2_trans_put(&mut trans);
+                return ret;
+            }
+        }
+        if !bch2_btree_iter_rewind(&mut iter) {
+            break;
+        }
+    }
+    bch2_trans_iter_exit(&mut iter);
+    bch2_trans_put(&mut trans);
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
