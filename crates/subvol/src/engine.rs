@@ -5681,6 +5681,193 @@ mod tests {
         }
     }
 
+    #[test]
+    fn multi_btree_random_operations_preserve_per_id_models() {
+        /* T0208 AC-1：多 btree id 随机 put/delete 序列属性测试。
+         * 每 id 独立 shadow 模型（BTreeMap），逐步全量比对
+         * scan(id) == model[id]——同时验证扫描有序性（bch2_btree_iter
+         * 顺序遍历）与 id 隔离（操作只改目标 id 的模型，其余 id
+         * 模型不变即 scan 不变，每 btree 独立 root，
+         * bch2_btree_id_root）；get 命中一致；verify_all 遍历全部
+         * live btree（engine.rs:807）。 */
+        const N_IDS: u8 = 4;
+        for seed in 1..=3u64 {
+            let engine = StorageEngine::new().unwrap();
+            let mut model: Vec<BTreeMap<KeyPosition, BtreeKey>> =
+                (0..N_IDS).map(|_| BTreeMap::new()).collect();
+            let mut state = seed ^ 0x9e37_79b9;
+            for _step in 0..256u64 {
+                state ^= state << 7;
+                state ^= state >> 11;
+                state ^= state << 9;
+                let id = (state % N_IDS as u64) as u8;
+                let position = KeyPosition::new(1 + state % 3, state % 96, 0);
+                let mut txn = engine.transaction();
+                if state & 1 == 0 {
+                    let k = BtreeKey::new(position, vec![seed, _step, state]).unwrap();
+                    txn.put(BtreeId::new(id).unwrap(), k.clone());
+                    model[id as usize].insert(position, k);
+                } else if model[id as usize].remove(&position).is_some() {
+                    txn.delete(BtreeId::new(id).unwrap(), position);
+                } else {
+                    continue;
+                }
+                txn.commit().unwrap();
+                for i in 0..N_IDS as usize {
+                    assert_eq!(
+                        engine.scan(BtreeId::new(i as u8).unwrap()).unwrap(),
+                        model[i].values().cloned().collect::<Vec<_>>(),
+                        "seed {seed} step {_step} id {i}"
+                    );
+                    assert_eq!(
+                        engine
+                            .get(BtreeId::new(i as u8).unwrap(), position)
+                            .unwrap(),
+                        model[i].get(&position).cloned(),
+                        "get seed {seed} step {_step} id {i}"
+                    );
+                }
+            }
+            engine.verify_all().unwrap();
+        }
+    }
+
+    #[test]
+    fn multi_btree_topology_changes_preserve_all_models() {
+        /* T0208 AC-2：多 btree id 同时经历 split（768 键分层，
+         * T0174 模式）与 merge（3/4 删除，T0204 模式）后：
+         * verify_all 通过（遍历全部 live btree），每 id scan 与
+         * shadow 模型一致。批量 16 键/事务（路径池约束
+         * BTREE_ITER_INITIAL=64；批大小避开叶容量 64 谐振，
+         * T0204 merge_bulk_delete 同模式）。 */
+        const N_IDS: u8 = 4;
+        let path = persistent_test_path("multi-btree-topology");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        let mut model: Vec<BTreeMap<KeyPosition, BtreeKey>> =
+            (0..N_IDS).map(|_| BTreeMap::new()).collect();
+        for id in 0..N_IDS {
+            for offsets in (0..768u64).collect::<Vec<_>>().chunks(16) {
+                let mut txn = engine.transaction();
+                for &o in offsets {
+                    let k = key(o, &[o, o + 1]);
+                    txn.put(BtreeId::new(id).unwrap(), k.clone());
+                    model[id as usize].insert(KeyPosition::new(1, o, 0), k);
+                }
+                txn.commit().unwrap();
+            }
+        }
+        for id in 0..N_IDS {
+            for chunk in (0..768u64)
+                .filter(|o| o % 4 != 0)
+                .collect::<Vec<_>>()
+                .chunks(16)
+            {
+                let mut txn = engine.transaction();
+                for &o in chunk {
+                    let position = KeyPosition::new(1, o, 0);
+                    txn.delete(BtreeId::new(id).unwrap(), position);
+                    model[id as usize].remove(&position);
+                }
+                txn.commit().unwrap();
+            }
+        }
+        engine.verify_all().unwrap();
+        for id in 0..N_IDS {
+            assert_eq!(
+                engine.scan(BtreeId::new(id).unwrap()).unwrap(),
+                model[id as usize].values().cloned().collect::<Vec<_>>(),
+                "topology id {id}"
+            );
+        }
+        drop(engine);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn multi_btree_random_sequence_survives_crash_reopen() {
+        /* T0208 AC-3：随机 put/delete 序列（全部 sync，journal
+         * durable 后返回）→ 随机步数 drop（StorageEngine 无 Drop
+         * 隐式 flush，丢弃 = 模拟崩溃）→ open_persistent 重开
+         * （journal 重放已 durable 记录，T0201 语义：未 flush 的
+         * 事务丢弃）→ 每 id scan 与 shadow 一致（已同步部分必须
+         * 全部恢复）+ verify_all；重开后继续随机追加操作仍一致。 */
+        const N_IDS: u8 = 4;
+        let path = persistent_test_path("multi-btree-crash-reopen");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let engine = StorageEngine::create_persistent(&path).unwrap();
+        let mut model: Vec<BTreeMap<KeyPosition, BtreeKey>> =
+            (0..N_IDS).map(|_| BTreeMap::new()).collect();
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let crash_at = 64 + state % 96;
+        let mut steps = 0u64;
+        loop {
+            state ^= state << 7;
+            state ^= state >> 11;
+            state ^= state << 9;
+            let id = (state % N_IDS as u64) as u8;
+            let position = KeyPosition::new(1, state % 128, 0);
+            if state & 1 == 0 {
+                let k = key(position.offset, &[steps, state]);
+                engine
+                    .put_sync(BtreeId::new(id).unwrap(), k.clone())
+                    .unwrap();
+                model[id as usize].insert(position, k);
+            } else if model[id as usize].contains_key(&position) {
+                engine
+                    .delete_sync(BtreeId::new(id).unwrap(), position)
+                    .unwrap();
+                model[id as usize].remove(&position);
+            }
+            steps += 1;
+            if steps >= crash_at {
+                break;
+            }
+        }
+        drop(engine);
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        recovered.verify_all().unwrap();
+        for id in 0..N_IDS {
+            assert_eq!(
+                recovered.scan(BtreeId::new(id).unwrap()).unwrap(),
+                model[id as usize].values().cloned().collect::<Vec<_>>(),
+                "after reopen id {id}"
+            );
+        }
+        for _ in 0..64u64 {
+            state ^= state << 7;
+            state ^= state >> 11;
+            state ^= state << 9;
+            let id = (state % N_IDS as u64) as u8;
+            let position = KeyPosition::new(1, state % 128, 0);
+            let mut txn = recovered.transaction();
+            if state & 1 == 0 {
+                let k = key(position.offset, &[steps, state]);
+                txn.put(BtreeId::new(id).unwrap(), k.clone());
+                model[id as usize].insert(position, k);
+            } else if model[id as usize].remove(&position).is_some() {
+                txn.delete(BtreeId::new(id).unwrap(), position);
+            } else {
+                continue;
+            }
+            txn.commit().unwrap();
+            steps += 1;
+        }
+        for id in 0..N_IDS {
+            assert_eq!(
+                recovered.scan(BtreeId::new(id).unwrap()).unwrap(),
+                model[id as usize].values().cloned().collect::<Vec<_>>(),
+                "after append id {id}"
+            );
+        }
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
     /// 沿 root 的 child 指针下行到指定 level，返回包含 pos 的节点。
     unsafe fn find_node_at_level(
         fs: &mut bch_fs,
