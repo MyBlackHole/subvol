@@ -35,10 +35,10 @@ use crate::{
         cache::bch2_fs_btree_cache_init,
         interior::{bch2_btree_node_check_topology, bch2_btree_root_alloc_fake},
         iter::{
-            bch2_btree_iter_next, bch2_btree_iter_peek, bch2_btree_iter_peek_node,
-            bch2_btree_iter_traverse, bch2_trans_begin, bch2_trans_init, bch2_trans_iter_exit,
-            bch2_trans_iter_init, bch2_trans_iter_init_common, bch2_trans_put, btree_iter,
-            btree_trans, BTREE_ITER_all_snapshots, BTREE_ITER_intent, BTREE_ITER_not_extents,
+            bch2_btree_iter_next, bch2_btree_iter_peek, bch2_btree_iter_traverse, bch2_trans_begin,
+            bch2_trans_init, bch2_trans_iter_exit, bch2_trans_iter_init,
+            bch2_trans_iter_init_common, bch2_trans_put, btree_iter, btree_trans,
+            BTREE_ITER_all_snapshots, BTREE_ITER_intent, BTREE_ITER_not_extents,
             BTREE_ITER_snapshot_field,
         },
         types::{
@@ -419,6 +419,35 @@ impl Deref for EngineFs {
 impl DerefMut for EngineFs {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/* 引擎层锁守卫：Drop 时（= engine 公开操作返回前，trans 已释放、
+ * 无节点路径锁）执行 bch2_do_pending_node_rewrites，处理读完成点
+ * （read.c:968）入队的待重写节点。域内差异（AC-1 D1）：上游由
+ * async work 执行，域内同步于操作边界——语义等价（interior.c:3462
+ * pending 列表延迟执行） */
+struct EngineFsGuard<'a>(MutexGuard<'a, EngineFs>);
+
+impl<'a> Deref for EngineFsGuard<'a> {
+    type Target = EngineFs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> DerefMut for EngineFsGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for EngineFsGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            crate::btree::interior::bch2_do_pending_node_rewrites(&mut *self.0 .0 as *mut bch_fs);
+        }
     }
 }
 
@@ -1595,8 +1624,10 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn lock_fs(&self) -> Result<MutexGuard<'_, EngineFs>, EngineError> {
-        self.inner.fs.lock().map_err(|_| EngineError::Poisoned)
+    fn lock_fs(&self) -> Result<EngineFsGuard<'_>, EngineError> {
+        Ok(EngineFsGuard(
+            self.inner.fs.lock().map_err(|_| EngineError::Poisoned)?,
+        ))
     }
 
     unsafe fn checkpoint_locked(&self, fs: &mut bch_fs) -> Result<(), EngineError> {
@@ -2128,24 +2159,9 @@ unsafe fn rewrite_node_key_locked(
      * 注意与 rewrite_node_locked 的 level 语义不同：rewrite_key
      * 的 level 即"目标节点层数"（async 传 b->c.level，read.c:1243
      * 传 scrub->level - 1），CLASS depth=level；因此叶节点
-     * level == 0 合法，无 BUG_ON(!level)。 */
-    let mut trans = btree_trans::default();
-    bch2_trans_init(&mut trans, fs);
-    bch2_trans_begin(&mut trans);
-
-    let mut iter = btree_iter::default();
-    bch2_trans_iter_init_common(
-        &mut trans,
-        &mut iter,
-        btree.as_u8(),
-        key.position().raw(),
-        crate::btree::bset::BTREE_MAX_DEPTH,
-        level,
-        crate::btree::iter::BTREE_ITER_intent,
-    );
-    let b = crate::btree::iter::bch2_btree_iter_peek_node(&mut iter);
-    /* 指针键必须为 btree_ptr_v2 类型（btree_ptr_hash_val 只对
-     * btree_ptr_v2 取 seq）；encode_key 的通用路径编码为 cookie。 */
+     * level == 0 合法，无 BUG_ON(!level)。实现已下沉到
+     * btree::interior::bch2_btree_node_rewrite_key（AC-3 读完成
+     * 触发点复用同一函数）。 */
     let mut words = vec![0u64; BKEY_U64S as usize + key.value().len()];
     let raw_key = words.as_mut_ptr().cast::<bkey_i>();
     (*raw_key).k = bkey {
@@ -2157,17 +2173,8 @@ unsafe fn rewrite_node_key_locked(
     };
     words[BKEY_U64S as usize..].copy_from_slice(key.value());
     let raw_key = words.as_ptr().cast::<bkey_i>();
-    let found = !b.is_null()
-        && !(*b).data.is_null()
-        && crate::btree::cache::btree_ptr_hash_val(&(*b).key)
-            == crate::btree::cache::btree_ptr_hash_val(raw_key);
-    let ret = if found {
-        crate::btree::interior::bch2_btree_node_rewrite(&mut trans, iter.path)
-    } else {
-        -2
-    };
-    bch2_trans_iter_exit(&mut iter);
-    bch2_trans_put(&mut trans);
+    let ret =
+        crate::btree::interior::bch2_btree_node_rewrite_key(fs, btree.as_u8(), level, raw_key);
     if ret != 0 {
         Err(EngineError::Transaction(ret))
     } else {
@@ -4900,6 +4907,36 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_root_region_does_not_affect_journal_first_recovery() {
+        /* 行为契约（journal-first 持久化）：engine 模式节点 key 以
+         * mem_ptr 寻址、磁盘 root 区域不参与恢复（恢复期 disk_sb 无
+         * 文件句柄 → journal.rs 跳过 root_read → 树完全由 journal
+         * btree_keys 记录重建）。因此 AC-3 读完成触发（read.c:968
+         * 语义）仅在 io 层读路径生效（btree/io.rs 两个测试），engine
+         * 模式无节点读盘场景；此处验证破坏磁盘 root 区域不影响恢复，
+         * 防止未来误判该区域参与读盘。 */
+        let path = persistent_test_path("engine-root-region");
+        {
+            let engine = StorageEngine::create_persistent(&path).unwrap();
+            for offset in 100..104u64 {
+                engine
+                    .put_sync(BtreeId::DEFAULT, key(offset, &[offset]))
+                    .unwrap();
+            }
+            engine.sync().unwrap();
+        }
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        assert_eq!(file.write_at(&[4], 64 * 512 + 160).unwrap(), 1);
+        file.sync_all().unwrap();
+        drop(file);
+
+        let engine = StorageEngine::open_persistent(&path).unwrap();
+        assert_eq!(engine.scan(BtreeId::DEFAULT).unwrap().len(), 4);
+        engine.verify(BtreeId::DEFAULT).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn concurrent_rcu_read_transactions_and_writers_keep_iterator_order() {
         let engine = Arc::new(StorageEngine::new().unwrap());
         let mut workers = Vec::new();
@@ -5483,9 +5520,12 @@ mod tests {
                     break;
                 }
                 let key_u64s = crate::btree::bkey::bkeyp_key_u64s(&(*b).format, &*ptr);
-                let child = *ptr.cast::<u64>().add(key_u64s as usize)
-                    as usize as *mut crate::btree::types::btree;
-                assert!(!child.is_null(), "interior key without child at depth {depth}");
+                let child = *ptr.cast::<u64>().add(key_u64s as usize) as usize
+                    as *mut crate::btree::types::btree;
+                assert!(
+                    !child.is_null(),
+                    "interior key without child at depth {depth}"
+                );
                 walk(trans, child, depth + 1, stats);
                 crate::btree::node_iter::bch2_btree_node_iter_next_all(&mut iter, b);
             }
@@ -5654,10 +5694,14 @@ mod tests {
             let mut iter = crate::btree::types::btree_node_iter::default();
             crate::btree::node_iter::bch2_btree_node_iter_init(c, b, &mut iter, &pos);
             let ptr = crate::btree::node_iter::bch2_btree_node_iter_peek(&mut iter, b);
-            assert!(!ptr.is_null(), "no child key covers pos at level {}", (*b).c.level);
+            assert!(
+                !ptr.is_null(),
+                "no child key covers pos at level {}",
+                (*b).c.level
+            );
             let key_u64s = crate::btree::bkey::bkeyp_key_u64s(&(*b).format, &*ptr);
-            let child = *ptr.cast::<u64>().add(key_u64s as usize)
-                as usize as *mut crate::btree::types::btree;
+            let child = *ptr.cast::<u64>().add(key_u64s as usize) as usize
+                as *mut crate::btree::types::btree;
             assert!(!child.is_null(), "interior key without child");
             b = child;
         }
@@ -5724,11 +5768,20 @@ mod tests {
                 );
                 let ptr = crate::btree::node_iter::bch2_btree_node_iter_peek(&mut iter, parent);
                 let key_u64s = crate::btree::bkey::bkeyp_key_u64s(&(*parent).format, &*ptr);
-                let child = *ptr.cast::<u64>().add(key_u64s as usize)
-                    as usize as *mut crate::btree::types::btree;
-                child == leaf && bpos_eq(crate::btree::node_iter::bkey_unpack_pos(parent, ptr), (*leaf).key.k.p)
+                let child = *ptr.cast::<u64>().add(key_u64s as usize) as usize
+                    as *mut crate::btree::types::btree;
+                child == leaf
+                    && bpos_eq(
+                        crate::btree::node_iter::bkey_unpack_pos(parent, ptr),
+                        (*leaf).key.k.p,
+                    )
             };
-            (seq, pivot_ok, (*(*leaf).data).min_key, (*(*leaf).data).max_key)
+            (
+                seq,
+                pivot_ok,
+                (*(*leaf).data).min_key,
+                (*(*leaf).data).max_key,
+            )
         };
         assert_eq!(
             after.0,
@@ -5808,9 +5861,14 @@ mod tests {
         let before_scan = engine.scan(BtreeId::DEFAULT).unwrap();
         let root_level = unsafe {
             let fs = &mut *engine.lock_fs().unwrap();
-            (*crate::btree::types::bch2_btree_id_root_b(&**fs, 0)).c.level
+            (*crate::btree::types::bch2_btree_id_root_b(&**fs, 0))
+                .c
+                .level
         };
-        assert!(root_level >= 1, "root must be internal, got level {root_level}");
+        assert!(
+            root_level >= 1,
+            "root must be internal, got level {root_level}"
+        );
         let pos = KeyPosition::new(1, 20, 0);
         engine
             .rewrite_node(BtreeId::DEFAULT, root_level + 1, pos)
@@ -5818,7 +5876,9 @@ mod tests {
         let (root_level_after, self_pointing) = unsafe {
             let fs = &mut *engine.lock_fs().unwrap();
             let root = crate::btree::types::bch2_btree_id_root_b(&**fs, 0);
-            let self_ptr = (*(core::ptr::addr_of!((*root).key.v).cast::<crate::btree::bset::bch_btree_ptr_v2>())).mem_ptr
+            let self_ptr = (*(core::ptr::addr_of!((*root).key.v)
+                .cast::<crate::btree::bset::bch_btree_ptr_v2>()))
+            .mem_ptr
                 == root as usize as u64;
             ((*root).c.level, self_ptr)
         };
@@ -5875,14 +5935,18 @@ mod tests {
         ));
         let seq_before = unsafe {
             let fs = &mut *engine.lock_fs().unwrap();
-            (*(*find_node_at_level(fs, 0, target_pos.raw())).data).keys.seq
+            (*(*find_node_at_level(fs, 0, target_pos.raw())).data)
+                .keys
+                .seq
         };
         engine
             .rewrite_node_key(BtreeId::DEFAULT, 0, &live_key)
             .unwrap();
         let seq_after = unsafe {
             let fs = &mut *engine.lock_fs().unwrap();
-            (*(*find_node_at_level(fs, 0, target_pos.raw())).data).keys.seq
+            (*(*find_node_at_level(fs, 0, target_pos.raw())).data)
+                .keys
+                .seq
         };
         assert_eq!(seq_before, seq_after - 1, "matched key must rewrite");
         engine.verify_all().unwrap();
@@ -5935,7 +5999,8 @@ mod tests {
             (*(*find_node_at_level(fs, 0, pos.raw())).data).keys.seq
         };
         assert_eq!(
-            seq_after, seq_before + 2,
+            seq_after,
+            seq_before + 2,
             "double rewrite must bump seq once per call"
         );
         assert_eq!(
@@ -5976,7 +6041,9 @@ mod tests {
                 txn.commit().unwrap();
             }
             engine.sync().unwrap();
-            engine.rewrite_node(BtreeId::DEFAULT, 1, KeyPosition::new(1, 20, 0)).unwrap();
+            engine
+                .rewrite_node(BtreeId::DEFAULT, 1, KeyPosition::new(1, 20, 0))
+                .unwrap();
         }
         let recovered = StorageEngine::open_persistent(&path).unwrap();
         recovered.verify_all().unwrap();
@@ -6043,8 +6110,7 @@ mod tests {
                     let level = 1 + ((state >> 8) % 2) as u8;
                     let result = engine.rewrite_node(BtreeId::DEFAULT, level, target);
                     assert!(
-                        result.is_ok()
-                            || matches!(result, Err(EngineError::Transaction(-5))),
+                        result.is_ok() || matches!(result, Err(EngineError::Transaction(-5))),
                         "rewrite must succeed or report no node, got {result:?}"
                     );
                 }

@@ -484,6 +484,11 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
         return -5;
     }
     let btree_ptr = bkey_i_to_btree_ptr_v2(&mut (*b).key);
+    crate::rewrite_log_debug!(
+        "btree node read: disk seq={} key v.seq={}",
+        node.keys.seq,
+        (*btree_ptr).v.seq
+    );
     if node.keys.seq != (*btree_ptr).v.seq {
         return -11;
     }
@@ -541,61 +546,129 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
                 core::mem::size_of::<btree_node_entry>(),
             )
         };
-        let key_u64s = (*set).u64s as usize;
-        let bytes = header_bytes + key_u64s * 8;
-        let sectors = bytes.next_multiple_of(block_bytes) / 512;
+        let mut key_u64s = (*set).u64s as usize;
+        let mut bytes = header_bytes + key_u64s * 8;
+        let mut sectors = bytes.next_multiple_of(block_bytes) / 512;
         if written + sectors > limit || written * 512 + bytes > node_bytes {
-            return -6;
+            // 对齐 read.c bset_past_end_of_btree_node（FSCK_CAN_FIX）：截断该 bset
+            crate::rewrite_log_error!("btree node read: bset past end, truncating");
+            (*set).u64s = 0;
+            key_u64s = 0;
+            bytes = header_bytes;
+            sectors = bytes.next_multiple_of(block_bytes) / 512;
         }
         let csum_type = BSET_CSUM_TYPE(&*set);
-        if csum_type >= BCH_CSUM_NR {
-            return -7;
+        let good_csum_type = csum_type < BCH_CSUM_NR;
+        if !good_csum_type {
+            // 对齐 read.c bset_unknown_csum（FSCK_CAN_FIX，域内无加密 csum）：跳过校验
+            crate::rewrite_log_error!("btree node read: unknown csum type {csum_type}");
         }
-        let header = if first {
-            node as *mut btree_node as *mut u8
-        } else {
-            buffer.as_mut_ptr().add(written * 512)
-        };
-        let checksum_data = core::slice::from_raw_parts(header.add(16), bytes - 16);
-        if bch2_checksum(csum_type, checksum_data) != expected_csum {
-            return -8;
+        if good_csum_type {
+            let header = if first {
+                node as *mut btree_node as *mut u8
+            } else {
+                buffer.as_mut_ptr().add(written * 512)
+            };
+            let checksum_data = core::slice::from_raw_parts(header.add(16), bytes - 16);
+            if bch2_checksum(csum_type, checksum_data) != expected_csum {
+                // 对齐 read.c bset_bad_csum（FSCK_CAN_FIX）：继续
+                crate::rewrite_log_error!("btree node read: bad csum");
+            }
         }
         if (*set).version != bcachefs_metadata_version_current {
             return -9;
         }
         (*b).version_ondisk = (*b).version_ondisk.min((*set).version);
-        if BSET_SEPARATE_WHITEOUTS(&*set) != 0
-            || BSET_BIG_ENDIAN(&*set) != 0
-            || BSET_OFFSET(&*set) != written as u32
-        {
+        if BSET_SEPARATE_WHITEOUTS(&*set) != 0 || BSET_BIG_ENDIAN(&*set) != 0 {
             return -10;
+        }
+        if BSET_OFFSET(&*set) != written as u32 {
+            // 对齐 read.c bset_wrong_sector_offset（FSCK_CAN_FIX）：继续
+            crate::rewrite_log_error!("btree node read: bset wrong sector offset");
         }
         max_journal_seq = max_journal_seq.max((*set).journal_seq);
 
         let mut key = set.cast::<u64>().add(3).cast::<super::bkey::bkey_packed>();
         let key_start = key;
-        let end = (key as *mut u64)
+        let mut end = (key as *mut u64)
             .add(key_u64s)
             .cast::<super::bkey::bkey_packed>();
         let mut prev: *mut super::bkey::bkey_packed = core::ptr::null_mut();
         while key < end {
-            if (*key).u64s == 0 || bkey_p_next(key) > end || !bkeyp_u64s_valid(&(*b).format, &*key)
-            {
-                return -15;
+            if bkey_p_next(key) > end {
+                // 对齐 read.c btree_node_bkey_past_bset_end（FSCK_CAN_FIX）：截断到当前键
+                (*set).u64s = (key as *mut u64).offset_from(set.cast::<u64>().add(3)) as u16;
+                end = key;
+                break;
             }
-            let pos = super::node_iter::bkey_unpack_pos(b, key);
-            if bpos_lt(pos, node.min_key) || bpos_gt(pos, node.max_key) {
-                return -16;
+            let mut drop_key = false;
+            if (*key).u64s == 0 || !bkeyp_u64s_valid(&(*b).format, &*key) {
+                // 对齐 read.c btree_node_bkey_bad_u64s（FSCK_CAN_FIX）：drop_this_key
+                drop_key = true;
+            } else {
+                let pos = super::node_iter::bkey_unpack_pos(b, key);
+                if bpos_lt(pos, node.min_key) || bpos_gt(pos, node.max_key) {
+                    // 对齐 read.c bch2_bkey_in_btree_node → fsck_delete_bkey：drop_this_key
+                    drop_key = true;
+                } else if !prev.is_null()
+                    && bpos_cmp(super::node_iter::bkey_unpack_pos(b, prev), pos) >= 0
+                {
+                    // 对齐 read.c btree_node_bkey_out_of_order（FSCK_CAN_FIX）：drop_this_key
+                    drop_key = true;
+                } else if (*key).type_ == KEY_TYPE_btree_ptr_v2 {
+                    let key_words = bkeyp_key_u64s(&(*b).format, &*key) as usize;
+                    let value_words = (*key).u64s as usize - key_words;
+                    if value_words < core::mem::size_of::<super::bset::bch_btree_ptr_v2>() / 8 {
+                        // 对齐 read.c btree_node_bkey_val_validate → fsck_delete_bkey：drop_this_key
+                        drop_key = true;
+                    }
+                }
             }
-            if !prev.is_null() && bpos_cmp(super::node_iter::bkey_unpack_pos(b, prev), pos) >= 0 {
-                return -17;
+            if drop_key {
+                // 对齐 read.c drop_this_key：删当前键，扫描后续好键，无好键则截断剩余
+                crate::rewrite_log_debug!("btree node read: dropping bad key");
+                let mut next_good_key = (*key).u64s as usize;
+                if !read_bkey_packed_valid(b, (key as *mut u64).add(next_good_key).cast(), end) {
+                    // 扫描找下一个好键
+                    let total = (end as *mut u64).offset_from(key as *mut u64) as usize;
+                    let mut found = 0usize;
+                    for cand in 1..total {
+                        if read_bkey_packed_valid(b, (key as *mut u64).add(cand).cast(), end) {
+                            found = cand;
+                            break;
+                        }
+                    }
+                    if found != 0 {
+                        next_good_key = found;
+                    } else {
+                        // 没找到好键，截断剩余
+                        next_good_key = total;
+                    }
+                }
+                crate::rewrite_log_debug!(
+                    "drop: set u64s before={} next_good_key={} total={}",
+                    (*set).u64s,
+                    next_good_key,
+                    (end as *mut u64).offset_from(key as *mut u64)
+                );
+                (*set).u64s -= next_good_key as u16;
+                let remaining =
+                    (end as *mut u64).offset_from(key as *mut u64) as usize - next_good_key;
+                core::ptr::copy(
+                    (key as *mut u64).add(next_good_key),
+                    key as *mut u64,
+                    remaining,
+                );
+                end = (key as *mut u64).add(remaining).cast();
+                super::types::set_btree_node_need_rewrite(b);
+                super::types::set_btree_node_need_rewrite_error(b);
+                if key >= end {
+                    break;
+                }
+                continue;
             }
             if (*key).type_ == KEY_TYPE_btree_ptr_v2 {
                 let key_words = bkeyp_key_u64s(&(*b).format, &*key) as usize;
-                let value_words = (*key).u64s as usize - key_words;
-                if value_words < core::mem::size_of::<super::bset::bch_btree_ptr_v2>() / 8 {
-                    return -18;
-                }
                 *((key as *mut u64).add(key_words)) = 0;
             }
             prev = key;
@@ -608,7 +681,10 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
         written += sectors;
     }
     if ptr_written != 0 && written != ptr_written {
-        return -19;
+        // 对齐 read.c btree_node_data_missing（FSCK_CAN_FIX）：报告后继续
+        crate::rewrite_log_error!(
+            "btree node read: data missing: expected {ptr_written} sectors, found {written}"
+        );
     }
     if ptr_written == 0 {
         let mut trailing = written;
@@ -618,7 +694,8 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
                 .add(trailing * 512)
                 .cast::<btree_node_entry>();
             if (*entry).keys.seq == node.keys.seq {
-                return -20;
+                // 对齐 read.c btree_node_bset_after_end（FSCK_CAN_FIX）：报告后继续
+                crate::rewrite_log_error!("btree node read: bset signature after last bset");
             }
             trailing += block_bytes / 512;
         }
@@ -660,12 +737,38 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
         super::types::bset(b, (*b).set.as_mut_ptr()),
         1,
     );
+    if ptr_written == 0 {
+        // 对齐 read.c bch2_btree_node_read_done（read.c:871-872）：
+        // !ptr_written → need_rewrite + need_rewrite_ptr_written_zero
+        super::types::set_btree_node_need_rewrite(b);
+        super::types::set_btree_node_need_rewrite_ptr_written_zero(b);
+    }
     crate::rewrite_log_debug!(
         "btree node read complete level={} sets={} written={written}",
         (*b).c.level,
         (*b).nsets
     );
     0
+}
+
+/// 对齐 read.c bkey_packed_valid：检查一个 packed key 是否结构有效
+unsafe fn read_bkey_packed_valid(
+    b: *mut btree,
+    k: *mut super::bkey::bkey_packed,
+    end: *mut super::bkey::bkey_packed,
+) -> bool {
+    if k.is_null() || k >= end || bkey_p_next(k) > end {
+        return false;
+    }
+    if (*k).format > super::bkey::KEY_FORMAT_CURRENT {
+        return false;
+    }
+    if !bkeyp_u64s_valid(&(*b).format, &*k) {
+        return false;
+    }
+    let pos = super::node_iter::bkey_unpack_pos(b, k);
+    let node = &*(*b).data;
+    !bpos_lt(pos, node.min_key) && !bpos_gt(pos, node.max_key)
 }
 
 pub unsafe fn bch2_btree_node_drop_keys_outside_node(b: *mut btree) {
@@ -851,6 +954,15 @@ pub(crate) unsafe fn bch2_btree_node_get_noiter_unlocked(
             );
         }
         return core::ptr::null_mut();
+    }
+    /* read.c:968 读完成触发：读成功且节点标记 need_rewrite →
+     * ASYNC_BTREE_rewrite。上游经 async work（interior.c:3406）
+     * 执行（不持锁）；域内同步执行会与外层路径锁互斥死锁（实测，
+     * AC-3），故此处仅入队 btree.node_rewrites（对齐上游 a->key
+     * bkey_buf 拷贝语义），由无锁时机（root_read 末尾 / engine
+     * 操作边界）bch2_do_pending_node_rewrites 执行 */
+    if super::types::btree_node_need_rewrite(node) {
+        super::interior::bch2_btree_node_need_rewrite_add(c, node);
     }
     super::types::set_btree_node_accessed(node);
     node
@@ -1062,6 +1174,14 @@ pub unsafe fn bch2_btree_root_read(
     super::interior::bch2_btree_set_root_for_read(c, node);
     six_unlock_write(&(*node).c.lock);
     six_unlock_intent(&(*node).c.lock);
+    /* read.c:968 读完成触发（root 场景）：入队后立即 drain——root_read
+     * 上下文无外层路径锁（节点读写锁已释放），可安全执行重写；队列中
+     * 若有 get 路径残留项亦一并处理（对齐 interior.c:3462 上游 drain
+     * 语义） */
+    if super::types::btree_node_need_rewrite(node) {
+        super::interior::bch2_btree_node_need_rewrite_add(c, node);
+    }
+    super::interior::bch2_do_pending_node_rewrites(c);
     0
 }
 
@@ -1324,10 +1444,16 @@ mod tests {
             assert_eq!((*(words.as_ptr().add(25).cast::<bkey>())).p, SPOS(4, 2, 0));
 
             let mut byte = [0u8; 1];
+            // 破坏第二个键的 u64s 字段（5 ^ 1 = 4 < key_u64s）：触发 drop_this_key
             assert_eq!(file.read_at(&mut byte, 64 * 512 + 200).unwrap(), 1);
             byte[0] ^= 1;
             assert_eq!(file.write_at(&byte, 64 * 512 + 200).unwrap(), 1);
-            assert_eq!(bch2_btree_node_read(&mut handle, &mut node), -8);
+            assert_eq!(bch2_btree_node_read(&mut handle, &mut node), 0);
+            assert!(crate::btree::types::btree_node_need_rewrite(&node));
+            assert!(crate::btree::types::btree_node_need_rewrite_error(&node));
+            assert_eq!((*node.data).keys.u64s, 5);
+            assert_eq!(node.nr.unpacked_keys, 1);
+            assert_eq!((*(words.as_ptr().add(20).cast::<bkey>())).p, SPOS(4, 1, 0));
 
             bch2_free_super(&mut handle);
             drop(file);
@@ -1630,13 +1756,556 @@ mod tests {
             assert_eq!(seen, [(2, 3), (3, 6)]);
 
             let mut byte = [0u8; 1];
-            let corrupt_offset = (32 + 1) * 512 + 100;
+            // 破坏第二 bset 第二个键的 u64s 字段（5 ^ 1 = 4 < key_u64s）：触发 drop_this_key
+            let corrupt_offset = 33 * 512 + 80;
             assert_eq!(file.read_at(&mut byte, corrupt_offset).unwrap(), 1);
             byte[0] ^= 1;
             assert_eq!(file.write_at(&byte, corrupt_offset).unwrap(), 1);
-            assert_eq!(bch2_btree_node_read(&mut handle, &mut recovered), -8);
+            assert_eq!(bch2_btree_node_read(&mut handle, &mut recovered), 0);
+            assert!(crate::btree::types::btree_node_need_rewrite(&recovered));
+            assert!(crate::btree::types::btree_node_need_rewrite_error(
+                &recovered
+            ));
+            // whiteout 键使第二 bset 布局前移：破坏位置命中 (12,2,0)type3 键；
+            // drop 后第一 bset 的 (12,2,0)type6 保留，与 (3,6) 合并
+            assert_eq!((*recovered.data).keys.u64s, 10);
+            assert_eq!(recovered.nr.unpacked_keys, 2);
+            let mut iter = btree_node_iter::default();
+            bch2_btree_node_iter_init_from_start(&mut iter, &mut recovered);
+            let mut seen = Vec::new();
+            loop {
+                let key = bch2_btree_node_iter_peek(&mut iter, &mut recovered);
+                if key.is_null() {
+                    break;
+                }
+                seen.push((bkey_unpack_pos(&recovered, key).offset, (*key).type_));
+                bch2_btree_node_iter_advance(&mut iter, &mut recovered);
+            }
+            assert_eq!(seen, [(2, 6), (3, 6)]);
 
             bch2_free_super(&mut handle);
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn root_read_need_rewrite_triggers_sync_rewrite() {
+        use crate::btree::node_iter::{
+            bch2_btree_node_iter_init_from_start, bch2_btree_node_iter_peek,
+            bch2_btree_node_iter_peek_all, bkey_unpack_pos,
+        };
+        use crate::btree::types::{bch_fs, btree_node_iter};
+        use std::os::unix::fs::FileExt;
+
+        unsafe {
+            /* AC-3（read.c:968 语义）：读完成触发重写。构造单节点树
+             * （root 即叶，level 0，2 键 seq=101 @ 偏移 64），破坏第 2
+             * 键 u64s（5→4，AC-2 同款模式）→ bch2_btree_root_read 读
+             * 成功（截断修复 + need_rewrite）→ 读完成点同步触发
+             * bch2_btree_node_rewrite_key → root 分支 set_root_for_read
+             * 替换 root slot（新节点 seq=102）。 */
+            let path =
+                std::env::temp_dir().join(format!("subvol-root-rewrite-{}", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(128 * 512).unwrap();
+
+            let mut write_handle = bch_sb_handle::default();
+            write_handle.s_bdev_file = Box::into_raw(Box::new(file.try_clone().unwrap())).cast();
+            assert_eq!(bch2_sb_realloc(&mut write_handle, 0), 0);
+            (*write_handle.sb).uuid = [0x71; 16];
+            (*write_handle.sb).dev_idx = 0;
+            (*write_handle.sb).flags[0] = 1 << 12;
+
+            let mut root_words = vec![0u64; 64];
+            let mut root = Box::new(btree::default());
+            root.data = root_words.as_mut_ptr().cast();
+            root.byte_order = 9;
+            root.c.btree_id = 0;
+            root.c.level = 0;
+            root.format = BKEY_FORMAT_CURRENT;
+            root.nr_key_bits = bkey_format_key_bits(&root.format) as u8;
+            root.nsets = 1;
+            (*root.data).min_key = POS_MIN;
+            (*root.data).max_key = SPOS_MAX;
+            (*root.data).keys.seq = 101;
+            (*root.data).keys.u64s = 10;
+            for (index, offset) in [1, 2].into_iter().enumerate() {
+                *root_words.as_mut_ptr().add(20 + index * 5).cast::<bkey>() = bkey {
+                    u64s: BKEY_U64S,
+                    format: KEY_FORMAT_CURRENT,
+                    type_: 6,
+                    p: SPOS(9, offset, 0),
+                    ..Default::default()
+                };
+            }
+            root.set[0] = bset_tree {
+                size: 0,
+                extra: BSET_NO_AUX_TREE_VAL,
+                data_offset: 17,
+                aux_data_offset: u16::MAX,
+                end_offset: 30,
+            };
+            root.key.k = bkey {
+                u64s: 10,
+                format: KEY_FORMAT_CURRENT,
+                type_: KEY_TYPE_btree_ptr_v2,
+                p: (*root.data).max_key,
+                ..Default::default()
+            };
+            let root_ptr = bkey_i_to_btree_ptr_v2(&mut root.key);
+            (*root_ptr).v.mem_ptr = (&mut *root as *mut btree) as usize as u64;
+            (*root_ptr).v.seq = 101;
+            (*root_ptr).v.min_key = (*root.data).min_key;
+            let mut root_extent = bch_extent_ptr::default();
+            SET_BCH_EXTENT_PTR_OFFSET(&mut root_extent, 64);
+            SET_BCH_EXTENT_PTR_DEV(&mut root_extent, 0);
+            bch2_bkey_append_ptr(core::ptr::null(), &mut root.key, root_extent);
+            assert_eq!(__bch2_btree_node_write(&mut write_handle, &mut *root), 0);
+
+            let mut root_key_words = [0u64; 20];
+            core::ptr::copy_nonoverlapping(
+                (&root.key as *const crate::btree::bkey::bkey_i).cast::<u64>(),
+                root_key_words.as_mut_ptr(),
+                root.key.k.u64s as usize,
+            );
+            let root_key = root_key_words
+                .as_mut_ptr()
+                .cast::<crate::btree::bkey::bkey_i>();
+            (*bkey_i_to_btree_ptr_v2(root_key)).v.mem_ptr = 0;
+
+            let corrupt_offset = 64 * 512 + 200;
+            let mut byte = [0u8; 1];
+            assert_eq!(file.read_at(&mut byte, corrupt_offset).unwrap(), 1);
+            byte[0] ^= 1;
+            assert_eq!(file.write_at(&byte, corrupt_offset).unwrap(), 1);
+
+            let mut recovered = bch_fs::default();
+            recovered.disk_sb.s_bdev_file =
+                Box::into_raw(Box::new(file.try_clone().unwrap())).cast();
+            assert_eq!(bch2_sb_realloc(&mut recovered.disk_sb, 0), 0);
+            (*recovered.disk_sb.sb).uuid = [0x71; 16];
+            (*recovered.disk_sb.sb).dev_idx = 0;
+            (*recovered.disk_sb.sb).flags[0] = 1 << 12;
+            assert_eq!(bch2_btree_root_read(&mut recovered, 0, root_key, 0), 0);
+
+            /* 重写触发证据：root slot 已由 rewrite 的 root 分支替换为
+             * 新节点（seq=101+1=102，interior.rs root 分支）。重写会
+             * 重新打包键（bch2_btree_sort_into + transform），故新节点
+             * 为 1 个 packed 键（u64s=1），unpacked 计数为 0。 */
+            let recovered_root = crate::btree::types::bch2_btree_id_root_b(&recovered, 0);
+            assert!(!recovered_root.is_null());
+            let slot_ptr = bkey_i_to_btree_ptr_v2(
+                &mut (*crate::btree::types::bch2_btree_id_root(&mut recovered, 0)).key,
+            );
+            assert_eq!((*slot_ptr).v.seq, 102);
+            assert_eq!((*(*recovered_root).data).keys.u64s, 1);
+            assert_eq!((*recovered_root).nr.packed_keys, 1);
+            assert_eq!((*recovered_root).nr.unpacked_keys, 0);
+            /* 新节点键集 = 修复后内容（坏键截断，仅剩键 1 @ SPOS(9,1,0)） */
+            let mut iter = btree_node_iter::default();
+            bch2_btree_node_iter_init_from_start(&mut iter, recovered_root);
+            let key = bch2_btree_node_iter_peek(&mut iter, recovered_root);
+            assert!(!key.is_null());
+            assert_eq!(bkey_unpack_pos(recovered_root, key), SPOS(9, 1, 0));
+            crate::btree::node_iter::bch2_btree_node_iter_advance(&mut iter, recovered_root);
+            let next = bch2_btree_node_iter_peek(&mut iter, recovered_root);
+            assert!(next.is_null());
+
+            bch2_free_super(&mut write_handle);
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn rewritten_node_revalidates_on_reopen() {
+        use crate::btree::iter::{bch2_trans_init, btree_trans};
+        use crate::btree::node_iter::{
+            bch2_btree_node_iter_advance, bch2_btree_node_iter_init_from_start,
+            bch2_btree_node_iter_peek, bkey_unpack_pos,
+        };
+        use crate::btree::types::{bch_fs, btree_node_iter};
+        use std::os::unix::fs::FileExt;
+
+        unsafe {
+            /* AC-5（read.c:1233 scrub_work 语义）：重写后重新校验必须
+             * 通过。构造 root 即叶（2 键 seq=101 @ 64）→ 损坏键 2
+             * u64s → root_read 触发重写（root 分支 set_root_for_read
+             * 更新 slot，新节点 seq=102，key 继承旧 extent @ 64，
+             * interior.rs child_ptr）→ 模拟提交 flush 写盘（对齐
+             * __btree_node_flush，commit.c:254）→ 模拟关闭后重开：
+             * 从写盘后的节点 key 序列化 root 记录（io.c
+             * bch2_write_super 语义，mem_ptr 清零 = 持久化记录）→
+             * 第二次 root_read 重新读盘校验（magic/seq/level/范围
+             * 逐项，io.rs:478-503）→ 断言：读解析通过、无
+             * need_rewrite（磁盘字节干净）、seq=102 持久化、键集
+             * = 修复后内容、拓扑校验通过。 */
+            let path =
+                std::env::temp_dir().join(format!("subvol-rewrite-reopen-{}", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(128 * 512).unwrap();
+
+            let mut write_handle = bch_sb_handle::default();
+            write_handle.s_bdev_file = Box::into_raw(Box::new(file.try_clone().unwrap())).cast();
+            assert_eq!(bch2_sb_realloc(&mut write_handle, 0), 0);
+            (*write_handle.sb).uuid = [0x71; 16];
+            (*write_handle.sb).dev_idx = 0;
+            (*write_handle.sb).flags[0] = 1 << 12;
+
+            let mut root_words = vec![0u64; 64];
+            let mut root = Box::new(btree::default());
+            root.data = root_words.as_mut_ptr().cast();
+            root.byte_order = 9;
+            root.c.btree_id = 0;
+            root.c.level = 0;
+            root.format = BKEY_FORMAT_CURRENT;
+            root.nr_key_bits = bkey_format_key_bits(&root.format) as u8;
+            root.nsets = 1;
+            (*root.data).min_key = POS_MIN;
+            (*root.data).max_key = SPOS_MAX;
+            (*root.data).keys.seq = 101;
+            (*root.data).keys.u64s = 10;
+            for (index, offset) in [1, 2].into_iter().enumerate() {
+                *root_words.as_mut_ptr().add(20 + index * 5).cast::<bkey>() = bkey {
+                    u64s: BKEY_U64S,
+                    format: KEY_FORMAT_CURRENT,
+                    type_: 6,
+                    p: SPOS(9, offset, 0),
+                    ..Default::default()
+                };
+            }
+            root.set[0] = bset_tree {
+                size: 0,
+                extra: BSET_NO_AUX_TREE_VAL,
+                data_offset: 17,
+                aux_data_offset: u16::MAX,
+                end_offset: 30,
+            };
+            root.key.k = bkey {
+                u64s: 10,
+                format: KEY_FORMAT_CURRENT,
+                type_: KEY_TYPE_btree_ptr_v2,
+                p: (*root.data).max_key,
+                ..Default::default()
+            };
+            let root_ptr = bkey_i_to_btree_ptr_v2(&mut root.key);
+            (*root_ptr).v.mem_ptr = (&mut *root as *mut btree) as usize as u64;
+            (*root_ptr).v.seq = 101;
+            (*root_ptr).v.min_key = (*root.data).min_key;
+            let mut root_extent = bch_extent_ptr::default();
+            SET_BCH_EXTENT_PTR_OFFSET(&mut root_extent, 64);
+            SET_BCH_EXTENT_PTR_DEV(&mut root_extent, 0);
+            bch2_bkey_append_ptr(core::ptr::null(), &mut root.key, root_extent);
+            assert_eq!(__bch2_btree_node_write(&mut write_handle, &mut *root), 0);
+
+            let mut root_key_words = [0u64; 20];
+            core::ptr::copy_nonoverlapping(
+                (&root.key as *const crate::btree::bkey::bkey_i).cast::<u64>(),
+                root_key_words.as_mut_ptr(),
+                root.key.k.u64s as usize,
+            );
+            let root_key = root_key_words
+                .as_mut_ptr()
+                .cast::<crate::btree::bkey::bkey_i>();
+            (*bkey_i_to_btree_ptr_v2(root_key)).v.mem_ptr = 0;
+
+            let corrupt_offset = 64 * 512 + 200;
+            let mut byte = [0u8; 1];
+            assert_eq!(file.read_at(&mut byte, corrupt_offset).unwrap(), 1);
+            byte[0] ^= 1;
+            assert_eq!(file.write_at(&byte, corrupt_offset).unwrap(), 1);
+
+            /* 第一次恢复：root_read 触发重写（root 分支覆盖写盘） */
+            let mut recovered1 = bch_fs::default();
+            recovered1.disk_sb.s_bdev_file =
+                Box::into_raw(Box::new(file.try_clone().unwrap())).cast();
+            assert_eq!(bch2_sb_realloc(&mut recovered1.disk_sb, 0), 0);
+            (*recovered1.disk_sb.sb).uuid = [0x71; 16];
+            (*recovered1.disk_sb.sb).dev_idx = 0;
+            (*recovered1.disk_sb.sb).flags[0] = 1 << 12;
+            assert_eq!(bch2_btree_root_read(&mut recovered1, 0, root_key, 0), 0);
+            let slot1 = crate::btree::types::bch2_btree_id_root(&mut recovered1, 0);
+            let root1 = (*slot1).b;
+            assert_eq!((*(*root1).data).keys.seq, 102);
+            assert!(!crate::btree::types::btree_node_need_rewrite(root1));
+            crate::rewrite_log_debug!(
+                "AC-5 slot1 key u64s={} type={}",
+                (*slot1).key.k.u64s,
+                (*slot1).key.k.type_
+            );
+            let s1p = crate::btree::bset::bch2_bkey_ptrs_c(crate::btree::bkey::bkey_s_c {
+                k: &(*slot1).key.k,
+                v: &(*slot1).key.v,
+            });
+            crate::rewrite_log_debug!(
+                "AC-5 slot1 ptrs start={} end={}",
+                s1p.start as usize,
+                s1p.end as usize
+            );
+
+            /* AC-5：重写仅 set_dirty（journal-first，节点落盘由事务
+             * 提交/日志 flush 驱动）。对齐 __btree_node_flush
+             * （fs/btree/commit.c:254 → bch2_btree_node_write_trans）
+             * 语义，此处模拟重写提交后的持久化写盘，使磁盘字节 =
+             * 修复后内容，随后重开才能读回验证。 */
+            assert!(crate::btree::types::btree_node_dirty(root1));
+            let mut write_trans = btree_trans::default();
+            bch2_trans_init(&mut write_trans, &mut recovered1);
+            crate::btree::io::bch2_btree_node_write_trans(
+                &mut write_trans,
+                root1,
+                crate::lock::six::six_lock_type::SIX_LOCK_write,
+                BTREE_WRITE_initial,
+            );
+            assert!(!crate::btree::types::btree_node_dirty(root1));
+
+            /* 模拟关闭后重开：对齐上游关闭时从内存节点 key 序列化
+             * root 记录（io.c bch2_write_super → bch2_btree_roots），
+             * 写盘后 root1.key 含最新 seq=102 与 sectors_written
+             * （io.rs:431），mem_ptr 清零（跨进程无效）后重放。
+             * 不能取 slot.key：其为重写时快照（sectors_written=0），
+             * 重开时 ptr_written==0 会触发二次重写（seq 103）。 */
+            let mut new_root_key_words = [0u64; 20];
+            core::ptr::copy_nonoverlapping(
+                (&(*root1).key as *const crate::btree::bkey::bkey_i).cast::<u64>(),
+                new_root_key_words.as_mut_ptr(),
+                (*root1).key.k.u64s as usize,
+            );
+            let new_root_key = new_root_key_words
+                .as_mut_ptr()
+                .cast::<crate::btree::bkey::bkey_i>();
+            (*bkey_i_to_btree_ptr_v2(new_root_key)).v.mem_ptr = 0;
+
+            let mut recovered2 = bch_fs::default();
+            recovered2.disk_sb.s_bdev_file =
+                Box::into_raw(Box::new(file.try_clone().unwrap())).cast();
+            assert_eq!(bch2_sb_realloc(&mut recovered2.disk_sb, 0), 0);
+            (*recovered2.disk_sb.sb).uuid = [0x71; 16];
+            (*recovered2.disk_sb.sb).dev_idx = 0;
+            (*recovered2.disk_sb.sb).flags[0] = 1 << 12;
+            assert_eq!(bch2_btree_root_read(&mut recovered2, 0, new_root_key, 0), 0);
+
+            /* AC-5：重写后重新读盘校验通过——magic/seq(102)/范围/
+             * 格式逐项匹配（io.rs:478-503），无 need_rewrite（磁盘
+             * 字节干净），键集 = 修复后内容（键 1 @ SPOS(9,1,0)） */
+            let root2 = crate::btree::types::bch2_btree_id_root_b(&recovered2, 0);
+            assert!(!root2.is_null());
+            assert!(!crate::btree::types::btree_node_need_rewrite(root2));
+            assert_eq!((*(*root2).data).keys.seq, 102);
+            assert_eq!((*(*root2).data).keys.u64s, 1);
+            let mut iter = btree_node_iter::default();
+            bch2_btree_node_iter_init_from_start(&mut iter, root2);
+            let key = bch2_btree_node_iter_peek(&mut iter, root2);
+            assert!(!key.is_null());
+            assert_eq!(bkey_unpack_pos(root2, key), SPOS(9, 1, 0));
+            bch2_btree_node_iter_advance(&mut iter, root2);
+            assert!(bch2_btree_node_iter_peek(&mut iter, root2).is_null());
+
+            /* AC-5：重写后拓扑校验通过（bch2_btree_node_check_topology） */
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut recovered2);
+            assert_eq!(
+                crate::btree::interior::bch2_btree_node_check_topology(&mut trans, root2),
+                0
+            );
+
+            bch2_free_super(&mut write_handle);
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn child_read_need_rewrite_triggers_sync_rewrite_via_iter() {
+        use crate::btree::iter::{
+            bch2_btree_iter_peek, bch2_trans_init, bch2_trans_iter_exit, bch2_trans_iter_init,
+            bch2_trans_put, btree_iter, btree_trans,
+        };
+        use crate::btree::types::bch_fs;
+        use std::os::unix::fs::FileExt;
+
+        unsafe {
+            /* AC-3（read.c:968 语义）：get 路径读完成触发重写。布局
+             * 同 root_read 测试：leaf（level 0，2 键 seq=101 @ 64）+
+             * root（level 1，含 leaf 指针键 @ 72）。损坏 leaf 第 2 键
+             * u64s → 经 bch2_btree_iter_peek 遍历触发 leaf 读取（修复 +
+             * need_rewrite）→ 读完成点入队 → 无锁时机 drain 执行
+             * rewrite_key → parent 分支更新 root 中 child 指针
+             * （seq 101→102）。实测：读路径内同步执行会与外层路径
+             * 锁互斥死锁，故入队延迟（对齐上游 async work 解耦）。 */
+            let path =
+                std::env::temp_dir().join(format!("subvol-child-rewrite-{}", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(128 * 512).unwrap();
+
+            let mut write_handle = bch_sb_handle::default();
+            write_handle.s_bdev_file = Box::into_raw(Box::new(file.try_clone().unwrap())).cast();
+            assert_eq!(bch2_sb_realloc(&mut write_handle, 0), 0);
+            (*write_handle.sb).uuid = [0x71; 16];
+            (*write_handle.sb).dev_idx = 0;
+            (*write_handle.sb).flags[0] = 1 << 12;
+
+            let mut leaf_words = vec![0u64; 64];
+            let mut leaf = Box::new(btree::default());
+            leaf.data = leaf_words.as_mut_ptr().cast();
+            leaf.byte_order = 9;
+            leaf.c.btree_id = 0;
+            leaf.c.level = 0;
+            leaf.format = BKEY_FORMAT_CURRENT;
+            leaf.nr_key_bits = bkey_format_key_bits(&leaf.format) as u8;
+            leaf.nsets = 1;
+            (*leaf.data).min_key = POS_MIN;
+            (*leaf.data).max_key = SPOS_MAX;
+            (*leaf.data).keys.seq = 101;
+            (*leaf.data).keys.u64s = 10;
+            for (index, offset) in [1, 2].into_iter().enumerate() {
+                *leaf_words.as_mut_ptr().add(20 + index * 5).cast::<bkey>() = bkey {
+                    u64s: BKEY_U64S,
+                    format: KEY_FORMAT_CURRENT,
+                    type_: 6,
+                    p: SPOS(9, offset, 0),
+                    ..Default::default()
+                };
+            }
+            leaf.set[0] = bset_tree {
+                size: 0,
+                extra: BSET_NO_AUX_TREE_VAL,
+                data_offset: 17,
+                aux_data_offset: u16::MAX,
+                end_offset: 30,
+            };
+            leaf.key.k = bkey {
+                u64s: 10,
+                format: KEY_FORMAT_CURRENT,
+                type_: KEY_TYPE_btree_ptr_v2,
+                p: (*leaf.data).max_key,
+                ..Default::default()
+            };
+            let leaf_ptr = bkey_i_to_btree_ptr_v2(&mut leaf.key);
+            (*leaf_ptr).v.mem_ptr = (&mut *leaf as *mut btree) as usize as u64;
+            (*leaf_ptr).v.seq = 101;
+            (*leaf_ptr).v.min_key = (*leaf.data).min_key;
+            let mut leaf_extent = bch_extent_ptr::default();
+            SET_BCH_EXTENT_PTR_OFFSET(&mut leaf_extent, 64);
+            SET_BCH_EXTENT_PTR_DEV(&mut leaf_extent, 0);
+            bch2_bkey_append_ptr(core::ptr::null(), &mut leaf.key, leaf_extent);
+            assert_eq!(__bch2_btree_node_write(&mut write_handle, &mut *leaf), 0);
+
+            let mut root_words = vec![0u64; 64];
+            let mut root = Box::new(btree::default());
+            root.data = root_words.as_mut_ptr().cast();
+            root.byte_order = 9;
+            root.c.btree_id = 0;
+            root.c.level = 1;
+            root.format = BKEY_FORMAT_CURRENT;
+            root.nr_key_bits = bkey_format_key_bits(&root.format) as u8;
+            root.nsets = 1;
+            (*root.data).min_key = POS_MIN;
+            (*root.data).max_key = SPOS_MAX;
+            (*root.data).keys.seq = 202;
+            (*root.data).keys.u64s = leaf.key.k.u64s as u16;
+            core::ptr::copy_nonoverlapping(
+                (&leaf.key as *const crate::btree::bkey::bkey_i).cast::<u64>(),
+                root_words.as_mut_ptr().add(20),
+                leaf.key.k.u64s as usize,
+            );
+            root.set[0] = bset_tree {
+                size: 0,
+                extra: BSET_NO_AUX_TREE_VAL,
+                data_offset: 17,
+                aux_data_offset: u16::MAX,
+                end_offset: 20 + leaf.key.k.u64s as u16,
+            };
+            root.key.k = bkey {
+                u64s: 10,
+                format: KEY_FORMAT_CURRENT,
+                type_: KEY_TYPE_btree_ptr_v2,
+                p: (*root.data).max_key,
+                ..Default::default()
+            };
+            let root_ptr = bkey_i_to_btree_ptr_v2(&mut root.key);
+            (*root_ptr).v.mem_ptr = (&mut *root as *mut btree) as usize as u64;
+            (*root_ptr).v.seq = 202;
+            (*root_ptr).v.min_key = (*root.data).min_key;
+            let mut root_extent = bch_extent_ptr::default();
+            SET_BCH_EXTENT_PTR_OFFSET(&mut root_extent, 72);
+            SET_BCH_EXTENT_PTR_DEV(&mut root_extent, 0);
+            bch2_bkey_append_ptr(core::ptr::null(), &mut root.key, root_extent);
+            assert_eq!(__bch2_btree_node_write(&mut write_handle, &mut *root), 0);
+
+            let mut root_key_words = [0u64; 20];
+            core::ptr::copy_nonoverlapping(
+                (&root.key as *const crate::btree::bkey::bkey_i).cast::<u64>(),
+                root_key_words.as_mut_ptr(),
+                root.key.k.u64s as usize,
+            );
+            let root_key = root_key_words
+                .as_mut_ptr()
+                .cast::<crate::btree::bkey::bkey_i>();
+            (*bkey_i_to_btree_ptr_v2(root_key)).v.mem_ptr = 0;
+
+            let corrupt_offset = 64 * 512 + 200;
+            let mut byte = [0u8; 1];
+            assert_eq!(file.read_at(&mut byte, corrupt_offset).unwrap(), 1);
+            byte[0] ^= 1;
+            assert_eq!(file.write_at(&byte, corrupt_offset).unwrap(), 1);
+
+            let mut recovered = bch_fs::default();
+            recovered.disk_sb.s_bdev_file =
+                Box::into_raw(Box::new(file.try_clone().unwrap())).cast();
+            assert_eq!(bch2_sb_realloc(&mut recovered.disk_sb, 0), 0);
+            (*recovered.disk_sb.sb).uuid = [0x71; 16];
+            (*recovered.disk_sb.sb).dev_idx = 0;
+            (*recovered.disk_sb.sb).flags[0] = 1 << 12;
+            assert_eq!(bch2_btree_root_read(&mut recovered, 0, root_key, 1), 0);
+
+            /* 经 iter 遍历触发 leaf 读取（get 路径）→ 读完成点触发重写 */
+            let mut trans = btree_trans::default();
+            bch2_trans_init(&mut trans, &mut recovered);
+            let mut iter = btree_iter::default();
+            bch2_trans_iter_init(&mut trans, &mut iter, 0, SPOS(9, 1, 0), 0);
+            let found = bch2_btree_iter_peek(&mut iter);
+            assert_eq!(crate::btree::bkey::bkey_err(found), 0);
+            assert!(!found.k.is_null());
+            assert_eq!((*found.k).p, SPOS(9, 1, 0));
+            bch2_trans_iter_exit(&mut iter);
+            bch2_trans_put(&mut trans);
+
+            /* 读完成点已入队（无锁上下文执行会与外层路径锁死锁，
+             * 上游以 async work 解耦，域内延迟到操作边界）；
+             * 无 engine 时手动 drain（等价 engine 操作返回前的
+             * EngineFsGuard::drop 时机） */
+            crate::btree::interior::bch2_do_pending_node_rewrites(&mut recovered);
+
+            /* 重写证据：root（内存）中 child 指针键 seq 101→102（parent
+             * 分支 bch2_btree_insert_node 替换旧键） */
+            let recovered_root = crate::btree::types::bch2_btree_id_root_b(&recovered, 0);
+            assert!(!recovered_root.is_null());
+            let child_on_disk = ((*recovered_root).data as *mut u64)
+                .add(20)
+                .cast::<crate::btree::bset::bkey_i_btree_ptr_v2>();
+            assert_eq!((*child_on_disk).v.seq, 102);
+
+            bch2_free_super(&mut write_handle);
             drop(file);
             std::fs::remove_file(path).unwrap();
         }

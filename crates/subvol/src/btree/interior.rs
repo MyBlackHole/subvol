@@ -969,7 +969,8 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             let mut l = (*path).level as usize + 1;
             let mut merge_ret = 0;
             while super::iter::btree_node_intent_locked(path, l) && merge_ret == 0 {
-                merge_ret = bch2_foreground_maybe_merge(trans, path_idx, l, 0, core::ptr::null_mut());
+                merge_ret =
+                    bch2_foreground_maybe_merge(trans, path_idx, l, 0, core::ptr::null_mut());
                 l += 1;
             }
             if merge_ret != 0 {
@@ -1318,11 +1319,7 @@ unsafe fn merge_fail_reset_sib_u64s_at(
     (*b).sib_u64s[sib] = sib_u64s as u16;
 }
 
-unsafe fn merge_fail_reset_sib_u64s(
-    c: *mut super::types::bch_fs,
-    b: *mut btree,
-    s: &merge_node,
-) {
+unsafe fn merge_fail_reset_sib_u64s(c: *mut super::types::bch_fs, b: *mut btree, s: &merge_node) {
     /* interior.c:2591 merge_fail_reset_sib_u64s()：
      * 节点 key.k.p 即 max_key，prev/next 侧由 bpos 比较判定 */
     if s.b == b {
@@ -1408,10 +1405,7 @@ unsafe fn bch2_btree_merge_push_pos(
     0
 }
 
-unsafe fn __bch2_btree_calc_format(
-    state: &mut super::bkey::bkey_format_state,
-    b: *mut btree,
-) {
+unsafe fn __bch2_btree_calc_format(state: &mut super::bkey::bkey_format_state, b: *mut btree) {
     /* btree_io.c __bch2_btree_calc_format()：遍历节点全部键（跳过已删），
      * 按 pos 累加进 format state */
     let mut iter = super::types::btree_node_iter::default();
@@ -1519,8 +1513,9 @@ unsafe fn compute_merge(
             }
             *nr = 2;
             total_u64s = merge_node_u64s_and_format(srcs, *nr, new_f);
-            nr_dsts =
-                1usize.max((total_u64s + btree_buf_max_u64s(&*b) / 2 - 1) / (btree_buf_max_u64s(&*b) / 2));
+            nr_dsts = 1usize.max(
+                (total_u64s + btree_buf_max_u64s(&*b) / 2 - 1) / (btree_buf_max_u64s(&*b) / 2),
+            );
         }
     }
 
@@ -1535,9 +1530,7 @@ unsafe fn compute_merge(
     if nr_dsts == 2 {
         /* interior.c:2889-2901 find_balanced_split 失败路径：单节点装得下
          * 则降级 1-dst，否则全毒化 */
-        if core::mem::size_of::<super::bset::btree_node>() + total_u64s * 8
-            < btree_buf_bytes(&*b)
-        {
+        if core::mem::size_of::<super::bset::btree_node>() + total_u64s * 8 < btree_buf_bytes(&*b) {
             nr_dsts = 1;
         } else {
             for i in 0..*nr {
@@ -1834,7 +1827,8 @@ unsafe fn __bch2_foreground_maybe_merge(
     /* 打包容量诊断（interior.c:3144-3148 BUG_ON）：
      * compute_merge 的 format-aware 精确计算保证不溢出 */
     assert!(
-        core::mem::size_of::<super::bset::btree_node>() + (*(*dst_node).data).keys.u64s as usize * 8
+        core::mem::size_of::<super::bset::btree_node>()
+            + (*(*dst_node).data).keys.u64s as usize * 8
             < btree_buf_bytes(&*dst_node),
         "merge dst overflow"
     );
@@ -2070,8 +2064,7 @@ pub(crate) unsafe fn bch2_btree_node_rewrite(
      * 拓扑校验 + sib 重置 */
     super::bset_build::bch2_btree_sort_into(c, n, b);
     assert!(
-        core::mem::size_of::<super::bset::btree_node>()
-            + (*(*n).data).keys.u64s as usize * 8
+        core::mem::size_of::<super::bset::btree_node>() + (*(*n).data).keys.u64s as usize * 8
             < btree_buf_bytes(&*n),
         "rewrite replacement overflow"
     );
@@ -2079,30 +2072,43 @@ pub(crate) unsafe fn bch2_btree_node_rewrite(
     btree_node_reset_sib_u64s(n);
     super::bset_build::bch2_btree_build_aux_trees(n);
 
-    let child_ptr = |child: *mut btree| super::bset::bkey_i_btree_ptr_v2 {
-        k: super::bkey::bkey {
+    let child_ptr = |child: *mut btree, out: *mut super::bset::bkey_i_btree_ptr_v2| {
+        (*out).k = super::bkey::bkey {
             u64s: 10,
             format: super::bkey::KEY_FORMAT_CURRENT,
             type_: super::bset::KEY_TYPE_btree_ptr_v2,
             p: (*(*child).data).max_key,
             ..Default::default()
-        },
-        v: super::bset::bch_btree_ptr_v2 {
+        };
+        (*out).v = super::bset::bch_btree_ptr_v2 {
             mem_ptr: child as usize as u64,
             seq: (*(*child).data).keys.seq,
             min_key: (*(*child).data).min_key,
             ..Default::default()
-        },
+        };
+        /* 上游 __bch2_btree_node_alloc（interior.c:515-518）新节点 key 经
+         * bch2_alloc_sectors_append_ptrs 必带 extent（磁盘位置），set_root
+         * 后 root 记录含 extent；域内差异（T0205 D 覆盖写原位置）：新键
+         * 继承旧节点 b.key 的 extent（mem_ptr 键场景无 extent 则跳过）。
+         * 缺此合并则重写后 slot.key 无磁盘位置，io 层重开 root_read 读盘
+         * bch2_bkey_ptrs_c 空返回 -2（AC-5 验证测试暴露）。 */
+        let old_ptrs = super::bset::bch2_bkey_ptrs_c(super::bkey::bkey_s_c {
+            k: &(*b).key.k,
+            v: &(*b).key.v,
+        });
+        if !old_ptrs.start.is_null() && old_ptrs.start < old_ptrs.end {
+            super::bset::bch2_bkey_append_ptr(c, out.cast(), (*old_ptrs.start).ptr);
+        }
     };
-    let mut n_key = child_ptr(n);
-    super::bkey::bkey_copy(
-        &mut (*n).key,
-        (&n_key as *const super::bset::bkey_i_btree_ptr_v2).cast(),
-    );
+    let mut n_key_buf = [0u64; 16];
+    child_ptr(n, n_key_buf.as_mut_ptr().cast());
+    let n_key = n_key_buf.as_mut_ptr().cast::<super::bkey::bkey_i>();
+    super::bkey::bkey_copy(&mut (*n).key, n_key);
 
     /* 路径换新（interior.c:3299-3302 bch2_path_get_unlocked_mut +
      * btree_path_take_new_node） */
-    let new_path = super::iter::bch2_path_get_unlocked_mut(trans, btree_id, level, (*n).key.k.p, false);
+    let new_path =
+        super::iter::bch2_path_get_unlocked_mut(trans, btree_id, level, (*n).key.k.p, false);
     super::iter::btree_path_take_new_node(trans, (*trans).paths.add(new_path as usize), n);
 
     let parent_level = level as usize + 1;
@@ -2150,8 +2156,9 @@ pub(crate) unsafe fn bch2_btree_node_rewrite(
             super::bset_update::bch2_bset_delete(parent, old, old_u64s);
         }
         let mut insert_iter = super::types::btree_node_iter::default();
-        super::node_iter::bch2_btree_node_iter_init(c, parent, &mut insert_iter, &n_key.k.p);
-        let where_ = super::node_iter::bch2_btree_node_iter_bset_pos(&mut insert_iter, parent, last);
+        super::node_iter::bch2_btree_node_iter_init(c, parent, &mut insert_iter, &(*n_key).k.p);
+        let where_ =
+            super::node_iter::bch2_btree_node_iter_bset_pos(&mut insert_iter, parent, last);
         if (*trans).journal_replay_not_finished {
             let journal_keys = core::ptr::addr_of!((*c).journal_keys);
             let _overwrite_lock = (&(*journal_keys).overwrite_lock).lock().unwrap();
@@ -2159,25 +2166,21 @@ pub(crate) unsafe fn bch2_btree_node_rewrite(
                 c,
                 (*parent).c.btree_id,
                 (*parent).c.level,
-                n_key.k.p,
+                (*n_key).k.p,
                 false,
             );
         }
-        super::bset_update::bch2_bset_insert(
-            parent,
-            where_,
-            (&mut n_key as *mut super::bset::bkey_i_btree_ptr_v2).cast(),
-            0,
-        );
+        super::bset_update::bch2_bset_insert(parent, where_, n_key, 0);
         super::cache::bch2_btree_node_set_dirty(c, parent);
     } else {
         /* root 分支（interior.c:3310-3312 bch2_btree_set_root）：
          * root.key 更新为自身指针 + set_root_for_read（split root
          * 分支模式 interior.rs:800-850） */
-        let root_ptr = child_ptr(n);
+        let mut root_ptr_buf = [0u64; 16];
+        child_ptr(n, root_ptr_buf.as_mut_ptr().cast());
         super::bkey::bkey_copy(
             &mut (*n).key,
-            (&root_ptr as *const super::bset::bkey_i_btree_ptr_v2).cast(),
+            root_ptr_buf.as_mut_ptr().cast::<super::bkey::bkey_i>(),
         );
         if cache_initialized {
             let _ = super::cache::bch2_btree_node_transition_state(
@@ -2204,6 +2207,112 @@ pub(crate) unsafe fn bch2_btree_node_rewrite(
     crate::lock::six::six_unlock_write(&(*n).c.lock);
     crate::lock::six::six_unlock_intent(&(*n).c.lock);
     0
+}
+
+pub(crate) unsafe fn bch2_btree_node_rewrite_key(
+    c: *mut super::types::bch_fs,
+    btree: u8,
+    level: u8,
+    key: *const super::bkey::bkey_i,
+) -> i32 {
+    /* interior.c:3345 bch2_btree_node_rewrite_key() 语义：CLASS iter
+     * (trans, btree, k->k.p, BTREE_MAX_DEPTH, level, 0) →
+     * bch2_btree_iter_peek_node → 仅当定位节点 b 与给定键 k 的指针
+     * 键 hash 匹配才 bch2_btree_node_rewrite，否则 -ENOENT。
+     * 上游 async work（interior.c:3406，read.c:968 读完成触发）经
+     * bch2_trans_do 新建独立 trans 调用；域内同步触发（AC-3，
+     * io.rs 两个读完成点）同样自建 trans，与调用方 trans 解耦。 */
+    if c.is_null() || key.is_null() {
+        return -2;
+    }
+    let mut trans = super::iter::btree_trans::default();
+    super::iter::bch2_trans_init(&mut trans, c);
+    super::iter::bch2_trans_begin(&mut trans);
+
+    let mut iter = super::iter::btree_iter::default();
+    super::iter::bch2_trans_iter_init_common(
+        &mut trans,
+        &mut iter,
+        btree,
+        (*key).k.p,
+        super::bset::BTREE_MAX_DEPTH,
+        level,
+        super::iter::BTREE_ITER_intent,
+    );
+    let b = super::iter::bch2_btree_iter_peek_node(&mut iter);
+    let found = !b.is_null()
+        && !(*b).data.is_null()
+        && super::cache::btree_ptr_hash_val(&(*b).key) == super::cache::btree_ptr_hash_val(key);
+    let ret = if found {
+        bch2_btree_node_rewrite(&mut trans, iter.path)
+    } else {
+        -2
+    };
+    super::iter::bch2_trans_iter_exit(&mut iter);
+    super::iter::bch2_trans_put(&mut trans);
+    ret
+}
+
+/* read.c:968 读完成（btree_node_need_rewrite）→ 上游经 async_btree_rewrite
+ * work（interior.c:3406）排队执行。域内差异（AC-1 D1 同步触发）：无
+ * async worker，读完成点仅把节点入队 btree.node_rewrites（对齐上游
+ * a->key 的 bch2_bkey_buf_copy 语义，拷贝 key 而非持有节点引用，避免
+ * 节点 retire 后悬垂）；执行推迟到无锁时机（root_read 末尾 / engine
+ * 操作边界）的 bch2_do_pending_node_rewrites。 */
+pub(crate) unsafe fn bch2_btree_node_need_rewrite_add(
+    c: *mut super::types::bch_fs,
+    b: *mut super::types::btree,
+) {
+    if c.is_null() || b.is_null() || (*b).data.is_null() {
+        return;
+    }
+    if !super::types::btree_node_need_rewrite(b) {
+        return;
+    }
+    let key = &(*b).key;
+    let mut words = vec![0u64; key.k.u64s as usize];
+    core::ptr::copy_nonoverlapping(
+        (key as *const super::bkey::bkey_i).cast::<u64>(),
+        words.as_mut_ptr(),
+        key.k.u64s as usize,
+    );
+    (*c).btree
+        .node_rewrites
+        .lock()
+        .unwrap()
+        .push(super::types::btree_node_rewrite_item {
+            btree_id: (*b).c.btree_id,
+            level: (*b).c.level,
+            key: words,
+        });
+}
+
+/* interior.c:3462 bch2_do_pending_node_rewrites() 语义：把待重写列表
+ * 交给执行者。上游移入 list 后 queue_work（异步、不持锁）；域内同步
+ * drain：逐项 bch2_btree_node_rewrite_key，忽略 -2（-ENOENT，节点
+ * 已被定位不到）与 -5（no_btree_node_nofill，对齐上游
+ * no_btree_node_nofill 忽略），其余错误记日志（对齐上游对其它错误
+ * 仅报错不中止）。调用方必须处于无节点锁上下文（否则与路径锁
+ * 互斥死锁，见 AC-3 测试）。 */
+pub(crate) unsafe fn bch2_do_pending_node_rewrites(c: *mut super::types::bch_fs) {
+    if c.is_null() {
+        return;
+    }
+    let items = core::mem::take(&mut *(*c).btree.node_rewrites.lock().unwrap());
+    for mut item in items {
+        let ret = bch2_btree_node_rewrite_key(c, item.btree_id, item.level, {
+            let key = item.key.as_mut_ptr().cast::<super::bkey::bkey_i>();
+            key
+        });
+        if ret != 0 && ret != -2 && ret != -5 {
+            crate::rewrite_log_warn!(
+                "pending node rewrite failed (btree {}, level {}): {}",
+                item.btree_id,
+                item.level,
+                ret
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2436,7 +2545,12 @@ mod tests {
                         );
                         assert!(bch2_btree_iter_peek(&mut split_retry).k.is_null());
                         assert_eq!(
-                            bch2_trans_update(&mut split_retry_trans, &mut split_retry, &mut key, 0),
+                            bch2_trans_update(
+                                &mut split_retry_trans,
+                                &mut split_retry,
+                                &mut key,
+                                0
+                            ),
                             0
                         );
                     }

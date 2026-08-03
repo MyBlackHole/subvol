@@ -3,6 +3,7 @@ use super::bset::{bset as disk_bset, btree_node as disk_btree_node};
 use crate::lock::six::six_lock;
 use crate::util::rhashtable::rhashtable;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
+use std::sync::Mutex;
 
 pub const MAX_BSETS: usize = 3;
 pub const BCH_BKEY_PTRS_MAX: usize = 16;
@@ -400,6 +401,23 @@ impl Drop for bch_fs_btree_cache {
 pub struct bch_fs_btree {
     pub cache: bch_fs_btree_cache,
     pub evicted_size: btree_evicted_size,
+    /* interior.c:3390 async_btree_rewrite + btree.node_rewrites：
+     * 读完成（read.c:968）入队的待重写节点。域内差异（AC-1 D1）：
+     * 无 async worker，队列保存 key 拷贝（对齐 a->key bkey_buf），
+     * 由无锁时机（root_read 末尾 / engine 操作边界）
+     * bch2_do_pending_node_rewrites 同步执行 */
+    pub node_rewrites: Mutex<Vec<btree_node_rewrite_item>>,
+}
+
+/* interior.c:3390-3396 async_btree_rewrite 的域内等价：记录
+ * btree_id/level + 指针键拷贝（bch2_bkey_buf_copy(&a->key, &b->key)），
+ * 不持有节点引用，避免节点被 retire 后悬垂 */
+#[repr(C)]
+#[derive(Clone)]
+pub struct btree_node_rewrite_item {
+    pub btree_id: u8,
+    pub level: u8,
+    pub key: Vec<u64>,
 }
 
 #[repr(C)]

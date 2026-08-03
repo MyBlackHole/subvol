@@ -3000,14 +3000,12 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
             (*(*i).k).k.u64s as i32
         };
         let next_idx = idx + 1;
-        let same_leaf_as_next = next_idx < (*trans).nr_updates as usize
-            && {
-                let ni = (*trans).updates.add(next_idx);
-                let np = (*trans).paths.add((*ni).path as usize);
-                (*np).l[(*ni).level as usize].b == b
-            };
-        if !same_leaf_as_next
-            && super::interior::btree_node_needs_merge((*trans).c, b, u64s_delta)
+        let same_leaf_as_next = next_idx < (*trans).nr_updates as usize && {
+            let ni = (*trans).updates.add(next_idx);
+            let np = (*trans).paths.add((*ni).path as usize);
+            (*np).l[(*ni).level as usize].b == b
+        };
+        if !same_leaf_as_next && super::interior::btree_node_needs_merge((*trans).c, b, u64s_delta)
         {
             crate::rewrite_log_debug!("commit maybe_merge idx={idx} delta={u64s_delta}");
             let mut merge_count = 0u64;
