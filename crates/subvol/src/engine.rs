@@ -6412,6 +6412,107 @@ mod tests {
     }
 
     #[test]
+    fn t0210b_ac3_multilevel_tree_traverses_disk_nodes_after_reopen() {
+        /* T0210b AC-3 阶段三：split 树（root 内部节点 + 叶子）重开后 root
+         * 真实读盘（root_read 以 seq_ondisk 为 replay_seq 过滤，未写盘键
+         * 不被当作内存子树）、多级结构保持、scan 触发子树懒加载逐层读盘
+         * （对齐 iter.c btree_path_level_fill 首次访问路径）、全键与崩溃
+         * 前一致。区分性断言：root 从磁盘读回（key type + 磁盘 ptr）；
+         * root level >= 1 且携带 >= 2 个子树指针；scan 后子树节点带磁盘
+         * ptr（真实读盘而非纯重放内存重建）；全键与崩溃前一致。 */
+        let path = persistent_test_path("ac3-multilevel");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let mut model = BTreeMap::new();
+        {
+            let engine = StorageEngine::create_persistent(&path).unwrap();
+            for offset in 4..=15u64 {
+                engine.add_free_bucket(offset);
+            }
+            for offset in (0..512u64).collect::<Vec<_>>().chunks(16) {
+                let mut txn = engine.transaction();
+                for &o in offset {
+                    let k = key(o, &[o, o + 1]);
+                    txn.put(BtreeId::DEFAULT, k.clone());
+                    model.insert(KeyPosition::new(1, o, 0), k);
+                }
+                txn.commit().unwrap();
+            }
+            engine.sync().unwrap();
+        }
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        let root_level = unsafe {
+            let mut fs = recovered.lock_fs().unwrap();
+            let c: *mut bch_fs = &mut **fs;
+            let root = crate::btree::types::bch2_btree_id_root_b(c, 0);
+            assert!(!root.is_null(), "DEFAULT root 必须存在");
+            assert_eq!(
+                (*root).key.k.type_,
+                crate::btree::bset::KEY_TYPE_btree_ptr_v2,
+                "多级树重开后 root 必须从磁盘读回带 ptr 的真实节点"
+            );
+            assert!(
+                crate::btree::alloc::btree_node_key_has_ptr(root),
+                "root 节点 key 必须携带磁盘 ptr"
+            );
+            let mut subtree_ptrs = 0usize;
+            let mut root_iter = crate::btree::types::btree_node_iter::default();
+            crate::btree::node_iter::bch2_btree_node_iter_init_from_start(&mut root_iter, root);
+            loop {
+                let ptr = crate::btree::node_iter::bch2_btree_node_iter_peek(&mut root_iter, root);
+                if ptr.is_null() {
+                    break;
+                }
+                subtree_ptrs += 1;
+                crate::btree::node_iter::bch2_btree_node_iter_advance(&mut root_iter, root);
+            }
+            assert!(
+                subtree_ptrs >= 2,
+                "多级树 root 必须携带至少 2 个子树指针，实际 {subtree_ptrs}"
+            );
+            (*root).c.level
+        };
+        assert!(
+            root_level >= 1,
+            "split 树重开后 root 应为内部节点，实际 level={root_level}"
+        );
+        assert_eq!(
+            recovered.scan(BtreeId::DEFAULT).unwrap(),
+            model.values().cloned().collect::<Vec<_>>(),
+            "重开后多级树全键遍历必须与崩溃前一致"
+        );
+        unsafe {
+            let mut fs = recovered.lock_fs().unwrap();
+            let c: *mut bch_fs = &mut **fs;
+            let root = crate::btree::types::bch2_btree_id_root_b(c, 0);
+            let mut children = 0usize;
+            let mut root_iter = crate::btree::types::btree_node_iter::default();
+            crate::btree::node_iter::bch2_btree_node_iter_init_from_start(&mut root_iter, root);
+            loop {
+                let ptr = crate::btree::node_iter::bch2_btree_node_iter_peek(&mut root_iter, root);
+                if ptr.is_null() {
+                    break;
+                }
+                let key_u64s = crate::btree::bkey::bkeyp_key_u64s(&(*root).format, &*ptr);
+                let child = *ptr.cast::<u64>().add(key_u64s as usize) as usize
+                    as *mut crate::btree::types::btree;
+                assert!(!child.is_null(), "scan 后子树必须已从磁盘读回");
+                assert!(
+                    crate::btree::alloc::btree_node_key_has_ptr(child),
+                    "子树节点必须从磁盘读回并携带磁盘 ptr"
+                );
+                children += 1;
+                crate::btree::node_iter::bch2_btree_node_iter_advance(&mut root_iter, root);
+            }
+            assert!(children > 0, "root 至少有一个子节点");
+        }
+        recovered.verify_all().unwrap();
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rewrite_random_operations_preserve_keyset_model() {
         /* T0205 T7（AC-1 §4）：属性测试。确定性伪随机 put/delete +
          * 随机节点重写（叶/内部/root 层），键级模型对比；重写只

@@ -151,6 +151,8 @@ pub unsafe fn bch2_btree_node_write_trans(
     );
     let w = super::types::btree_prev_write(b);
     crate::journal::bch2_journal_pin_drop(&(*(*trans).c).journal, &mut (*w).journal);
+    let w = super::types::btree_current_write(b);
+    crate::journal::bch2_journal_pin_drop(&(*(*trans).c).journal, &mut (*w).journal);
     if lock_type_held == crate::lock::six::six_lock_type::SIX_LOCK_write {
         bch2_btree_post_write_cleanup((*trans).c, b);
     } else if lock_type_held == crate::lock::six::six_lock_type::SIX_LOCK_intent {
@@ -1151,7 +1153,7 @@ pub(crate) unsafe fn bch2_btree_node_get_noiter_unlocked(
     super::types::set_btree_node_read_in_flight(node);
     let replay_seq = (*c)
         .journal
-        .last_seq
+        .seq_ondisk
         .load(core::sync::atomic::Ordering::Acquire);
     let ret = bch2_btree_node_read(&mut (*c).disk_sb, node, replay_seq);
     super::types::clear_btree_node_read_in_flight(node);
@@ -1368,7 +1370,7 @@ pub unsafe fn bch2_btree_root_read(
         &mut (*c).disk_sb,
         node,
         (*c).journal
-            .last_seq
+            .seq_ondisk
             .load(core::sync::atomic::Ordering::Acquire),
     );
     super::types::clear_btree_node_read_in_flight(node);
