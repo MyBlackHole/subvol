@@ -42,6 +42,14 @@ pub const fn btree_id_is_extents_snapshots(btree: u8) -> bool {
     btree_id_is_extents(btree) && btree_type_has_snapshots(btree)
 }
 
+/* 对齐 bcachefs_format.h:1864 btree_id_can_reconstruct()：本域保留本地
+ * BCH_BTREE_IDS() 前 8 个 id（0-7）外加一个域内 id。可重建集合照搬上游
+ * 语义——只有 alloc 可从扫描重建，extents/inodes/dirents/xattrs 等核心
+ * 数据读盘失败即恢复失败。 */
+pub const fn btree_id_can_reconstruct(btree: u8) -> bool {
+    btree == 4
+}
+
 pub const BCH_VALIDATE_write: u8 = 1 << 0;
 pub const BCH_VALIDATE_commit: u8 = 1 << 1;
 pub const BCH_VALIDATE_silent: u8 = 1 << 2;

@@ -1769,13 +1769,13 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
 
     /* recovery.c runs read_btree_roots() immediately after its early replay
      * pass.  The port combines the early pass with normal replay, therefore
-     * load only roots that came from a journal record and have not already
-     * been supplied by an in-memory recovery bootstrap. */
+     * load every root that came from a journal record; bch2_btree_root_read
+     * replaces the in-memory bootstrap root with the node read back from
+     * disk, and a read failure leaves the bootstrap root in place unless the
+     * btree is reconstructable (recovery.c:639-650). */
     if roots_seen != 0 && !(*c).disk_sb.s_bdev_file.is_null() {
         for id in 0..crate::btree::types::BTREE_ID_NR {
-            if roots_seen & (1usize << id) == 0
-                || !crate::btree::types::bch2_btree_id_root_b(c, id).is_null()
-            {
+            if roots_seen & (1usize << id) == 0 {
                 continue;
             }
             let root = crate::btree::types::bch2_btree_id_root(c, id);
@@ -1783,9 +1783,41 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
                 continue;
             }
             let key = core::ptr::addr_of!((*root).key);
+            /* 对齐 recovery.c read_btree_roots：root_read 无条件读盘。内存
+             * bootstrap（Self::new 预创建的 fake root）与 journal root key
+             * 同源（seq = U64_MAX - id），会与读回节点 rhashtable 冲突且
+             * 使读盘被 b 非 null 跳过；先解除槽绑定并从 rhashtable 移除
+             * fake root 节点再读。 */
+            let old_b = crate::btree::types::bch2_btree_id_root_b(c, id);
+            crate::btree::types::bch2_btree_id_root_set(c, id, core::ptr::null_mut());
+            if !old_b.is_null() && !(*old_b).data.is_null() {
+                crate::btree::cache::bch2_btree_node_transition_state(
+                    &mut (*c).btree.cache,
+                    old_b,
+                    crate::btree::types::btree_node_cache_state::BTREE_NODE_CACHE_FREEABLE,
+                );
+            }
             let ret = crate::btree::io::bch2_btree_root_read(c, id as u8, key, (*root).level);
             if ret != 0 {
-                return ret;
+                /* 对齐 recovery.c:639-650 mustfix_fsck_err_on：root 读盘失败
+                 * 记录错误后恢复继续（可重建的 btree 清 error，其余留待
+                 * fsck 修复）；bootstrap root 已解除绑定，重建 fake root
+                 * 保证重放仍可遍历（对齐 recovery.c:653-661 读失败后
+                 * bch2_btree_root_alloc_fake）。 */
+                crate::rewrite_log_error!(
+                    "btree root id={id} read failed ret={ret}, keeping bootstrap root"
+                );
+                if crate::btree::types::bch2_btree_id_root_b(c, id).is_null() {
+                    crate::btree::interior::bch2_btree_root_alloc_fake(c, id as u8, 0);
+                    /* 对齐 engine.rs Self::new（533-534）：重建的 fake root
+                     * 需清 fake/need_rewrite 成为普通可写叶，否则 insert_fits
+                     * 恒 false 导致重放键反复 split（interior.rs:71-73）。 */
+                    let rb = crate::btree::types::bch2_btree_id_root_b(c, id);
+                    if !rb.is_null() {
+                        crate::btree::types::clear_btree_node_fake(rb);
+                        crate::btree::types::clear_btree_node_need_rewrite(rb);
+                    }
+                }
             }
         }
     }
