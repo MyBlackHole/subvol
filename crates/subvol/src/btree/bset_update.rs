@@ -206,6 +206,13 @@ pub(crate) unsafe fn bch2_bset_insert(
         (where_ as *mut u64).add(key_u64s),
         val_u64s,
     );
+    if (*b).c.level == 1 && (*insert).k.type_ == crate::btree::bset::KEY_TYPE_btree_ptr_v2 {
+        crate::rewrite_log_debug!(
+            "DEBUG bset_insert level=1 u64s={} val0={:#018x}",
+            (*src).u64s,
+            *(where_.cast::<u64>().add(key_u64s)),
+        );
+    }
 
     if (*src).u64s as u32 != clobber_u64s {
         bch2_bset_fix_lookup_table(b, t, where_, clobber_u64s, (*src).u64s as u32);

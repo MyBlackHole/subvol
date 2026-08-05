@@ -196,6 +196,13 @@ fn __do_six_trylock(
 ) -> bool {
     if lock_type == six_lock_type::SIX_LOCK_write {
         assert_eq!(*lock.owner.lock().unwrap(), Some(task));
+        if try_lock != (lock.state.load(Ordering::Relaxed) & SIX_LOCK_HELD_WRITE == 0) {
+            crate::rewrite_log_debug!(
+                "six trylock write conflict: lock={lock:p} state={:#x} task={task:?} owner={:?}",
+                lock.state.load(Ordering::Relaxed),
+                *lock.owner.lock().unwrap()
+            );
+        }
         assert_eq!(
             try_lock,
             lock.state.load(Ordering::Relaxed) & SIX_LOCK_HELD_WRITE == 0

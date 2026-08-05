@@ -76,6 +76,22 @@ pub unsafe fn sort_iter_add(
     end: *mut bkey_packed_type,
 ) {
     assert!((*iter).used < (*iter).size);
+    crate::rewrite_log_debug!(
+        "DEBUG sort_add: used={} size={} k_off={} end_off={} sets_ptr={:p}",
+        (*iter).used,
+        (*iter).size,
+        if (*iter).b.is_null() {
+            0
+        } else {
+            (k as usize).saturating_sub((*(*iter).b).data as usize)
+        },
+        if (*iter).b.is_null() {
+            0
+        } else {
+            (end as usize).saturating_sub((*(*iter).b).data as usize)
+        },
+        sort_iter_data(iter)
+    );
     if k != end {
         *sort_iter_data(iter).add((*iter).used as usize) = sort_iter_set { k, end };
         (*iter).used += 1;
@@ -466,6 +482,15 @@ pub unsafe fn bch2_bset_init_next(b: *mut btree, bne: *mut btree_node_entry) {
     let i = &mut (*bne).keys;
     *i = disk_bset::default();
     i.seq = (*btree_bset_first(b)).seq;
+    /* 对齐 commit.c:351（i->journal_seq = max(journal_seq, 旧值)）：
+     * 新 bset 继承节点已写 bset 的最大 journal_seq，保证二次写盘
+     * 满足 write.c:470 BUG_ON(b->written && !seq)；域内 interior
+     * key 直接内存发布不经 commit，seq 由继承保持非 0。 */
+    let mut jseq = 0u64;
+    for idx in 0..(*b).nsets as usize {
+        jseq = jseq.max((*super::types::bset(b, (*b).set.as_ptr().add(idx))).journal_seq);
+    }
+    i.journal_seq = jseq;
     let t = (*b).set.as_mut_ptr().add((*b).nsets as usize);
     (*b).nsets += 1;
     set_btree_bset(b, t, i);
@@ -665,8 +690,21 @@ unsafe fn make_bfloat(
     let high_bit =
         greatest_differing_bit(b, l, r).max(BKEY_MANTISSA_BITS.min((*b).nr_key_bits as u32) - 1);
     let exponent = high_bit as i32 - (BKEY_MANTISSA_BITS as i32 - 1);
+    /* 对齐 bset.c:894 EBUG_ON(shift + BKEY_MANTISSA_BITS > key_u64s * 64)：
+     * shift 可为大值（含负 exponent 抬高），仅受 key 总位宽约束 */
     let shift = ((*b).format.key_u64s as i32 * 64 - (*b).nr_key_bits as i32) + exponent;
-    assert!(shift >= 0 && shift < u8::MAX as i32);
+    assert!(
+        shift >= 0 && shift as u32 + BKEY_MANTISSA_BITS as u32 <= (*b).format.key_u64s as u32 * 64
+    );
+    /* 对齐 bset.c:909 EBUG_ON(shift < 0 || shift >= BFLOAT_FAILED)：subvol
+     * 节点可用 CURRENT format（key_u64s=5、padding 160 位），相邻 key 差
+     * 在 pos 高位时 shift 合法越界；该 bfloat 无区分能力，置
+     * BFLOAT_FAILED 使查找走线性 fallback（bset_search.rs:174，对齐
+     * bset.c:1410 lookup 的 exponent < BFLOAT_FAILED 分支）。 */
+    if shift >= super::bset::BFLOAT_FAILED as i32 {
+        (*f).exponent = super::bset::BFLOAT_FAILED;
+        return;
+    }
     (*f).exponent = shift as u8;
     let mut mantissa = key_mantissa(m, f) as u32;
     if exponent < 0 {

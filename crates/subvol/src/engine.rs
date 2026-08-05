@@ -2074,11 +2074,35 @@ fn reclaim_status(state: &ReclaimWorkerState) -> ReclaimStatus {
 
 unsafe fn decode_key(raw: bkey_s_c) -> Result<BtreeKey, EngineError> {
     let header = &*raw.k;
-    if header.u64s < BKEY_U64S || header.format != KEY_FORMAT_CURRENT {
+    /* bch2_bkey_unpack_key 输出保留 KEY_PACKED_BITS(0x80)：
+     * format 低 7 位才是真实格式（bkey.rs:334 同款校验） */
+    if header.u64s < BKEY_U64S || header.format & 0x7f != KEY_FORMAT_CURRENT {
+        let p = unsafe { core::ptr::addr_of!(header.p).read_unaligned() };
+        let (inode, offset, snapshot) = unsafe {
+            (
+                core::ptr::addr_of!(p.inode).read_unaligned(),
+                core::ptr::addr_of!(p.offset).read_unaligned(),
+                core::ptr::addr_of!(p.snapshot).read_unaligned(),
+            )
+        };
+        crate::rewrite_log_error!(
+            "decode_key reject: u64s={} format={} type={} p=({},{},{})",
+            header.u64s,
+            header.format,
+            header.type_,
+            inode,
+            offset,
+            snapshot
+        );
         return Err(EngineError::Transaction(-1));
     }
     let value_u64s = bkey_val_u64s(header) as usize;
     if value_u64s > BKEY_VAL_U64S_MAX as usize || (value_u64s != 0 && raw.v.is_null()) {
+        crate::rewrite_log_error!(
+            "decode_key reject val: value_u64s={} v={:p}",
+            value_u64s,
+            raw.v
+        );
         return Err(EngineError::Transaction(-1));
     }
 
@@ -2439,6 +2463,10 @@ unsafe fn scan_locked(fs: &mut bch_fs, btree: BtreeId) -> Result<Vec<BtreeKey>, 
     let result = loop {
         let error = bkey_err(current);
         if error != 0 {
+            crate::rewrite_log_error!(
+                "scan_locked abort: bkey_err={error} current.k={:p}",
+                current.k
+            );
             break Err(EngineError::Transaction(error));
         }
         if current.k.is_null() {
@@ -5553,6 +5581,12 @@ mod tests {
         file.set_len(32 * 1024 * 1024).unwrap();
         drop(file);
         let engine = StorageEngine::create_persistent(&path).unwrap();
+        /* T0210：btree 节点落盘需要可分配桶，初始化 freespace
+         * 桶 4-7（桶 1-4 为 journal 区，同 t0210_ac1 几何）。 */
+        for offset in 4..8u64 {
+            engine.add_free_bucket(offset);
+        }
+
         let mut model = BTreeMap::new();
         /* 单事务 update 数受路径池约束（BTREE_ITER_INITIAL=64，每
          * update 持一条路径引用），批量取 16 键/批；批大小还需避开
@@ -5619,6 +5653,12 @@ mod tests {
         let mut model = BTreeMap::new();
         {
             let engine = StorageEngine::create_persistent(&path).unwrap();
+            /* T0210：btree 节点落盘需要可分配桶，初始化 freespace
+             * 桶 4-7（桶 1-4 为 journal 区，同 t0210_ac1 几何）。 */
+            for offset in 4..8u64 {
+                engine.add_free_bucket(offset);
+            }
+
             for offset in (0..512u64).collect::<Vec<_>>().chunks(16) {
                 let mut txn = engine.transaction();
                 for &o in offset {
@@ -5753,6 +5793,12 @@ mod tests {
         file.set_len(32 * 1024 * 1024).unwrap();
         drop(file);
         let engine = StorageEngine::create_persistent(&path).unwrap();
+        /* T0210：btree 节点落盘需要可分配桶，初始化 freespace
+         * 桶 4-7（桶 1-4 为 journal 区，同 t0210_ac1 几何）。 */
+        for offset in 4..8u64 {
+            engine.add_free_bucket(offset);
+        }
+
         let mut model: Vec<BTreeMap<KeyPosition, BtreeKey>> =
             (0..N_IDS).map(|_| BTreeMap::new()).collect();
         for id in 0..N_IDS {
@@ -5920,6 +5966,12 @@ mod tests {
         file.set_len(32 * 1024 * 1024).unwrap();
         drop(file);
         let engine = StorageEngine::create_persistent(&path).unwrap();
+        /* T0210：btree 节点落盘需要可分配桶，初始化 freespace
+         * 桶 4-7（桶 1-4 为 journal 区，同 t0210_ac1 几何）。 */
+        for offset in 4..8u64 {
+            engine.add_free_bucket(offset);
+        }
+
         for offset in (0..768u64).collect::<Vec<_>>().chunks(16) {
             let mut txn = engine.transaction();
             for &o in offset {
@@ -6005,6 +6057,12 @@ mod tests {
         file.set_len(32 * 1024 * 1024).unwrap();
         drop(file);
         let engine = StorageEngine::create_persistent(&path).unwrap();
+        /* T0210：btree 节点落盘需要可分配桶，初始化 freespace
+         * 桶 4-7（桶 1-4 为 journal 区，同 t0210_ac1 几何）。 */
+        for offset in 4..8u64 {
+            engine.add_free_bucket(offset);
+        }
+
         for offset in (0..8192u64).collect::<Vec<_>>().chunks(16) {
             let mut txn = engine.transaction();
             for &o in offset {
@@ -6045,6 +6103,12 @@ mod tests {
         file.set_len(32 * 1024 * 1024).unwrap();
         drop(file);
         let engine = StorageEngine::create_persistent(&path).unwrap();
+        /* T0210：btree 节点落盘需要可分配桶，初始化 freespace
+         * 桶 4-7（桶 1-4 为 journal 区，同 t0210_ac1 几何）。 */
+        for offset in 4..8u64 {
+            engine.add_free_bucket(offset);
+        }
+
         for offset in (0..768u64).collect::<Vec<_>>().chunks(16) {
             let mut txn = engine.transaction();
             for &o in offset {
@@ -6098,6 +6162,12 @@ mod tests {
         file.set_len(32 * 1024 * 1024).unwrap();
         drop(file);
         let engine = StorageEngine::create_persistent(&path).unwrap();
+        /* T0210：btree 节点落盘需要可分配桶，初始化 freespace
+         * 桶 4-7（桶 1-4 为 journal 区，同 t0210_ac1 几何）。 */
+        for offset in 4..8u64 {
+            engine.add_free_bucket(offset);
+        }
+
         for offset in (0..768u64).collect::<Vec<_>>().chunks(16) {
             let mut txn = engine.transaction();
             for &o in offset {
@@ -6159,6 +6229,12 @@ mod tests {
         file.set_len(32 * 1024 * 1024).unwrap();
         drop(file);
         let engine = StorageEngine::create_persistent(&path).unwrap();
+        /* T0210：btree 节点落盘需要可分配桶，初始化 freespace
+         * 桶 4-7（桶 1-4 为 journal 区，同 t0210_ac1 几何）。 */
+        for offset in 4..8u64 {
+            engine.add_free_bucket(offset);
+        }
+
         for offset in (0..768u64).collect::<Vec<_>>().chunks(16) {
             let mut txn = engine.transaction();
             for &o in offset {
@@ -6225,6 +6301,12 @@ mod tests {
         let mut model = BTreeMap::new();
         {
             let engine = StorageEngine::create_persistent(&path).unwrap();
+            /* T0210：btree 节点落盘需要可分配桶，初始化 freespace
+             * 桶 4-7（桶 1-4 为 journal 区，同 t0210_ac1 几何）。 */
+            for offset in 4..8u64 {
+                engine.add_free_bucket(offset);
+            }
+
             for offset in (0..512u64).collect::<Vec<_>>().chunks(16) {
                 let mut txn = engine.transaction();
                 for &o in offset {
@@ -6532,5 +6614,489 @@ mod tests {
             }
         }
         let _ = fs::remove_file(&path);
+    }
+    #[test]
+    fn t0210_ac1_btree_node_alloc_sectors() {
+        use crate::btree::alloc::bch2_btree_node_alloc_sectors;
+        use crate::btree::alloc::btree_node_key_has_ptr;
+        use crate::btree::bset::BCH_EXTENT_PTR_DEV;
+        use crate::btree::bset::BCH_EXTENT_PTR_GEN;
+        use crate::btree::bset::BCH_EXTENT_PTR_OFFSET;
+        use crate::btree::cache::bch2_btree_node_mem_alloc;
+        use crate::btree::cache::bch2_btree_node_mem_free;
+        use crate::btree::iter::{bch2_trans_init, btree_trans};
+        use crate::btree::types::btree;
+
+        let dir = persistent_test_path("t0210-ac1");
+        let engine = StorageEngine::create_persistent(&dir).unwrap();
+        for offset in 4..=7u64 {
+            engine.add_free_bucket(offset);
+        }
+        let mut fs = engine.lock_fs().unwrap();
+        let c: *mut bch_fs = &mut **fs;
+        let mut trans = btree_trans::default();
+        unsafe {
+            bch2_trans_init(&mut trans, c);
+
+            /* 单次分配：建节点 → 初始化（对齐 bch2_btree_node_alloc 的
+             * 初始化顺序）→ 分配扇区 → 校验 key 为 btree_ptr_v2 且携带
+             * 磁盘 ptr → 返回 (dev, offset, gen)。 */
+            let mut alloc = |c: *mut bch_fs, nodes: &mut Vec<*mut btree>| -> (u64, u64, u32) {
+                let n = bch2_btree_node_mem_alloc(&mut trans, false);
+                assert!(!n.is_null());
+                nodes.push(n);
+                (*n).c.level = 0;
+                (*n).c.btree_id = 1;
+                (*n).version_ondisk = crate::sb::bcachefs_metadata_version_current;
+                crate::btree::bset_build::bch2_bset_init_first(n, &mut (*(*n).data).keys);
+                crate::btree::bset_build::bch2_btree_build_aux_trees(n);
+                let ret = bch2_btree_node_alloc_sectors(c, n);
+                assert_eq!(ret, 0, "alloc_sectors 必须成功");
+                assert_eq!((*n).key.k.type_, crate::btree::bset::KEY_TYPE_btree_ptr_v2);
+                assert!(btree_node_key_has_ptr(n), "节点 key 必须携带磁盘 ptr");
+                let ptrs = bch2_bkey_ptrs_c(bkey_s_c {
+                    k: &(*n).key.k,
+                    v: &(*n).key.v,
+                });
+                let ptr = (*ptrs.start).ptr;
+                (
+                    BCH_EXTENT_PTR_DEV(&ptr),
+                    BCH_EXTENT_PTR_OFFSET(&ptr),
+                    BCH_EXTENT_PTR_GEN(&ptr) as u32,
+                )
+            };
+            let mut nodes: Vec<*mut btree> = Vec::new();
+            let (dev0, off1, _) = alloc(c, &mut nodes);
+            assert_eq!(dev0, 0, "单设备 dev_idx=0");
+            let (_, off2, _) = alloc(c, &mut nodes);
+            assert_eq!(off2, off1 + 8, "同桶连续分配 8 扇区");
+            /* 模拟桶 4 写点耗尽（split 批量消费节点扇区后的域内状态），
+             * 下一次分配经 freelist 换桶（对齐 interior.c:473-482）。 */
+            (*c).allocator.btree_write_point.sectors_free = 0;
+            let (_, off3, _) = alloc(c, &mut nodes);
+            assert_eq!(off3, 5 * 2048, "桶 4 写点耗尽后换桶 5 起点");
+            /* reserve_cache：第 4 次分配复用 off3 的扇区（同一 ptr） */
+            crate::btree::alloc::bch2_btree_reserve_cache_put(c, *nodes.last().unwrap());
+            let (_, off4, _) = alloc(c, &mut nodes);
+            assert_eq!(
+                off4, off3,
+                "reserve_cache 复用同一扇区 ptr（覆盖写原位置语义）"
+            );
+
+            for node in &nodes {
+                bch2_btree_node_mem_free(c, *node);
+            }
+            bch2_trans_put(&mut trans);
+        }
+        drop(fs);
+
+        /* 分配后状态：桶 4/5 alloc_v4.data_type == BCH_DATA_BTREE，
+         * 且桶 4/5 freespace 位已清除（桶 6/7 保留）。 */
+        let mut fs = engine.lock_fs().unwrap();
+        unsafe {
+            for bucket in [4u64, 5] {
+                let mut found_btree = false;
+                for raw in scan_raw_locked(&mut **fs, 4).unwrap() {
+                    let key = raw.words.as_ptr().cast::<bkey_i>();
+                    if (*key).k.type_ == KEY_TYPE_alloc_v4
+                        && (*key).k.p.inode == 0
+                        && (*key).k.p.offset == bucket
+                    {
+                        let value = (key as *const u8)
+                            .add(core::mem::size_of::<bkey>())
+                            .cast::<bch_alloc_v4>();
+                        let alloc = core::ptr::read_unaligned(value);
+                        assert_eq!(alloc.data_type, BCH_DATA_BTREE);
+                        found_btree = true;
+                    }
+                }
+                assert!(found_btree, "bucket {bucket} alloc_v4 应为 BTREE");
+            }
+            let mut free_bits = Vec::new();
+            for raw in scan_raw_locked(&mut **fs, BTREE_ID_FREESPACE).unwrap() {
+                let key = raw.words.as_ptr().cast::<bkey_i>();
+                if (*key).k.type_ == crate::btree::bset::KEY_TYPE_set {
+                    free_bits.push((*key).k.p.offset & ((1u64 << 56) - 1));
+                }
+            }
+            assert!(!free_bits.contains(&4u64), "桶 4 freespace 位必须清除");
+            assert!(!free_bits.contains(&5u64), "桶 5 freespace 位必须清除");
+            assert!(free_bits.contains(&6u64) && free_bits.contains(&7u64));
+        }
+        drop(fs);
+        let _ = fs::remove_file(&dir);
+    }
+    #[test]
+    fn t0210_ac2_btree_node_write_read_roundtrip() {
+        use crate::btree::bkey::bch2_bkey_unpack;
+        use crate::btree::bset::bkey_i_to_btree_ptr_v2;
+        use crate::btree::bset::btree_node_mem_ptr;
+        use crate::btree::bset::KEY_TYPE_btree_ptr_v2;
+        use crate::btree::cache::bch2_btree_node_mem_alloc;
+        use crate::btree::cache::bch2_btree_node_mem_free;
+        use crate::btree::io::__bch2_btree_node_write;
+        use crate::btree::io::bch2_btree_node_read;
+        use crate::btree::node_iter::bch2_btree_node_iter_advance;
+        use crate::btree::node_iter::bch2_btree_node_iter_init_from_start;
+        use crate::btree::node_iter::bch2_btree_node_iter_peek_all;
+        use crate::btree::types::bch2_btree_id_root_b;
+        use crate::btree::types::btree;
+        use crate::btree::types::btree_node_iter;
+        use crate::checksum::bch2_checksum;
+        use crate::checksum::BCH_CSUM_xxhash;
+
+        /* 从 root 递归收集树内全部节点：interior 节点的每个 key 都是
+         * child ptr（mem_ptr 指向 child btree）。 */
+        unsafe fn collect_nodes(node: *mut btree, out: &mut Vec<*mut btree>) {
+            out.push(node);
+            if (*node).c.level == 0 {
+                return;
+            }
+            let mut iter = btree_node_iter::default();
+            bch2_btree_node_iter_init_from_start(&mut iter, node);
+            loop {
+                let packed = bch2_btree_node_iter_peek_all(&mut iter, node);
+                if packed.is_null() {
+                    break;
+                }
+                let mut buffer = [0u64; 40];
+                let key = buffer.as_mut_ptr().cast::<crate::btree::bkey::bkey_i>();
+                bch2_bkey_unpack(node, key, packed);
+                if (*key).k.type_ == KEY_TYPE_btree_ptr_v2 {
+                    let child = btree_node_mem_ptr(key);
+                    if !child.is_null() {
+                        collect_nodes(child, out);
+                    }
+                }
+                bch2_btree_node_iter_advance(&mut iter, node);
+            }
+        }
+
+        /* 写盘后的磁盘副本校验（对齐 io.rs roundtrip 测试模式）：
+         * 独立 mem_alloc 节点 + 继承 key → read → key 数与 xxhash
+         * csum 必须与内存节点一致。 */
+        unsafe fn verify_roundtrip(
+            c: *mut bch_fs,
+            trans: *mut crate::btree::iter::btree_trans,
+            n: *mut btree,
+        ) {
+            let mut r = bch2_btree_node_mem_alloc(trans, false);
+            assert!(!r.is_null(), "读回节点分配失败");
+            (*r).c.btree_id = (*n).c.btree_id;
+            (*r).c.level = (*n).c.level;
+            crate::btree::bkey::bkey_copy(&mut (*r).key, &(*n).key);
+            /* DEBUG：read 前直接读磁盘字节对比内存节点 */
+            {
+                use std::os::unix::fs::FileExt;
+                let file = &*(*c).disk_sb.s_bdev_file.cast::<std::fs::File>();
+                let ptrs = bch2_bkey_ptrs_c(bkey_s_c {
+                    k: &(*n).key.k,
+                    v: &(*n).key.v,
+                });
+                let disk_off = crate::btree::bset::BCH_EXTENT_PTR_OFFSET(&(*ptrs.start).ptr) * 512;
+                let mut raw = vec![0u8; 4096];
+                let nread = file.read_at(&mut raw, disk_off).unwrap_or(0);
+                crate::rewrite_log_debug!("DEBUG verify_disk_off={disk_off} nread={nread}");
+                let mem_node = (*n).data;
+                let mut mismatch = 0usize;
+                for i in 0..(core::mem::size_of::<crate::btree::bset::btree_node>()
+                    + (*mem_node).keys.u64s as usize * 8)
+                    / 8
+                {
+                    let disk_u64 = u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+                    let mem_u64 = *(mem_node.cast::<u8>() as *const u64).add(i);
+                    if disk_u64 != mem_u64 && mismatch < 8 {
+                        crate::rewrite_log_debug!(
+                            "DEBUG disk/mem u64[{i}] disk={disk_u64:#018x} mem={mem_u64:#018x}"
+                        );
+                        mismatch += 1;
+                    }
+                }
+                crate::rewrite_log_debug!(
+                    "DEBUG node level={} u64s={} written={} mismatch_total={}",
+                    (*n).c.level,
+                    (*mem_node).keys.u64s,
+                    (*n).written,
+                    (0..(core::mem::size_of::<crate::btree::bset::btree_node>()
+                        + (*mem_node).keys.u64s as usize * 8)
+                        / 8)
+                        .filter(|&i| {
+                            let disk_u64 =
+                                u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+                            let mem_u64 = *(mem_node.cast::<u8>() as *const u64).add(i);
+                            disk_u64 != mem_u64
+                        })
+                        .count()
+                );
+                {
+                    let keys_off = core::mem::offset_of!(crate::btree::bset::btree_node, keys) / 8;
+                    crate::rewrite_log_debug!(
+                        "DEBUG keys_off={} mem_keys=[{}]",
+                        keys_off,
+                        (0..(*mem_node).keys.u64s as usize)
+                            .map(|j| format!(
+                                "{:#018x}",
+                                *(mem_node.cast::<u8>() as *const u64).add(keys_off + j)
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    crate::rewrite_log_debug!(
+                        "DEBUG disk_keys=[{}]",
+                        (0..(*mem_node).keys.u64s as usize)
+                            .map(|j| {
+                                let u = u64::from_le_bytes(
+                                    raw[(keys_off + j) * 8..(keys_off + j) * 8 + 8]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                format!("{u:#018x}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+            }
+            let read_ret = bch2_btree_node_read(&mut (*c).disk_sb, r);
+            crate::rewrite_log_debug!(
+                "DEBUG read_ret={} level={} btree={} written={}",
+                read_ret,
+                (*r).c.level,
+                (*r).c.btree_id,
+                (*r).written
+            );
+            assert_eq!(read_ret, 0, "btree 节点读回失败");
+            /* DEBUG：read 后 n/r 的状态快照 */
+            {
+                let snap = |tag: &str, b: *mut btree| {
+                    let base = (*b).data.cast::<u8>() as *const u64;
+                    crate::rewrite_log_debug!(
+                        "DEBUG after_read {tag}: node={} data={} nsets={} off17={:#x} key0_head={:#x} key0_v0={:#x}",
+                        b as usize,
+                        (*b).data as usize,
+                        (*b).nsets,
+                        *base.add(17),
+                        *base.add(20),
+                        *base.add(25)
+                    );
+                };
+                snap("n", n);
+                snap("r", r);
+                crate::rewrite_log_debug!("DEBUG after_read n==r: {}", core::ptr::eq(n, r));
+            }
+            /* 读回节点把磁盘上所有 bset 合并为单个 bset（去重 split
+             * 边界重复 key），key 总数与内存节点的首 bset 不必相同；
+             * 校验 key 集合（pos -> packed 字节）与内存一致。 */
+            unsafe fn collect_node_keys(
+                b: *mut btree,
+            ) -> std::collections::BTreeMap<(u64, u64, u32), Vec<u64>> {
+                let mut map = std::collections::BTreeMap::new();
+                for i in 0..(*b).nsets as usize {
+                    let t = (*b).set.as_mut_ptr().add(i);
+                    let mut k = crate::btree::types::btree_bkey_first(b, t);
+                    let end = crate::btree::types::btree_bkey_last(b, t);
+                    while k < end {
+                        {
+                            let pos = crate::btree::node_iter::bkey_unpack_pos(b, k);
+                            let (p_i, p_o, p_s) = unsafe {
+                                (
+                                    core::ptr::addr_of!(pos.inode).read_unaligned(),
+                                    core::ptr::addr_of!(pos.offset).read_unaligned(),
+                                    core::ptr::addr_of!(pos.snapshot).read_unaligned(),
+                                )
+                            };
+                            crate::rewrite_log_debug!(
+                                "collect set{i} off={} u64s={} type={} pos=({p_i},{p_o},{p_s})",
+                                (k as *mut u64).offset_from((*b).data.cast::<u64>())
+                                    - crate::btree::types::btree_bkey_first_offset(t) as isize
+                                    + crate::btree::types::btree_bkey_first_offset(t) as isize,
+                                (*k).u64s,
+                                (*k).type_,
+                            );
+                        }
+                        if (*k).type_ != crate::btree::bset::KEY_TYPE_deleted {
+                            let pos = crate::btree::node_iter::bkey_unpack_pos(b, k);
+                            let mut bytes =
+                                std::slice::from_raw_parts(k.cast::<u64>(), (*k).u64s as usize)
+                                    .to_vec();
+                            /* 对齐上游语义归一化后比较：
+                             * 1. mem_ptr（read.c:855 读回清零）是内存专属缓存，磁盘形态无意义；
+                             * 2. bkey_packed.format 的 0x80 位（KEY_FORMAT_LOCAL_BTREE）是
+                             *    needs_whiteout 内存暂存标记（write.c:697 写盘前标记、
+                             *    write.c:502 写盘后清除、read.c:863 读回重标），非磁盘内容。 */
+                            let key_words =
+                                crate::btree::bkey::bkeyp_key_u64s(&(*b).format, &*k) as usize;
+                            bytes[key_words] = 0;
+                            bytes[0] &= !(0x80u64 << 8);
+                            map.insert((pos.inode, pos.offset, pos.snapshot), bytes);
+                        }
+                        k = crate::btree::bkey::bkey_p_next(k);
+                    }
+                }
+                map
+            }
+            let mem_keys = collect_node_keys(n);
+            let read_keys = collect_node_keys(r);
+            {
+                let base = (*r).data.cast::<u8>() as *const u64;
+                crate::rewrite_log_debug!(
+                    "DEBUG pre-assert r: data={} k20={:#x} k25={:#x}",
+                    (*r).data as usize,
+                    *base.add(20),
+                    *base.add(25)
+                );
+                crate::rewrite_log_debug!(
+                    "DEBUG collect r (1,47): {:x?}",
+                    read_keys.get(&(1, 47, 0))
+                );
+                crate::rewrite_log_debug!(
+                    "DEBUG collect n (1,47): {:x?}",
+                    mem_keys.get(&(1, 47, 0))
+                );
+            }
+            assert_eq!(
+                read_keys,
+                mem_keys,
+                "读回节点的 key 集合必须与内存节点全部 bset 合并一致 (mem={} read={})",
+                mem_keys.len(),
+                read_keys.len()
+            );
+            assert_eq!((*(*r).data).keys.seq, (*(*n).data).keys.seq);
+            /* 对齐上游语义：read 后 keys.u64s 被合并排序改写（read.c:823
+             * b->data->keys.u64s = sorted->keys.u64s），而磁盘 csum 覆盖的是
+             * 首写时 btree_node 头 + 当时的 key 数据（io.rs 写盘路径
+             * data[16..header_bytes + u64s*8]），故必须从磁盘原始扇区重算。 */
+            use std::os::unix::fs::FileExt;
+            let file = &*(*c).disk_sb.s_bdev_file.cast::<std::fs::File>();
+            let ptrs = bch2_bkey_ptrs_c(bkey_s_c {
+                k: &(*n).key.k,
+                v: &(*n).key.v,
+            });
+            let disk_off = crate::btree::bset::BCH_EXTENT_PTR_OFFSET(&(*ptrs.start).ptr) * 512;
+            let mut raw = vec![0u8; 4096];
+            let nread = file.read_at(&mut raw, disk_off).unwrap_or(0);
+            assert!(
+                nread >= core::mem::size_of::<crate::btree::bset::btree_node>(),
+                "磁盘首扇区读取不足 (nread={nread})"
+            );
+            let dnode = raw.as_ptr().cast::<crate::btree::bset::btree_node>();
+            let disk_u64s = (*dnode).keys.u64s as usize;
+            let bytes = core::mem::size_of::<crate::btree::bset::btree_node>() + disk_u64s * 8;
+            let recomputed = bch2_checksum(BCH_CSUM_xxhash, &raw[16..bytes]);
+            assert_eq!(
+                recomputed,
+                (*dnode).csum,
+                "磁盘 xxhash csum 必须与重算一致 (computed={recomputed:?} disk={:?} off={disk_off} u64s={disk_u64s})",
+                (*dnode).csum
+            );
+            bch2_btree_node_mem_free(c, r);
+        }
+
+        let dir = persistent_test_path("t0210-ac2");
+        let mut engine = StorageEngine::create_persistent(&dir).unwrap();
+        for offset in 4..=7u64 {
+            engine.add_free_bucket(offset);
+        }
+        /* 第一轮：512 个 key（16/事务）强制多层 split —— 所有树内节点
+         * 均为 split 创建、携带磁盘 extent，且 commit 路径已自动写盘
+         * （update.rs bch2_trans_commit_pending_interior）。 */
+        for start in (0..512u64).step_by(16) {
+            let mut transaction = engine.transaction();
+            for i in start..start + 16 {
+                transaction.put(BtreeId::DEFAULT, key(i, &[i * 2]));
+            }
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            engine
+                .get(BtreeId::DEFAULT, KeyPosition::new(1, 511, 0))
+                .unwrap()
+                .unwrap()
+                .position(),
+            KeyPosition::new(1, 511, 0)
+        );
+        {
+            let mut fs = engine.lock_fs().unwrap();
+            let c: *mut bch_fs = &mut **fs;
+            let mut trans = btree_trans::default();
+            unsafe {
+                bch2_trans_init(&mut trans, c);
+                let root = bch2_btree_id_root_b(c, 0);
+                assert!(!root.is_null(), "树根必须存在");
+                let mut nodes: Vec<*mut btree> = Vec::new();
+                collect_nodes(root, &mut nodes);
+                assert!(nodes.len() >= 2, "512 key 必须触发至少一次 split");
+                for &n in &nodes {
+                    /* split 创建的每个节点都必须携带磁盘 extent，且
+                     * commit 已自动写盘（sectors_written > 0）。 */
+                    assert_eq!((*n).key.k.type_, KEY_TYPE_btree_ptr_v2);
+                    let ptrs = bch2_bkey_ptrs_c(bkey_s_c {
+                        k: &(*n).key.k,
+                        v: &(*n).key.v,
+                    });
+                    assert!(
+                        !ptrs.start.is_null() && ptrs.start < ptrs.end,
+                        "树内节点必须携带磁盘 extent"
+                    );
+                    let btp = bkey_i_to_btree_ptr_v2(&mut (*n).key);
+                    assert!((*btp).v.sectors_written > 0, "split 节点必须已自动写盘");
+                    crate::rewrite_log_debug!(
+                        "DEBUG node level={} u64s={} written={} off={} sectors={}",
+                        (*n).c.level,
+                        (*(*n).data).keys.u64s,
+                        (*n).written,
+                        crate::btree::bset::BCH_EXTENT_PTR_OFFSET(&(*ptrs.start).ptr),
+                        (*btp).v.sectors_written
+                    );
+                    /* 手动重写（幂等）后 round-trip 校验。 */
+                    assert_eq!(__bch2_btree_node_write(&mut (*c).disk_sb, n), 0);
+                    assert_eq!((*n).written, (*btp).v.sectors_written);
+                    verify_roundtrip(c, &mut trans, n);
+                }
+                bch2_trans_put(&mut trans);
+            }
+            drop(fs);
+        }
+        /* 第二轮：再写 512 个 key —— 命中已写盘叶子 → bset 追加 →
+         * sectors_written 单调不降（追加/覆盖扇区正确），读回数据完整。 */
+        for start in (512..1024u64).step_by(16) {
+            let mut transaction = engine.transaction();
+            for i in start..start + 16 {
+                transaction.put(BtreeId::DEFAULT, key(i, &[i * 2]));
+            }
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            engine
+                .get(BtreeId::DEFAULT, KeyPosition::new(1, 1023, 0))
+                .unwrap()
+                .unwrap()
+                .position(),
+            KeyPosition::new(1, 1023, 0)
+        );
+        {
+            let mut fs = engine.lock_fs().unwrap();
+            let c: *mut bch_fs = &mut **fs;
+            let mut trans = btree_trans::default();
+            unsafe {
+                bch2_trans_init(&mut trans, c);
+                let root = bch2_btree_id_root_b(c, 0);
+                let mut nodes: Vec<*mut btree> = Vec::new();
+                collect_nodes(root, &mut nodes);
+                for &n in &nodes {
+                    let btp = bkey_i_to_btree_ptr_v2(&mut (*n).key);
+                    let before = (*btp).v.sectors_written;
+                    assert_eq!(__bch2_btree_node_write(&mut (*c).disk_sb, n), 0);
+                    assert!(
+                        (*btp).v.sectors_written >= before,
+                        "追加重写后 sectors_written 不得回退"
+                    );
+                    verify_roundtrip(c, &mut trans, n);
+                }
+                bch2_trans_put(&mut trans);
+            }
+            drop(fs);
+        }
+        let _ = fs::remove_file(&dir);
     }
 }

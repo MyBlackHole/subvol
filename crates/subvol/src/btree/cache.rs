@@ -286,6 +286,7 @@ pub unsafe fn bch2_btree_node_transition_state_locked(
     if old == new {
         return 0;
     }
+    crate::rewrite_log_debug!("transition_state b={:p} old={:?} new={:?}", b, old, new);
     assert!(!btree_node_state_has_buffer(old) || !(*b).data.is_null());
     assert!(!btree_node_state_has_buffer(new) || !(*b).data.is_null());
     assert!(btree_node_state_hashed(new) || !btree_node_dirty(b));
@@ -514,6 +515,10 @@ pub unsafe fn bch2_btree_node_mem_alloc(
         while pos != head {
             let next = (*pos).next;
             let node = pos.cast::<u8>().sub(list_offset).cast::<btree>();
+            crate::rewrite_log_debug!(
+                "mem_alloc freeable scan: node={node:p} state={:#x}",
+                (*node).c.lock.state.load(Ordering::Relaxed)
+            );
             if pcpu_read_locks == (*node).c.lock.readers.is_some()
                 && six_trylock_intent(&(*node).c.lock)
             {

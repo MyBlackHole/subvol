@@ -407,6 +407,10 @@ pub struct bch_fs_btree {
      * 由无锁时机（root_read 末尾 / engine 操作边界）
      * bch2_do_pending_node_rewrites 同步执行 */
     pub node_rewrites: Mutex<Vec<btree_node_rewrite_item>>,
+    /* interior_types.h:19-26 bch_fs_btree_reserve_cache：已分配未消费的
+     * 节点 key 缓存（bch2_btree_reserve_put 回填 / __bch2_btree_node_alloc
+     * 复用）。 */
+    pub reserve_cache: crate::btree::alloc::btree_reserve_cache,
 }
 
 /* interior.c:3390-3396 async_btree_rewrite 的域内等价：记录
@@ -529,6 +533,9 @@ pub struct bch_fs {
     pub fault_inject_discard_restarts: AtomicU32,
     pub devs_online: crate::btree::bset::bch_devs_mask,
     pub disk_sb: crate::sb::bch_sb_handle,
+    /* allocator（fs/alloc/types.h 的 bch_fs_allocator 域内子集）：btree
+     * 写点 + open_bucket 记账 + reserve_cache。 */
+    pub allocator: crate::btree::alloc::bch_fs_allocator,
     pub btree: bch_fs_btree,
     pub journal: crate::journal::journal,
     pub journal_keys: journal_keys,

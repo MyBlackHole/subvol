@@ -1713,6 +1713,14 @@ unsafe fn bch2_btree_bset_insert_key_inlined(
     if !k.is_null() && !bpos_eq(bkey_unpack_pos(b, k), (*insert).k.p) {
         k = core::ptr::null_mut();
     }
+    crate::rewrite_log_debug!(
+        "bset_insert inlined: level={} id={} insert.type={} insert.format={:#x} k_null={}",
+        (*b).c.level,
+        (*b).c.btree_id,
+        (*insert).k.type_,
+        (*insert).k.format,
+        k.is_null()
+    );
     assert!(k.is_null() || !bkey_deleted(&*k));
 
     if bkey_deleted(&*(insert.cast::<bkey_packed>())) && k.is_null() {
@@ -2961,6 +2969,14 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
         }
         acc_u64s += required_u64s;
         last_leaf = b;
+        let _pre_remaining = super::interior::bch2_btree_keys_u64s_remaining(b);
+        let _pre_want = super::interior::want_new_bset((*trans).c, b);
+        crate::rewrite_log_debug!(
+            "commit precheck idx={idx} b={b:p} L{} acc={acc_u64s} remaining={_pre_remaining} want_new={} u64s={}",
+            (*b).c.level,
+            _pre_want.is_null() as u8,
+            (*(*i).k).k.u64s
+        );
         if !super::interior::bch2_btree_node_insert_fits(b, acc_u64s)
             && super::interior::want_new_bset((*trans).c, b).is_null()
         {
@@ -3088,18 +3104,16 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
     }
     (*trans).write_locked = true;
 
-    /* commit.c serializes the overlay check with all replay-time mutations:
-     * a key that changed underneath this transaction requires a restart,
-     * while a successful commit subsequently drops its overlay visibility. */
+    /* commit.c trans_commit_to_journal_replay_pre（commit.c:745-756）：
+     * overwrite_lock 只在 overlay 检查期间短暂持有；写 btree 与后续
+     * split/merge（interior 内同样 lock overwrite_lock）期间必须已
+     * 释放，否则同线程递归 Mutex 自死锁。 */
     let journal_replay = (*trans).journal_replay_not_finished;
     let journal_keys = core::ptr::addr_of_mut!((*(*trans).c).journal_keys);
-    let _journal_keys_lock = if journal_replay {
-        Some((&(*journal_keys).overwrite_lock).lock().unwrap())
-    } else {
-        None
-    };
     if journal_replay {
+        let _journal_keys_lock = (&(*journal_keys).overwrite_lock).lock().unwrap();
         let ret = bch2_check_drop_overwrites_from_journal(trans, true);
+        drop(_journal_keys_lock);
         if ret != 0 {
             for held in locked[..nr_locked].iter().rev() {
                 six_unlock_write(&(**held).c.lock);
@@ -3196,11 +3210,51 @@ pub unsafe fn bch2_trans_commit(trans: *mut btree_trans) -> i32 {
     for idx in 0..(*trans).nr_updates as usize {
         let i = (*trans).updates.add(idx);
         let path = (*trans).paths.add((*i).path as usize);
+        let b = (*path).l[(*i).level as usize].b;
+        let ins_u64s = (*(*i).k).k.u64s as u32;
+        let ins_remaining = super::interior::bch2_btree_keys_u64s_remaining(b);
+        let ins_want = super::interior::want_new_bset((*trans).c, b);
+        crate::rewrite_log_debug!(
+            "commit insert idx={idx} b={b:p} L{} u64s={ins_u64s} remaining={ins_remaining} want_new={}",
+            (*b).c.level,
+            ins_want.is_null() as u8
+        );
+        /* 对齐上游 commit.c btree_key_can_insert（1082-1105）：插入前
+         * 实时判定剩余空间（锁已持、逐 key），不满足则分裂并 restart。
+         * 预检循环的 acc 判定基于事务开始时剩余，同叶多 key 时可能
+         * 误判 fits，故此处为必需兜底。
+         * 分裂前必须先释放全部 write 锁（对齐 do_bch2_trans_commit 的
+         * bch2_trans_unlock_updates_write 在错误路径 split 之前的顺序）：
+         * split 内部 bch2_btree_node_lock_write 会重新 trylock write，
+         * 若本事务仍持有该节点 write 锁，six trylock 将断言失败。 */
+        if !super::interior::bch2_btree_node_insert_fits(b, ins_u64s)
+            && super::interior::want_new_bset((*trans).c, b).is_null()
+        {
+            crate::rewrite_log_debug!(
+                "commit insert split_leaf idx={idx} u64s={ins_u64s} remaining={ins_remaining}"
+            );
+            for held in locked[..nr_locked].iter().rev() {
+                six_unlock_write(&(**held).c.lock);
+            }
+            (*trans).write_locked = false;
+            nr_locked = 0;
+            let ret = super::interior::bch2_btree_split_leaf(trans, (*i).path, ins_u64s, 0);
+            if ret != 0 {
+                crate::rewrite_log_error!("transaction split failed ret={ret}");
+                return ret;
+            }
+            crate::rewrite_log_debug!("transaction requested restart after insert split");
+            (*trans).restarted = 4;
+            return -4;
+        }
         bch2_btree_insert_key_leaf(trans, path, (*i).k, journal_seq);
     }
 
     if journal_replay {
+        /* commit.c trans_commit_to_journal_replay_post（commit.c:758-765） */
+        let _journal_keys_lock = (&(*journal_keys).overwrite_lock).lock().unwrap();
         let _ = bch2_check_drop_overwrites_from_journal(trans, false);
+        drop(_journal_keys_lock);
     }
 
     for held in locked[..nr_locked].iter().rev() {

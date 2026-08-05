@@ -235,6 +235,13 @@ unsafe fn __bch2_members_v2_get_mut(
 
 unsafe fn bch2_members_v2_get(members: *mut bch_sb_field_members_v2, index: usize) -> bch_member {
     let mut ret = bch_member::default();
+    if members.is_null() {
+        /* 域内防御：interior 单元测试为纯内存模式（无磁盘设备），sb 无
+         * members 字段；上游 bch2_member 假定 sb 永远有效（真实设备）。
+         * 空 members 返回全 0 member（bucket_size=0），调用方按"设备
+         * 不可用"处理（alloc.rs freelist 返回 -1，不 panic）。 */
+        return ret;
+    }
     core::ptr::copy_nonoverlapping(
         __bch2_members_v2_get_mut(members, index).cast::<u8>(),
         (&mut ret as *mut bch_member).cast::<u8>(),

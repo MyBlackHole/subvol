@@ -1,3 +1,4 @@
+pub mod alloc;
 pub mod bkey;
 pub mod bset;
 pub mod bset_build;

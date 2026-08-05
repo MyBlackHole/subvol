@@ -345,6 +345,40 @@ pub unsafe fn __bch2_btree_node_write(sb: *mut bch_sb_handle, b: *mut btree) -> 
         );
         journal_seq = journal_seq.max((*disk_set).journal_seq);
     }
+    if !first && journal_seq == 0 {
+        crate::rewrite_log_debug!(
+            "DEBUG zero-seq write: level={} written={} nsets={} btree={} seq={} sets=[{}]",
+            (*b).c.level,
+            (*b).written,
+            (*b).nsets,
+            (*b).c.btree_id,
+            (*(*b).data).keys.seq,
+            (0..(*b).nsets as usize)
+                .map(|i| (*super::types::bset(b, (*b).set.as_ptr().add(i)))
+                    .journal_seq
+                    .to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    if !first {
+        crate::rewrite_log_debug!(
+            "DEBUG re-write: level={} written={} nsets={} sets=[{}] first_off={} end_off={}",
+            (*b).c.level,
+            (*b).written,
+            (*b).nsets,
+            (0..(*b).nsets as usize)
+                .map(|i| format!(
+                    "{}+{}",
+                    (*b).set.as_ptr().add(i).read_unaligned().data_offset,
+                    (*b).set.as_ptr().add(i).read_unaligned().end_offset
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            (*b).set.as_ptr().read_unaligned().data_offset,
+            (*b).set.as_ptr().read_unaligned().end_offset
+        );
+    }
     assert!(first || journal_seq != 0);
 
     bytes += 8;
@@ -391,6 +425,41 @@ pub unsafe fn __bch2_btree_node_write(sb: *mut bch_sb_handle, b: *mut btree) -> 
     (*b).whiteout_u64s = 0;
     if first {
         assert_eq!((*set).u64s, (*(*b).data).keys.u64s);
+        crate::rewrite_log_debug!(
+            "DEBUG buf[20]={:#018x} mem[20]={:#018x} bufval0={:#018x} memval0={:#018x}",
+            *(set.cast::<u64>().add(3)),
+            *((*b).data.cast::<u8>() as *const u64).add(20),
+            *(set.cast::<u64>().add(3 + 5)),
+            *((*b).data.cast::<u8>() as *const u64).add(20 + 5)
+        );
+        let mem_keys = (*(*b).data).keys.u64s;
+        let mem_base = ((*b).data as *const u8).add(
+            core::mem::offset_of!(btree_node, keys) + core::mem::size_of::<super::bset::bset>(),
+        );
+        let disk_base = set.cast::<u64>().add(3).cast::<u8>();
+        let mut diff = 0usize;
+        for i in 0..mem_keys as usize {
+            let m = *(mem_base as *const u64).add(i);
+            let d = *(disk_base as *const u64).add(i);
+            if m != d && diff < 6 {
+                crate::rewrite_log_debug!(
+                    "DEBUG sortdiff[{i}] mem={m:#018x} disk={d:#018x} (level={} btree={})",
+                    (*b).c.level,
+                    (*b).c.btree_id
+                );
+                diff += 1;
+            }
+        }
+        crate::rewrite_log_debug!(
+            "DEBUG sortdiff_total={} mem_keys={} level={}",
+            (0..mem_keys as usize)
+                .filter(|&i| {
+                    *(mem_base as *const u64).add(i) != *(disk_base as *const u64).add(i)
+                })
+                .count(),
+            mem_keys,
+            (*b).c.level
+        );
     }
     super::bset_build::bch2_set_bset_needs_whiteout(set, 0);
     if !first && (*set).u64s == 0 {
@@ -424,6 +493,43 @@ pub unsafe fn __bch2_btree_node_write(sb: *mut bch_sb_handle, b: *mut btree) -> 
             Ok(nr) => written += nr,
             Err(_) => return -6,
         }
+    }
+    crate::rewrite_log_debug!(
+        "DEBUG WRITE off={} bytes={} first={} seq={} level={} btree={} u64s={}",
+        BCH_EXTENT_PTR_OFFSET(&ptr) * 512,
+        data.len(),
+        first,
+        (*(*b).data).keys.seq,
+        (*b).c.level,
+        (*b).c.btree_id,
+        (*set).u64s
+    );
+    {
+        let mut verify = vec![0u8; data.len()];
+        let _ = file.read_at(&mut verify, disk_offset);
+        let mut ndiff = 0usize;
+        for i in 0..data.len().min(verify.len()) / 8 {
+            let d = u64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
+            let v = u64::from_le_bytes(verify[i * 8..i * 8 + 8].try_into().unwrap());
+            if d != v && ndiff < 8 {
+                crate::rewrite_log_debug!(
+                    "DEBUG writeback u64[{i}] wrote={d:#018x} read={v:#018x}"
+                );
+                ndiff += 1;
+            }
+        }
+        crate::rewrite_log_debug!(
+            "DEBUG writeback_total={} bytes={} first={}",
+            (0..data.len() / 8)
+                .filter(|&i| {
+                    let d = u64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
+                    let v = u64::from_le_bytes(verify[i * 8..i * 8 + 8].try_into().unwrap());
+                    d != v
+                })
+                .count(),
+            data.len(),
+            first
+        );
     }
 
     let btree_ptr = bkey_i_to_btree_ptr_v2(&mut (*b).key);
@@ -670,6 +776,13 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
             if (*key).type_ == KEY_TYPE_btree_ptr_v2 {
                 let key_words = bkeyp_key_u64s(&(*b).format, &*key) as usize;
                 *((key as *mut u64).add(key_words)) = 0;
+                crate::rewrite_log_debug!(
+                    "DEBUG read zero mem_ptr: node={} off={} k_words={} u64s={}",
+                    b as *mut crate::btree::types::btree as usize,
+                    ((key as *mut u64).offset_from(set.cast::<u64>()) as i64) - 3,
+                    key_words,
+                    (*key).u64s
+                );
             }
             prev = key;
             key = bkey_p_next(key);
@@ -680,6 +793,11 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
         super::bset_build::sort_iter_add(&mut sort.iter, key_start, end);
         written += sectors;
     }
+    crate::rewrite_log_debug!(
+        "DEBUG readloop: used={} level={}",
+        sort.iter.used,
+        (*b).c.level
+    );
     if ptr_written != 0 && written != ptr_written {
         // 对齐 read.c btree_node_data_missing（FSCK_CAN_FIX）：报告后继续
         crate::rewrite_log_error!(
@@ -709,6 +827,41 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
         &mut sort.iter,
     );
     let compact_u64s = (*sorted_set).u64s as usize;
+    crate::rewrite_log_debug!(
+        "DEBUG compact: in_used={} compact_u64s={} bset_u64s={} level={}",
+        sort.iter.used,
+        compact_u64s,
+        (*sorted_set).u64s,
+        (*b).c.level
+    );
+    if (*b).c.level <= 2 {
+        let base = sorted_set.cast::<u64>().add(3);
+        let mut k = base.cast::<super::bkey::bkey_packed>();
+        let end = base.add(compact_u64s).cast();
+        let mut idx = 0;
+        while k < end {
+            let pos = super::node_iter::bkey_unpack_pos(b, k);
+            let (p_i, p_o, p_s) = unsafe {
+                (
+                    core::ptr::addr_of!(pos.inode).read_unaligned(),
+                    core::ptr::addr_of!(pos.offset).read_unaligned(),
+                    core::ptr::addr_of!(pos.snapshot).read_unaligned(),
+                )
+            };
+            let words = core::slice::from_raw_parts(k.cast::<u64>(), 6.min((*k).u64s as usize));
+            crate::rewrite_log_debug!(
+                "DEBUG compact key[{idx}] u64s={} type={} pos=({p_i},{p_o},{p_s}) words={:x?}",
+                (*k).u64s,
+                (*k).type_,
+                words
+            );
+            k = super::bkey::bkey_p_next(k);
+            idx += 1;
+            if idx > 12 {
+                break;
+            }
+        }
+    }
     node.keys.u64s = (*sorted_set).u64s;
     core::ptr::copy_nonoverlapping(
         node as *const btree_node as *const u64,
@@ -721,6 +874,14 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
         sorted.len(),
     );
     node.keys.journal_seq = max_journal_seq;
+    crate::rewrite_log_debug!(
+        "DEBUG read tail: node={} data={} sorted20={:#x} node20={:#x} keys_u64s={}",
+        b as usize,
+        (*b).data as usize,
+        *sorted.as_ptr().add(20),
+        *(node as *const btree_node as *const u64).add(20),
+        node.keys.u64s
+    );
 
     (*b).nsets = 1;
     (*b).set[0] = bset_tree {

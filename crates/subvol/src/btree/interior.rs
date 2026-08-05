@@ -533,6 +533,7 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
     }
 
     let allocate_node = |level: u8| {
+        let c = (*trans).c;
         let node = super::cache::bch2_btree_node_mem_alloc(trans, level != 0);
         assert!(!node.is_null());
         /* bch2_btree_node_mem_alloc() returns a preallocated node with
@@ -569,7 +570,20 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         }
         super::bset_build::bch2_bset_init_first(node, &mut (*(*node).data).keys);
         super::bset_build::bch2_btree_build_aux_trees(node);
-        node
+        /* __bch2_btree_node_alloc（interior.c:451-505）的扇区部分：
+         * 新节点 key 经 bch2_alloc_sectors_append_ptrs 必带磁盘 extent
+         * （dev/offset/gen），节点写盘（io.rs __bch2_btree_node_write）
+         * 依赖 key 中的 extent ptr；分配失败（如磁盘空间不足）释放节点
+         * 并返回 errno，对齐 reserve_get 失败路径（interior.c:714-721）。 */
+        let sectors_ret = super::alloc::bch2_btree_node_alloc_sectors(c, node);
+        if sectors_ret != 0 {
+            crate::lock::six::six_unlock_write(&(*node).c.lock);
+            crate::lock::six::six_unlock_intent(&(*node).c.lock);
+            super::cache::bch2_btree_node_data_free(node);
+            super::cache::bch2_btree_node_mem_free(c, node);
+            return Err(sectors_ret);
+        }
+        Ok(node)
     };
     let cache_ptr = &mut (*c).btree.cache as *mut super::types::bch_fs_btree_cache;
     let cache_initialized = (*cache_ptr).table_init_done;
@@ -609,6 +623,15 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         }
         super::types::clear_btree_node_permanent(node);
         super::types::clear_btree_node_noevict(node);
+        crate::rewrite_log_debug!(
+            "retire_node node=0x{:x} state={:x}",
+            node as usize,
+            (*node)
+                .c
+                .lock
+                .state
+                .load(core::sync::atomic::Ordering::Relaxed)
+        );
         if cache_initialized {
             /* bcachefs leaves the superseded root hashed until its normal
              * btree write completes.  This engine persists this mutation
@@ -627,8 +650,17 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         }
     };
 
-    let left = allocate_node(0);
-    let right = allocate_node(0);
+    let left = match allocate_node(0) {
+        Ok(node) => node,
+        Err(ret) => return ret,
+    };
+    let right = match allocate_node(0) {
+        Ok(node) => node,
+        Err(ret) => {
+            release_node(left);
+            return ret;
+        }
+    };
     btree_set_min(left, (*(*src).data).min_key);
     btree_set_max(left, pivot);
     btree_set_min(right, super::bkey::bpos_successor(pivot));
@@ -685,6 +717,15 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         (*disk_set).u64s = output[side]
             .cast::<u64>()
             .offset_from(disk_set.cast::<u64>().add(3)) as u16;
+        /* 对齐 sort.c:498-501 "Make sure we preserve bset journal_seq"：
+         * 拆分内容继承 src 各 bset 的最大 journal_seq，保证节点二次
+         * 写盘满足 write.c:470 BUG_ON(b->written && !seq)。 */
+        let mut src_seq = 0u64;
+        for set_idx in 0..(*src).nsets as usize {
+            src_seq = src_seq
+                .max((*super::types::bset(src, (*src).set.as_ptr().add(set_idx))).journal_seq);
+        }
+        (*disk_set).journal_seq = src_seq;
         super::types::set_btree_bset_end(nodes[side], (*nodes[side]).set.as_mut_ptr());
         btree_node_reset_sib_u64s(nodes[side]);
         super::bset_build::bch2_btree_build_aux_trees(nodes[side]);
@@ -692,28 +733,38 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         super::bset_update::__bch2_verify_btree_nr_keys(nodes[side]);
     }
 
-    let child_ptr = |child: *mut btree| super::bset::bkey_i_btree_ptr_v2 {
-        k: super::bkey::bkey {
+    let child_ptr = |child: *mut btree, out: *mut super::bset::bkey_i_btree_ptr_v2| {
+        (*out).k = super::bkey::bkey {
             u64s: 10,
             format: super::bkey::KEY_FORMAT_CURRENT,
             type_: super::bset::KEY_TYPE_btree_ptr_v2,
             p: (*(*child).data).max_key,
             ..Default::default()
-        },
-        v: super::bset::bch_btree_ptr_v2 {
+        };
+        (*out).v = super::bset::bch_btree_ptr_v2 {
             mem_ptr: child as usize as u64,
             seq: (*(*child).data).keys.seq,
             min_key: (*(*child).data).min_key,
             ..Default::default()
-        },
+        };
+        /* 同 rewrite（2088-2104 注释）：allocate_node 时 alloc_sectors 已把
+         * 磁盘 extent 写入节点 key（bch2_alloc_sectors_append_ptrs 语义，
+         * interior.c:515-518），child_ptr 重建 key 时必须继承该 extent，
+         * 否则节点写盘（io.rs __bch2_btree_node_write 依赖 key extent）
+         * 返回 -2。mem_ptr 键场景（无 extent）则跳过。 */
+        let old_ptrs = super::bset::bch2_bkey_ptrs_c(super::bkey::bkey_s_c {
+            k: &(*child).key.k,
+            v: &(*child).key.v,
+        });
+        if !old_ptrs.start.is_null() && old_ptrs.start < old_ptrs.end {
+            super::bset::bch2_bkey_append_ptr(c, out.cast(), (*old_ptrs.start).ptr);
+        }
     };
 
     for side in 0..2 {
-        let ptr = child_ptr(nodes[side]);
-        super::bkey::bkey_copy(
-            &mut (*nodes[side]).key,
-            (&ptr as *const super::bset::bkey_i_btree_ptr_v2).cast(),
-        );
+        let mut ptr_buf = [0u64; 16];
+        child_ptr(nodes[side], ptr_buf.as_mut_ptr().cast());
+        super::bkey::bkey_copy(&mut (*nodes[side]).key, ptr_buf.as_ptr().cast());
     }
 
     if cache_initialized {
@@ -766,7 +817,11 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
         let old_pos = (*(*old_node).data).max_key;
 
         if parent.is_null() {
-            crate::rewrite_log_debug!("btree split making new root");
+            crate::rewrite_log_debug!(
+                "btree split making new root old_node=0x{:x} parent_level={}",
+                old_node as usize,
+                parent_level
+            );
             if parent_level >= super::bset::BTREE_MAX_DEPTH as usize {
                 release_paths(&replacement_paths);
                 for node in replacement {
@@ -774,7 +829,22 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
                 }
                 return -12;
             }
-            let root = allocate_node(parent_level as u8);
+            let root = match allocate_node(parent_level as u8) {
+                Ok(node) => node,
+                Err(ret) => {
+                    release_paths(&replacement_paths);
+                    for node in replacement {
+                        release_node(node);
+                    }
+                    return ret;
+                }
+            };
+            crate::rewrite_log_debug!(
+                "split new root=0x{:x} replacement=[0x{:x}, 0x{:x}]",
+                root as usize,
+                replacement[0] as usize,
+                replacement[1] as usize
+            );
             (*root).format = super::bkey::BKEY_FORMAT_CURRENT;
             (*root).nr_key_bits = super::bkey::bkey_format_key_bits(&(*root).format) as u8;
             super::bkey::bch2_compute_bkey_unpack_consts(root);
@@ -786,10 +856,14 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             assert!((*root_path).l[parent_level].b.is_null());
             super::iter::btree_path_take_new_node(trans, root_path, root);
             for child in replacement {
-                let mut ptr = child_ptr(child);
+                let mut ptr_buf = [0u64; 16];
+                child_ptr(child, ptr_buf.as_mut_ptr().cast());
+                let ptr = ptr_buf
+                    .as_mut_ptr()
+                    .cast::<super::bset::bkey_i_btree_ptr_v2>();
                 let last = super::types::bset_tree_last(root);
                 let mut insert_iter = super::types::btree_node_iter::default();
-                super::node_iter::bch2_btree_node_iter_init(c, root, &mut insert_iter, &ptr.k.p);
+                super::node_iter::bch2_btree_node_iter_init(c, root, &mut insert_iter, &(*ptr).k.p);
                 let where_ =
                     super::node_iter::bch2_btree_node_iter_bset_pos(&mut insert_iter, root, last);
                 if (*trans).journal_replay_not_finished {
@@ -799,24 +873,28 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
                         c,
                         (*root).c.btree_id,
                         (*root).c.level,
-                        ptr.k.p,
+                        (*ptr).k.p,
                         false,
                     );
                 }
-                super::bset_update::bch2_bset_insert(
-                    root,
-                    where_,
-                    (&mut ptr as *mut super::bset::bkey_i_btree_ptr_v2).cast(),
-                    0,
-                );
+                super::bset_update::bch2_bset_insert(root, where_, ptr_buf.as_mut_ptr().cast(), 0);
             }
             btree_node_reset_sib_u64s(root);
+            /* 同 left/right 填充（sort.c:498-501）：root 内容为指向
+             * replacement 的 child key，journal_seq 继承其最大 seq。 */
+            let mut root_seq = 0u64;
+            for node in replacement {
+                for set_idx in 0..(*node).nsets as usize {
+                    root_seq = root_seq.max(
+                        (*super::types::bset(node, (*node).set.as_ptr().add(set_idx))).journal_seq,
+                    );
+                }
+            }
+            (*(*root).data).keys.journal_seq = root_seq;
             super::bset_build::bch2_btree_build_aux_trees(root);
-            let root_ptr = child_ptr(root);
-            super::bkey::bkey_copy(
-                &mut (*root).key,
-                (&root_ptr as *const super::bset::bkey_i_btree_ptr_v2).cast(),
-            );
+            let mut root_buf = [0u64; 16];
+            child_ptr(root, root_buf.as_mut_ptr().cast());
+            super::bkey::bkey_copy(&mut (*root).key, root_buf.as_ptr().cast());
             if cache_initialized {
                 let _ = super::cache::bch2_btree_node_transition_state(
                     cache_ptr,
@@ -830,6 +908,15 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             bch2_btree_set_root_for_read(c, root);
 
             retire_node(old_node);
+            crate::rewrite_log_debug!(
+                "split making new root after retire: old_node=0x{:x} state={:x}",
+                old_node as usize,
+                (*old_node)
+                    .c
+                    .lock
+                    .state
+                    .load(core::sync::atomic::Ordering::Relaxed)
+            );
             super::iter::bch2_trans_node_add(trans, root);
             for node in replacement.iter().rev() {
                 super::iter::bch2_trans_node_add(trans, *node);
@@ -837,11 +924,45 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             super::iter::bch2_trans_node_verify_not_in_iters(trans, old_node);
 
             release_paths(&replacement_paths);
+            /* 对齐 bch2_btree_update_new_node（interior.c:1303）：
+             * 新节点创建完成即写盘（write_trans 要求 dirty，root 已
+             * set_dirty）。写序：节点 bset 头 journal_seq 落后于
+             * journal 记录（write.c:485 读时过滤），崩溃时以 journal
+             * 为准，节点实体写盘不破坏一致性。 */
+            super::io::bch2_btree_node_write_trans(
+                trans,
+                root,
+                crate::lock::six::six_lock_type::SIX_LOCK_write,
+                0,
+            );
+            for node in replacement {
+                super::io::bch2_btree_node_write_trans(
+                    trans,
+                    node,
+                    crate::lock::six::six_lock_type::SIX_LOCK_write,
+                    0,
+                );
+            }
             /* The temporary paths drop their recursive references first;
              * consume the allocator-owned primary references afterwards, as
              * btree_update_done() does after interior.c's out: cleanup. */
             crate::lock::six::six_unlock_write(&(*root).c.lock);
             crate::lock::six::six_unlock_intent(&(*root).c.lock);
+            crate::rewrite_log_debug!(
+                "split making new root done: old_node=0x{:x} state={:x} root=0x{:x} state={:x}",
+                old_node as usize,
+                (*old_node)
+                    .c
+                    .lock
+                    .state
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                root as usize,
+                (*root)
+                    .c
+                    .lock
+                    .state
+                    .load(core::sync::atomic::Ordering::Relaxed)
+            );
             for node in replacement {
                 crate::lock::six::six_unlock_write(&(*node).c.lock);
                 crate::lock::six::six_unlock_intent(&(*node).c.lock);
@@ -913,18 +1034,72 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             let old_set_idx = old_set.offset_from((*parent).set.as_ptr()) as usize;
             super::bset_update::btree_keys_account_key(&mut (*parent).nr, old_set_idx, old, -1);
             let old_u64s = (*old).u64s as u32;
+            let old_had_whiteout = (*old).format & 0x80 != 0;
             (*old).type_ = 0;
+            /* 对齐 commit.c:198-203 bch2_btree_bset_insert_key_inlined：
+             * 置白的旧 key 若带 needs_whiteout（已写盘），新 key 继承该
+             * 标记（其进入 last bset 后仍视作已写盘区域），旧 key 清除。 */
+            if old_had_whiteout {
+                (*old).format &= 0x7f;
+            }
             if old_writeable {
                 super::bset_update::bch2_bset_delete(parent, old, old_u64s);
             }
 
-            let mut left_key = child_ptr(replacement[0]);
-            let mut right_key = child_ptr(replacement[1]);
-            for ptr in [&mut left_key, &mut right_key] {
+            let mut left_key = [0u64; 16];
+            let mut right_key = [0u64; 16];
+            child_ptr(replacement[0], left_key.as_mut_ptr().cast());
+            child_ptr(replacement[1], right_key.as_mut_ptr().cast());
+            let old_pos = super::node_iter::bkey_unpack_pos(parent, old);
+            if old_had_whiteout {
+                for key in [&mut left_key, &mut right_key] {
+                    let k = key.as_mut_ptr().cast::<super::bset::bkey_i_btree_ptr_v2>();
+                    if super::bkey::bpos_eq((*k).k.p, old_pos) {
+                        (*k).k.format |= 0x80;
+                    }
+                }
+            }
+            {
+                let lp = (*(left_key.as_ptr().cast::<super::bset::bkey_i_btree_ptr_v2>()))
+                    .k
+                    .p;
+                let rp = (*(right_key
+                    .as_ptr()
+                    .cast::<super::bset::bkey_i_btree_ptr_v2>()))
+                .k
+                .p;
+                crate::rewrite_log_debug!(
+                    "fits parent level={} old={:?} old_w={} nsets={} left={:?} right={:?}",
+                    (*parent).c.level,
+                    old_pos,
+                    old_writeable,
+                    (*parent).nsets,
+                    lp,
+                    rp
+                );
+            }
+            for ptr in [
+                left_key
+                    .as_mut_ptr()
+                    .cast::<super::bset::bkey_i_btree_ptr_v2>(),
+                right_key
+                    .as_mut_ptr()
+                    .cast::<super::bset::bkey_i_btree_ptr_v2>(),
+            ] {
                 let mut insert_iter = super::types::btree_node_iter::default();
-                super::node_iter::bch2_btree_node_iter_init(c, parent, &mut insert_iter, &ptr.k.p);
+                super::node_iter::bch2_btree_node_iter_init(
+                    c,
+                    parent,
+                    &mut insert_iter,
+                    &(*ptr).k.p,
+                );
                 let where_ =
                     super::node_iter::bch2_btree_node_iter_bset_pos(&mut insert_iter, parent, last);
+                crate::rewrite_log_debug!(
+                    "fits insert pos={:?} where_off={}",
+                    (*ptr).k.p,
+                    super::types::__btree_node_key_to_offset(parent, where_)
+                );
                 if (*trans).journal_replay_not_finished {
                     let journal_keys = core::ptr::addr_of!((*c).journal_keys);
                     let _overwrite_lock = (&(*journal_keys).overwrite_lock).lock().unwrap();
@@ -932,7 +1107,7 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
                         c,
                         (*parent).c.btree_id,
                         (*parent).c.level,
-                        ptr.k.p,
+                        (*ptr).k.p,
                         false,
                     );
                 }
@@ -956,6 +1131,16 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             }
             super::iter::bch2_trans_node_verify_not_in_iters(trans, old_node);
             release_paths(&replacement_paths);
+            /* 同 root 分支：replacement 为新节点，创建完成即写盘
+             * （对齐 bch2_btree_update_new_node interior.c:1303）。 */
+            for node in replacement {
+                super::io::bch2_btree_node_write_trans(
+                    trans,
+                    node,
+                    crate::lock::six::six_lock_type::SIX_LOCK_write,
+                    0,
+                );
+            }
             for node in replacement {
                 crate::lock::six::six_unlock_write(&(*node).c.lock);
                 crate::lock::six::six_unlock_intent(&(*node).c.lock);
@@ -984,19 +1169,18 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             return 0;
         }
 
-        let mut parent_key_words = [0u64; 20];
+        /* keylist 无容量检查（keylist.rs 与上游同，调用方保证空间）：
+         * 2 个子节点 key 含 extent 后为 11 u64/个（T0210 child_ptr
+         * 继承磁盘 extent），buffer 需 ≥ 22 u64。 */
+        let mut parent_key_words = [0u64; 24];
         let mut parent_keys = crate::data::keylist::keylist::default();
         crate::data::keylist::bch2_keylist_init(&mut parent_keys, parent_key_words.as_mut_ptr());
-        let left_key = child_ptr(replacement[0]);
-        let right_key = child_ptr(replacement[1]);
-        crate::data::keylist::bch2_keylist_add(
-            &mut parent_keys,
-            (&left_key as *const super::bset::bkey_i_btree_ptr_v2).cast(),
-        );
-        crate::data::keylist::bch2_keylist_add(
-            &mut parent_keys,
-            (&right_key as *const super::bset::bkey_i_btree_ptr_v2).cast(),
-        );
+        let mut left_key = [0u64; 16];
+        let mut right_key = [0u64; 16];
+        child_ptr(replacement[0], left_key.as_mut_ptr().cast());
+        child_ptr(replacement[1], right_key.as_mut_ptr().cast());
+        crate::data::keylist::bch2_keylist_add(&mut parent_keys, left_key.as_ptr().cast());
+        crate::data::keylist::bch2_keylist_add(&mut parent_keys, right_key.as_ptr().cast());
 
         let target = ((*parent).nr.live_u64s as usize * 3) / 5;
         let mut states = [
@@ -1058,8 +1242,27 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
 
         let old_min = (*(*parent).data).min_key;
         let old_max = (*(*parent).data).max_key;
-        let left_parent = allocate_node((*parent).c.level);
-        let right_parent = allocate_node((*parent).c.level);
+        let left_parent = match allocate_node((*parent).c.level) {
+            Ok(node) => node,
+            Err(ret) => {
+                release_paths(&replacement_paths);
+                for node in replacement {
+                    release_node(node);
+                }
+                return ret;
+            }
+        };
+        let right_parent = match allocate_node((*parent).c.level) {
+            Ok(node) => node,
+            Err(ret) => {
+                release_paths(&replacement_paths);
+                for node in replacement {
+                    release_node(node);
+                }
+                release_node(left_parent);
+                return ret;
+            }
+        };
         btree_set_min(left_parent, old_min);
         btree_set_max(left_parent, pivot);
         btree_set_min(right_parent, super::bkey::bpos_successor(pivot));
@@ -1121,6 +1324,15 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             (*set).u64s = output[side]
                 .cast::<u64>()
                 .offset_from(set.cast::<u64>().add(3)) as u16;
+            /* 同 left/right 填充（sort.c:498-501）：parent_nodes 内容
+             * 继承 parent 各 bset 的最大 journal_seq。 */
+            let mut parent_seq = 0u64;
+            for set_idx in 0..(*parent).nsets as usize {
+                parent_seq = parent_seq.max(
+                    (*super::types::bset(parent, (*parent).set.as_ptr().add(set_idx))).journal_seq,
+                );
+            }
+            (*set).journal_seq = parent_seq;
             super::types::set_btree_bset_end(
                 parent_nodes[side],
                 (*parent_nodes[side]).set.as_mut_ptr(),
@@ -1128,11 +1340,9 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             super::bset_build::bch2_btree_build_aux_trees(parent_nodes[side]);
         }
         for side in 0..2 {
-            let ptr = child_ptr(parent_nodes[side]);
-            super::bkey::bkey_copy(
-                &mut (*parent_nodes[side]).key,
-                (&ptr as *const super::bset::bkey_i_btree_ptr_v2).cast(),
-            );
+            let mut ptr_buf = [0u64; 16];
+            child_ptr(parent_nodes[side], ptr_buf.as_mut_ptr().cast());
+            super::bkey::bkey_copy(&mut (*parent_nodes[side]).key, ptr_buf.as_ptr().cast());
             if cache_initialized {
                 let _ = super::cache::bch2_btree_node_transition_state(
                     cache_ptr,
@@ -1709,6 +1919,7 @@ unsafe fn __bch2_foreground_maybe_merge(
      * 容量取 srcs 中最大 byte_order（同层节点容量一致，门控保证
      * total_u64s 不超过 dst 容量） */
     let allocate_node = |level: u8, byte_order: usize| {
+        let c = (*trans).c;
         let node = super::cache::bch2_btree_node_mem_alloc(trans, level != 0);
         assert!(!node.is_null());
         assert_eq!(crate::lock::six::six_lock_intent(&(*node).c.lock), 0);
@@ -1735,7 +1946,18 @@ unsafe fn __bch2_foreground_maybe_merge(
         }
         super::bset_build::bch2_bset_init_first(node, &mut (*(*node).data).keys);
         super::bset_build::bch2_btree_build_aux_trees(node);
-        node
+        /* 同 split allocate_node：__bch2_btree_node_alloc 的扇区部分，
+         * 新节点 key 必带磁盘 extent（写盘依赖）；失败释放节点返回
+         * errno（对齐 reserve_get 失败路径 interior.c:714-721）。 */
+        let sectors_ret = super::alloc::bch2_btree_node_alloc_sectors(c, node);
+        if sectors_ret != 0 {
+            crate::lock::six::six_unlock_write(&(*node).c.lock);
+            crate::lock::six::six_unlock_intent(&(*node).c.lock);
+            super::cache::bch2_btree_node_data_free(node);
+            super::cache::bch2_btree_node_mem_free(c, node);
+            return Err(sectors_ret);
+        }
+        Ok(node)
     };
     let cache_ptr = &mut (*c).btree.cache as *mut super::types::bch_fs_btree_cache;
     let cache_initialized = (*cache_ptr).table_init_done;
@@ -1787,27 +2009,42 @@ unsafe fn __bch2_foreground_maybe_merge(
             super::cache::bch2_btree_node_mem_free(c, node);
         }
     };
-    let child_ptr = |child: *mut btree| super::bset::bkey_i_btree_ptr_v2 {
-        k: super::bkey::bkey {
+    let child_ptr = |child: *mut btree, out: *mut super::bset::bkey_i_btree_ptr_v2| {
+        (*out).k = super::bkey::bkey {
             u64s: 10,
             format: super::bkey::KEY_FORMAT_CURRENT,
             type_: super::bset::KEY_TYPE_btree_ptr_v2,
             p: (*(*child).data).max_key,
             ..Default::default()
-        },
-        v: super::bset::bch_btree_ptr_v2 {
+        };
+        (*out).v = super::bset::bch_btree_ptr_v2 {
             mem_ptr: child as usize as u64,
             seq: (*(*child).data).keys.seq,
             min_key: (*(*child).data).min_key,
             ..Default::default()
-        },
+        };
+        /* 同 split child_ptr（718 注释）：merge dst 节点 key 继承
+         * allocate_node 时 alloc_sectors 写入的磁盘 extent。 */
+        let old_ptrs = super::bset::bch2_bkey_ptrs_c(super::bkey::bkey_s_c {
+            k: &(*child).key.k,
+            v: &(*child).key.v,
+        });
+        if !old_ptrs.start.is_null() && old_ptrs.start < old_ptrs.end {
+            super::bset::bch2_bkey_append_ptr(c, out.cast(), (*old_ptrs.start).ptr);
+        }
     };
 
     let mut dst_order = 0usize;
     for i in 0..srcs_nr {
         dst_order = dst_order.max((*srcs[i].b).byte_order as usize);
     }
-    let dst_node = allocate_node((*b).c.level, dst_order);
+    let dst_node = match allocate_node((*b).c.level, dst_order) {
+        Ok(node) => node,
+        Err(ret) => {
+            merge_put_sibling_paths(trans, &srcs, srcs_nr, path_idx);
+            return ret;
+        }
+    };
 
     /* N->1 打包（interior.c:3126-3141） */
     let mut max_seq = 0u64;
@@ -1824,6 +2061,18 @@ unsafe fn __bch2_foreground_maybe_merge(
     for i in 0..srcs_nr {
         super::bset_build::bch2_btree_sort_into(c, dst_node, srcs[i].b);
     }
+    /* 对齐 sort.c:498-501：dst 继承 srcs 各 bset 的最大 journal_seq，
+     * 满足 write.c:470 二次写盘断言。 */
+    let mut dst_seq = 0u64;
+    for i in 0..srcs_nr {
+        for set_idx in 0..(*srcs[i].b).nsets as usize {
+            dst_seq = dst_seq.max(
+                (*super::types::bset(srcs[i].b, (*srcs[i].b).set.as_ptr().add(set_idx)))
+                    .journal_seq,
+            );
+        }
+    }
+    (*(*dst_node).data).keys.journal_seq = dst_seq;
     /* 打包容量诊断（interior.c:3144-3148 BUG_ON）：
      * compute_merge 的 format-aware 精确计算保证不溢出 */
     assert!(
@@ -1878,14 +2127,30 @@ unsafe fn __bch2_foreground_maybe_merge(
         super::bset_update::btree_keys_account_key(&mut (*parent).nr, old_set_idx, old, -1);
         let old_u64s = (*old).u64s as u32;
         (*old).type_ = 0;
+        /* 对齐 commit.c:198-203 bch2_btree_bset_insert_key_inlined：
+         * 置白的旧 key 若带 needs_whiteout（已写盘），其删除必须
+         * push_whiteout 落盘，否则读回时旧 key 复活（T0210 ac2）。 */
+        if (*old).format & 0x80 != 0 {
+            bch2_push_whiteout(parent, src_key_p);
+            (*old).format &= 0x7f;
+        }
         if old_writeable {
             super::bset_update::bch2_bset_delete(parent, old, old_u64s);
         }
     }
 
-    let mut dst_key = child_ptr(dst_node);
+    let mut dst_key = [0u64; 16];
+    child_ptr(dst_node, dst_key.as_mut_ptr().cast());
+    let dst_key = dst_key
+        .as_mut_ptr()
+        .cast::<super::bset::bkey_i_btree_ptr_v2>();
+    /* 同 split（764 行）：dst_node.data.keys.seq 已在上面设为
+     * max_seq + 1，节点自身 key（写盘 ptr / 读回 seq 校验）必须同步
+     * 为 child_ptr 重建值（v.seq = data.keys.seq），否则读回校验
+     * io.rs:596（node.keys.seq != key.v.seq）返回 -11（T0210 ac2）。 */
+    super::bkey::bkey_copy(&mut (*dst_node).key, dst_key.cast());
     let mut insert_iter = super::types::btree_node_iter::default();
-    super::node_iter::bch2_btree_node_iter_init(c, parent, &mut insert_iter, &dst_key.k.p);
+    super::node_iter::bch2_btree_node_iter_init(c, parent, &mut insert_iter, &(*dst_key).k.p);
     let where_ = super::node_iter::bch2_btree_node_iter_bset_pos(&mut insert_iter, parent, last);
     if (*trans).journal_replay_not_finished {
         let journal_keys = core::ptr::addr_of!((*c).journal_keys);
@@ -1894,21 +2159,25 @@ unsafe fn __bch2_foreground_maybe_merge(
             c,
             (*parent).c.btree_id,
             (*parent).c.level,
-            dst_key.k.p,
+            (*dst_key).k.p,
             false,
         );
     }
-    super::bset_update::bch2_bset_insert(
-        parent,
-        where_,
-        (&mut dst_key as *mut super::bset::bkey_i_btree_ptr_v2).cast(),
-        0,
-    );
+    super::bset_update::bch2_bset_insert(parent, where_, dst_key.cast(), 0);
     super::cache::bch2_btree_node_set_dirty(c, parent);
 
     for i in 0..srcs_nr {
         retire_node(srcs[i].b);
     }
+    /* 对齐 bch2_btree_update_new_node（interior.c:1296-1303）：
+     * dst 新节点 set_dirty 后创建完成即写盘。 */
+    super::cache::bch2_btree_node_set_dirty(c, dst_node);
+    super::io::bch2_btree_node_write_trans(
+        trans,
+        dst_node,
+        crate::lock::six::six_lock_type::SIX_LOCK_write,
+        0,
+    );
     for i in 0..srcs_nr {
         crate::lock::six::six_unlock_write(&(*srcs[i].b).c.lock);
     }
