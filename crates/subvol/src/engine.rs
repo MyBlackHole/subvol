@@ -76,7 +76,7 @@ pub const STORAGE_FORMAT_VERSION: u32 = 2;
  * replays the retained window from last_seq (recovery.c), and reclaim
  * advances last_seq only after node pins have been flushed.
  */
-const JOURNAL_FILE_SECTORS: u64 = 16_384;
+const JOURNAL_FILE_SECTORS: u64 = 65_536;
 const JOURNAL_BUCKET_START: u64 = 1;
 const JOURNAL_BUCKETS: u64 = 4;
 const JOURNAL_BUCKET_SIZE: u16 = 2_048;
@@ -556,16 +556,62 @@ impl StorageEngine {
     /// Creates a persistent journal/checkpoint device using the engine's
     /// single fixed layout.
     pub fn create_persistent(path: impl AsRef<Path>) -> Result<Self, EngineError> {
+        Self::create_persistent_sized(path, JOURNAL_FILE_SECTORS)
+    }
+
+    /// Creates a persistent journal/checkpoint device with a custom device
+    /// size (sectors).  Data buckets behind the journal area are marked FREE
+    /// (make-fs alloc initialization), so btree-node allocation always has
+    /// freespace candidates.
+    pub fn create_persistent_sized(
+        path: impl AsRef<Path>,
+        file_sectors: u64,
+    ) -> Result<Self, EngineError> {
         let engine = Self::new()?;
-        engine.attach_persistent_journal(path.as_ref(), true)?;
+        engine.attach_persistent_journal_sized(path.as_ref(), true, file_sectors)?;
+        /* 对齐 make-fs 的 alloc 初始化（foreground.c:438 起即依赖 freespace
+         * btree 有候选桶）：把 journal 区之后的数据桶全部置 FREE（写
+         * alloc_v4 记录 + freespace 位）。缺失时 btree 节点分配
+         * （bch2_bucket_alloc_freelist）无候选桶恒 -28。 */
+        let nbuckets = {
+            let fs = engine.lock_fs()?;
+            unsafe {
+                let member = crate::sb::io::bch2_sb_member_get((*fs).disk_sb.sb, 0);
+                member.nbuckets
+            }
+        };
+        for bucket in (JOURNAL_BUCKET_START + JOURNAL_BUCKETS)..nbuckets {
+            engine.add_free_bucket(bucket);
+        }
         Ok(engine)
     }
 
     /// Opens a persistent engine, installs its durable checkpoint base, and
-    /// then replays the remaining journal window.
+    /// then replays the remaining journal window.  The device size is derived
+    /// from the on-disk file length, so devices created at any size
+    /// ([`create_persistent`] or [`create_persistent_sized`]) reopen cleanly.
     pub fn open_persistent(path: impl AsRef<Path>) -> Result<Self, EngineError> {
+        let metadata = std::fs::metadata(path.as_ref())?;
+        let file_sectors = metadata.len().div_ceil(512);
+        let min_sectors = (JOURNAL_BUCKET_START + JOURNAL_BUCKETS + 1) * JOURNAL_BUCKET_SIZE as u64;
+        if file_sectors < min_sectors {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "journal device is shorter than its fixed layout",
+            )
+            .into());
+        }
+        Self::open_persistent_sized(path, file_sectors)
+    }
+
+    /// Opens a persistent engine created by [`create_persistent_sized`],
+    /// matching the device size used at creation.
+    pub fn open_persistent_sized(
+        path: impl AsRef<Path>,
+        file_sectors: u64,
+    ) -> Result<Self, EngineError> {
         let engine = Self::new()?;
-        engine.attach_persistent_journal(path.as_ref(), false)?;
+        engine.attach_persistent_journal_sized(path.as_ref(), false, file_sectors)?;
         Ok(engine)
     }
 
@@ -1813,6 +1859,15 @@ impl StorageEngine {
     }
 
     fn attach_persistent_journal(&self, path: &Path, truncate: bool) -> Result<(), EngineError> {
+        self.attach_persistent_journal_sized(path, truncate, JOURNAL_FILE_SECTORS)
+    }
+
+    fn attach_persistent_journal_sized(
+        &self,
+        path: &Path,
+        truncate: bool,
+        file_sectors: u64,
+    ) -> Result<(), EngineError> {
         let file = if truncate {
             let file = OpenOptions::new()
                 .create(true)
@@ -1820,11 +1875,11 @@ impl StorageEngine {
                 .truncate(true)
                 .write(true)
                 .open(path)?;
-            file.set_len(JOURNAL_FILE_SECTORS * 512)?;
+            file.set_len(file_sectors * 512)?;
             file
         } else {
             let file = OpenOptions::new().read(true).write(true).open(path)?;
-            if file.metadata()?.len() < JOURNAL_FILE_SECTORS * 512 {
+            if file.metadata()?.len() < file_sectors * 512 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "journal device is shorter than its fixed layout",
@@ -3003,9 +3058,13 @@ mod tests {
     fn prepared_bucket_engine(label: &str, bucket: u64) -> (StorageEngine, PathBuf) {
         let path = persistent_test_path(label);
         let file = fs::File::create(&path).unwrap();
-        file.set_len(32 * 1024 * 1024).unwrap();
+        /* 8MB 小设备（8 桶）：create_persistent_sized 自动把数据桶 5..=7
+         * 标 FREE，本函数再手动把 bucket 桶标 FREE → 受限桶域 {bucket,
+         * 5,6,7}，供 alloc/discard 模型测试做精确三态断言（桶 8 超出
+         * 设备范围，reclaim 恒 -1）。 */
+        file.set_len(8 * 1024 * 1024).unwrap();
         drop(file);
-        let engine = StorageEngine::create_persistent(&path).unwrap();
+        let engine = StorageEngine::create_persistent_sized(&path, 16_384).unwrap();
         unsafe {
             let mut fs = engine.lock_fs().unwrap();
             let position = crate::btree::bkey::POS(0, bucket);

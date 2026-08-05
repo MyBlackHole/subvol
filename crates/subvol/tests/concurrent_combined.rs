@@ -174,7 +174,8 @@ fn concurrent_combined_crash_child() {
         writers[wid].push(decode_op(it.next().unwrap()));
     }
 
-    let engine = std::sync::Arc::new(StorageEngine::create_persistent(&engine_path).unwrap());
+    let engine =
+        std::sync::Arc::new(StorageEngine::create_persistent_sized(&engine_path, 16_384).unwrap());
     for offset in BUCKET_OFFSETS {
         engine.add_free_bucket(offset);
     }

@@ -662,7 +662,10 @@ proptest! {
          * （discard.c:643 bch2_fast_discard_bucket_add）——崩溃后树位
          * 保留（discover_discard_buckets 可见）、内存队列清空。 */
         let dir = unique_tmp_dir();
-        let mut engine = StorageEngine::create_persistent(&dir).unwrap();
+        /* 8MB 小设备（8 桶）：create_persistent_sized 自动把 journal 区
+         * 之后的数据桶（5..=7）标 FREE，再手动补桶 4 → 共 4 桶可用，
+         * 与下方 4..=7 桶域断言一致。 */
+        let mut engine = StorageEngine::create_persistent_sized(&dir, 16_384).unwrap();
         for offset in 4..=7u64 {
             engine.add_free_bucket(offset);
         }
@@ -931,7 +934,9 @@ fn unique_tmp_dir() -> PathBuf {
 #[test]
 fn combined_allocate_space_exhaustion() {
     let dir = unique_tmp_dir();
-    let engine = StorageEngine::create_persistent(&dir).unwrap();
+    /* 8MB 小设备（8 桶）：数据桶 5..=7 由 create 自动标 FREE，补桶 4 后
+     * 共 4 桶可用，分配 4 次后耗尽。 */
+    let engine = StorageEngine::create_persistent_sized(&dir, 16_384).unwrap();
     for offset in 4..=7u64 {
         engine.add_free_bucket(offset);
     }
