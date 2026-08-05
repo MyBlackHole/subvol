@@ -6356,6 +6356,62 @@ mod tests {
     }
 
     #[test]
+    fn t0210b_ac3_root_reads_disk_node_after_split_sync_reopen() {
+        /* T0210b AC-3 正常场景：split 树的 root 由 split 实体化（allocate_node
+         * 经 bch2_btree_node_alloc_sectors 携带磁盘 ptr，interior.rs:832-908），
+         * sync 落盘后重开经 bch2_btree_root_read 真实读盘（非容错 fake 重建）。
+         * 区分性断言：重开后 DEFAULT root 仍为带磁盘 ptr 的内部节点（读盘成功
+         * 路径保留节点 key 的 extent；容错重建则无 ptr 且 level=0），scan 与
+         * shadow 一致。 */
+        let path = persistent_test_path("ac3-root-read");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let mut model = BTreeMap::new();
+        {
+            let engine = StorageEngine::create_persistent(&path).unwrap();
+            for offset in 4..=9u64 {
+                engine.add_free_bucket(offset);
+            }
+            for offset in (0..512u64).collect::<Vec<_>>().chunks(16) {
+                let mut txn = engine.transaction();
+                for &o in offset {
+                    let k = key(o, &[o, o + 1]);
+                    txn.put(BtreeId::DEFAULT, k.clone());
+                    model.insert(KeyPosition::new(1, o, 0), k);
+                }
+                txn.commit().unwrap();
+            }
+            engine.sync().unwrap();
+        }
+        let recovered = StorageEngine::open_persistent(&path).unwrap();
+        recovered.verify_all().unwrap();
+        assert_eq!(
+            recovered.scan(BtreeId::DEFAULT).unwrap(),
+            model.values().cloned().collect::<Vec<_>>(),
+            "重开后键集必须与崩溃前一致"
+        );
+        unsafe {
+            let mut fs = recovered.lock_fs().unwrap();
+            let c: *mut bch_fs = &mut **fs;
+            let root = crate::btree::types::bch2_btree_id_root_b(c, 0);
+            assert!(!root.is_null(), "DEFAULT root 必须存在");
+            assert_eq!(
+                (*root).key.k.type_,
+                crate::btree::bset::KEY_TYPE_btree_ptr_v2,
+                "正常场景 root 必须从磁盘读回带 ptr 的真实节点，而非容错 fake 重建"
+            );
+            assert!(
+                crate::btree::alloc::btree_node_key_has_ptr(root),
+                "root 节点 key 必须携带磁盘 ptr"
+            );
+            assert!((*root).c.level >= 1, "512 键 split 后 root 应为内部节点");
+        }
+        drop(recovered);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rewrite_random_operations_preserve_keyset_model() {
         /* T0205 T7（AC-1 §4）：属性测试。确定性伪随机 put/delete +
          * 随机节点重写（叶/内部/root 层），键级模型对比；重写只
@@ -6857,7 +6913,7 @@ mod tests {
                     );
                 }
             }
-            let read_ret = bch2_btree_node_read(&mut (*c).disk_sb, r);
+            let read_ret = bch2_btree_node_read(&mut (*c).disk_sb, r, 0);
             crate::rewrite_log_debug!(
                 "DEBUG read_ret={} level={} btree={} written={}",
                 read_ret,

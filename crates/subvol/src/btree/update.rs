@@ -4713,7 +4713,7 @@ mod tests {
             );
             (*bkey_i_to_btree_ptr_v2(&mut recovered.key)).v.mem_ptr = 0;
             assert_eq!(
-                crate::btree::io::bch2_btree_node_read(&mut c.disk_sb, &mut recovered),
+                crate::btree::io::bch2_btree_node_read(&mut c.disk_sb, &mut recovered, 0),
                 0
             );
             assert_eq!(recovered.nr.unpacked_keys, 207);

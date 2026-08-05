@@ -299,6 +299,13 @@ pub unsafe fn __bch2_btree_node_write(sb: *mut bch_sb_handle, b: *mut btree) -> 
         v: &(*b).key.v,
     });
     if ptrs.start.is_null() || ptrs.start >= ptrs.end {
+        crate::rewrite_log_error!(
+            "btree node write rejected: no ptr in key: level={} btree_id={} key_type={} written={}",
+            (*b).c.level,
+            (*b).c.btree_id,
+            (*b).key.k.type_,
+            (*b).written
+        );
         return -2;
     }
     let ptr = (*ptrs.start).ptr;
@@ -538,7 +545,7 @@ pub unsafe fn __bch2_btree_node_write(sb: *mut bch_sb_handle, b: *mut btree) -> 
     0
 }
 
-pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32 {
+pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree, replay_seq: u64) -> i32 {
     use std::os::unix::fs::FileExt;
 
     if sb.is_null()
@@ -598,9 +605,23 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
     if node.keys.seq != (*btree_ptr).v.seq {
         return -11;
     }
+    crate::rewrite_log_debug!(
+        "btree node read entry: b_level={} expect_id={} key_type={}",
+        (*b).c.level,
+        (*b).c.btree_id,
+        (*b).key.k.type_
+    );
     if BTREE_NODE_ID(node) != (*b).c.btree_id as u64
         || BTREE_NODE_LEVEL(node) != (*b).c.level as u64
     {
+        crate::rewrite_log_error!(
+            "btree node read id/level mismatch: node_id={} expect_id={} node_level={} expect_level={} b_level_at_read={}",
+            BTREE_NODE_ID(node),
+            (*b).c.btree_id as u64,
+            BTREE_NODE_LEVEL(node),
+            (*b).c.level as u64,
+            (*b).c.level
+        );
         return -12;
     }
     if node.min_key != (*btree_ptr).v.min_key || node.max_key != (*b).key.k.p {
@@ -691,6 +712,31 @@ pub unsafe fn bch2_btree_node_read(sb: *mut bch_sb_handle, b: *mut btree) -> i32
         if BSET_OFFSET(&*set) != written as u32 {
             // 对齐 read.c bset_wrong_sector_offset（FSCK_CAN_FIX）：继续
             crate::rewrite_log_error!("btree node read: bset wrong sector offset");
+        }
+        /* 对齐 read.c:750-778 bset_blacklisted_journal_seq：bset 头
+         * journal_seq 新于重放 seq 的扇区作废——节点写盘可能在事务
+         * journal 记录持久化前发生，崩溃后该 bset 依赖的 journal 记录
+         * 缺失，数据以重放为准。首 bset blacklisted 是 fsck 错误
+         * （FSCK_CAN_FIX），域内作废节点返回错误；非首 bset blacklisted
+         * 直接跳过（read.c:776 continue）。replay_seq=0 表示无重放约束
+         * （域内测试直读）。 */
+        let blacklisted = replay_seq != 0 && (*set).journal_seq > replay_seq;
+        if blacklisted {
+            if first {
+                crate::rewrite_log_error!(
+                    "btree node read: first bset journal_seq={} exceeds replay_seq={}",
+                    (*set).journal_seq,
+                    replay_seq
+                );
+                return -16;
+            }
+            crate::rewrite_log_debug!(
+                "btree node read: dropping blacklisted bset journal_seq={} replay_seq={}",
+                (*set).journal_seq,
+                replay_seq
+            );
+            written += sectors;
+            continue;
         }
         max_journal_seq = max_journal_seq.max((*set).journal_seq);
 
@@ -1103,7 +1149,11 @@ pub(crate) unsafe fn bch2_btree_node_get_noiter_unlocked(
         }
     }
     super::types::set_btree_node_read_in_flight(node);
-    let ret = bch2_btree_node_read(&mut (*c).disk_sb, node);
+    let replay_seq = (*c)
+        .journal
+        .last_seq
+        .load(core::sync::atomic::Ordering::Acquire);
+    let ret = bch2_btree_node_read(&mut (*c).disk_sb, node, replay_seq);
     super::types::clear_btree_node_read_in_flight(node);
     if ret != 0 {
         super::types::set_btree_node_read_error(node);
@@ -1301,6 +1351,7 @@ pub unsafe fn bch2_btree_root_read(
     super::bkey::bkey_copy(&mut (*node).key, key);
     (*node).c.level = level;
     (*node).c.btree_id = id;
+    crate::rewrite_log_debug!("root_read: id={} node_level_set={}", id, (*node).c.level);
     if super::cache::bch2_btree_node_transition_state(
         &mut (*c).btree.cache,
         node,
@@ -1313,7 +1364,13 @@ pub unsafe fn bch2_btree_root_read(
     }
     super::types::set_btree_node_read_in_flight(node);
     super::iter::bch2_trans_unlock(&mut trans);
-    let ret = bch2_btree_node_read(&mut (*c).disk_sb, node);
+    let ret = bch2_btree_node_read(
+        &mut (*c).disk_sb,
+        node,
+        (*c).journal
+            .last_seq
+            .load(core::sync::atomic::Ordering::Acquire),
+    );
     super::types::clear_btree_node_read_in_flight(node);
     if ret != 0 {
         super::types::set_btree_node_read_error(node);
@@ -1326,12 +1383,6 @@ pub unsafe fn bch2_btree_root_read(
         six_unlock_intent(&(*node).c.lock);
         return ret;
     }
-    core::ptr::copy_nonoverlapping(
-        key.cast::<u64>(),
-        (&mut (*super::types::bch2_btree_id_root(c, id as usize)).key as *mut super::bkey::bkey_i)
-            .cast::<u64>(),
-        (*key).k.u64s as usize,
-    );
     super::interior::bch2_btree_set_root_for_read(c, node);
     six_unlock_write(&(*node).c.lock);
     six_unlock_intent(&(*node).c.lock);
@@ -1593,7 +1644,7 @@ mod tests {
             node.nsets = 0;
             node.nr = btree_nr_keys::default();
             node.written = u16::MAX;
-            assert_eq!(bch2_btree_node_read(&mut handle, &mut node), 0);
+            assert_eq!(bch2_btree_node_read(&mut handle, &mut node, 0), 0);
             assert_eq!((*node.data).min_key, SPOS(4, 1, 0));
             assert_eq!((*node.data).max_key, SPOS(4, 2, 0));
             assert_eq!((*node.data).keys.u64s, 10);
@@ -1609,12 +1660,124 @@ mod tests {
             assert_eq!(file.read_at(&mut byte, 64 * 512 + 200).unwrap(), 1);
             byte[0] ^= 1;
             assert_eq!(file.write_at(&byte, 64 * 512 + 200).unwrap(), 1);
-            assert_eq!(bch2_btree_node_read(&mut handle, &mut node), 0);
+            assert_eq!(bch2_btree_node_read(&mut handle, &mut node, 0), 0);
             assert!(crate::btree::types::btree_node_need_rewrite(&node));
             assert!(crate::btree::types::btree_node_need_rewrite_error(&node));
             assert_eq!((*node.data).keys.u64s, 5);
             assert_eq!(node.nr.unpacked_keys, 1);
             assert_eq!((*(words.as_ptr().add(20).cast::<bkey>())).p, SPOS(4, 1, 0));
+
+            bch2_free_super(&mut handle);
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn replay_seq_filters_bsets_newer_than_replay() {
+        /* T0210b AC-3 §3：节点 bset 头 journal_seq 新于重放 seq 的扇区
+         * 作废（对齐 read.c:750-778 bset_blacklisted_journal_seq）。首 bset
+         * blacklisted 是 fsck 错误（FSCK_CAN_FIX），域内作废节点返回 -16；
+         * seq 不大于重放 seq 时正常读回。 */
+        use std::os::unix::fs::FileExt;
+
+        unsafe {
+            let path =
+                std::env::temp_dir().join(format!("subvol-btree-io-replay-{}", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(128 * 512).unwrap();
+
+            let mut handle = bch_sb_handle::default();
+            handle.s_bdev_file = Box::into_raw(Box::new(file.try_clone().unwrap())).cast();
+            assert_eq!(bch2_sb_realloc(&mut handle, 0), 0);
+            (*handle.sb).uuid = [0x5a; 16];
+            (*handle.sb).dev_idx = 0;
+
+            let mut words = vec![0u64; 64];
+            let mut node = btree::default();
+            node.data = words.as_mut_ptr().cast::<btree_node>();
+            node.byte_order = 9;
+            node.c.btree_id = 3;
+            node.c.level = 0;
+            node.format = BKEY_FORMAT_CURRENT;
+            node.nr_key_bits = bkey_format_key_bits(&node.format) as u8;
+            node.nsets = 1;
+            (*node.data).min_key = SPOS(4, 1, 0);
+            (*node.data).max_key = SPOS(4, 2, 0);
+            (*node.data).keys.seq = 77;
+            (*node.data).keys.u64s = 10;
+            /* 写盘从 set[0]（data_offset 17 处 bset 头）收集 journal_seq，
+             * 需同步设置供 replay_seq 过滤判定（读盘首 bset 用 node.data.keys）。 */
+            (*words
+                .as_mut_ptr()
+                .add(17)
+                .cast::<crate::btree::bset::bset>())
+            .journal_seq = 77;
+            for (index, offset) in [1, 2].into_iter().enumerate() {
+                *words.as_mut_ptr().add(20 + index * 5).cast::<bkey>() = bkey {
+                    u64s: BKEY_U64S,
+                    format: KEY_FORMAT_CURRENT,
+                    type_: 6,
+                    p: SPOS(4, offset, 0),
+                    ..Default::default()
+                };
+            }
+            node.set[0] = bset_tree {
+                size: 0,
+                extra: BSET_NO_AUX_TREE_VAL,
+                data_offset: 17,
+                aux_data_offset: u16::MAX,
+                end_offset: 30,
+            };
+            node.nr.live_u64s = 10;
+            node.nr.bset_u64s[0] = 10;
+            node.nr.unpacked_keys = 2;
+
+            node.key.k = bkey {
+                u64s: 10,
+                format: KEY_FORMAT_CURRENT,
+                type_: KEY_TYPE_btree_ptr_v2,
+                p: (*node.data).max_key,
+                ..Default::default()
+            };
+            let node_ptr = bkey_i_to_btree_ptr_v2(&mut node.key);
+            (*node_ptr).v.mem_ptr = (&mut node as *mut btree) as usize as u64;
+            (*node_ptr).v.seq = 77;
+            (*node_ptr).v.min_key = (*node.data).min_key;
+            let mut extent = bch_extent_ptr::default();
+            SET_BCH_EXTENT_PTR_OFFSET(&mut extent, 64);
+            SET_BCH_EXTENT_PTR_DEV(&mut extent, 0);
+            bch2_bkey_append_ptr(core::ptr::null(), &mut node.key, extent);
+
+            assert_eq!(__bch2_btree_node_write(&mut handle, &mut node), 0);
+
+            /* 首 bset seq=77：replay_seq=76 作废（-16），replay_seq=77 保留 */
+            words.fill(0);
+            node.nsets = 0;
+            node.nr = btree_nr_keys::default();
+            node.written = u16::MAX;
+            assert_eq!(
+                bch2_btree_node_read(&mut handle, &mut node, 76),
+                -16,
+                "首 bset journal_seq 新于重放 seq 必须作废节点"
+            );
+            words.fill(0);
+            node.nsets = 0;
+            node.nr = btree_nr_keys::default();
+            node.written = u16::MAX;
+            assert_eq!(
+                bch2_btree_node_read(&mut handle, &mut node, 77),
+                0,
+                "bset seq 不大于重放 seq 时正常读回"
+            );
+            assert_eq!((*node.data).keys.u64s, 10);
+            assert_eq!(node.nr.unpacked_keys, 2);
 
             bch2_free_super(&mut handle);
             drop(file);
@@ -1897,7 +2060,7 @@ mod tests {
                 node.key.k.u64s as usize,
             );
             (*bkey_i_to_btree_ptr_v2(&mut recovered.key)).v.mem_ptr = 0;
-            assert_eq!(bch2_btree_node_read(&mut handle, &mut recovered), 0);
+            assert_eq!(bch2_btree_node_read(&mut handle, &mut recovered, 0), 0);
             assert_eq!(recovered.written, 2);
             assert_eq!(recovered.nsets, 1);
             assert_eq!((*recovered.data).keys.journal_seq, 2);
@@ -1922,7 +2085,7 @@ mod tests {
             assert_eq!(file.read_at(&mut byte, corrupt_offset).unwrap(), 1);
             byte[0] ^= 1;
             assert_eq!(file.write_at(&byte, corrupt_offset).unwrap(), 1);
-            assert_eq!(bch2_btree_node_read(&mut handle, &mut recovered), 0);
+            assert_eq!(bch2_btree_node_read(&mut handle, &mut recovered, 0), 0);
             assert!(crate::btree::types::btree_node_need_rewrite(&recovered));
             assert!(crate::btree::types::btree_node_need_rewrite_error(
                 &recovered

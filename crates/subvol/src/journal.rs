@@ -1783,11 +1783,17 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
                 continue;
             }
             let key = core::ptr::addr_of!((*root).key);
-            /* 对齐 recovery.c read_btree_roots：root_read 无条件读盘。内存
-             * bootstrap（Self::new 预创建的 fake root）与 journal root key
-             * 同源（seq = U64_MAX - id），会与读回节点 rhashtable 冲突且
-             * 使读盘被 b 非 null 跳过；先解除槽绑定并从 rhashtable 移除
-             * fake root 节点再读。 */
+            crate::rewrite_log_debug!(
+                "root_read pre: id={} root_level={} key_type={}",
+                id,
+                (*root).level,
+                (*root).key.k.type_
+            );
+            /* root_read 前解除槽绑定并回收 bootstrap fake root；解除绑定
+             * 会清空 slot（bch2_btree_id_root_set(null) 置 level=0），因此
+             * 必须在解绑前保存 root level 供读盘校验（io.rs 对齐 read.c
+             * BTREE_NODE_LEVEL 检查）。 */
+            let root_level = (*root).level;
             let old_b = crate::btree::types::bch2_btree_id_root_b(c, id);
             crate::btree::types::bch2_btree_id_root_set(c, id, core::ptr::null_mut());
             if !old_b.is_null() && !(*old_b).data.is_null() {
@@ -1797,7 +1803,7 @@ pub unsafe fn bch2_journal_replay(c: *mut crate::btree::types::bch_fs) -> i32 {
                     crate::btree::types::btree_node_cache_state::BTREE_NODE_CACHE_FREEABLE,
                 );
             }
-            let ret = crate::btree::io::bch2_btree_root_read(c, id as u8, key, (*root).level);
+            let ret = crate::btree::io::bch2_btree_root_read(c, id as u8, key, root_level);
             if ret != 0 {
                 /* 对齐 recovery.c:639-650 mustfix_fsck_err_on：root 读盘失败
                  * 记录错误后恢复继续（可重建的 btree 清 error，其余留待

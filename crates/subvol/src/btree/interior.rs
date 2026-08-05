@@ -114,6 +114,11 @@ pub unsafe fn bch2_journal_entry_to_btree_root(
     assert!(!root.is_null());
     (*root).level = (*entry).level;
     (*root).alive = 1;
+    crate::rewrite_log_debug!(
+        "journal root entry to root id={} entry_level={}",
+        (*entry).btree_id,
+        (*entry).level
+    );
     let key = entry.cast::<u64>().add(1).cast::<super::bkey::bkey_i>();
     super::bkey::bkey_copy(&mut (*root).key, key);
     if (*root).key.k.type_ == super::bset::KEY_TYPE_btree_ptr_v2 {
@@ -141,6 +146,11 @@ pub unsafe fn bch2_btree_roots_to_journal_entries(
                 (*root).level,
                 (&(*root).key as *const super::bkey::bkey_i).cast::<u64>(),
                 (*root).key.k.u64s as u16,
+            );
+            crate::rewrite_log_debug!(
+                "journal root entry id={id} level={} alive={}",
+                (*root).level,
+                (*root).alive
             );
             end = end.cast::<u64>().add(actual as usize).cast();
         }
@@ -240,6 +250,12 @@ pub unsafe fn bch2_btree_set_root_for_read(c: *mut super::types::bch_fs, b: *mut
         super::bkey::bkey_copy(&mut (*slot).key, &(*b).key);
         (*slot).level = (*b).c.level;
         (*slot).alive = 1;
+        crate::rewrite_log_debug!(
+            "set_root_for_read id={} b_level={} slot_level={}",
+            id,
+            (*b).c.level,
+            (*slot).level
+        );
     }
     super::cache::bch2_recalc_btree_reserve(c);
 }
