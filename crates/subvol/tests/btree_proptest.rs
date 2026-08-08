@@ -683,6 +683,11 @@ proptest! {
                 CombinedOp::Btree(bt) => {
                     apply_group(&engine, &OpGroup::Single(bt.clone())).unwrap();
                     apply_model(&mut btree_model, bt);
+                    /* btree 节点写盘会经 bch2_bucket_alloc_freelist
+                     * 内部分配 free 桶并置 BCH_DATA_BTREE（alloc.rs，
+                     * 对齐 foreground.c 的 btree 节点分配），影子模型
+                     * 无法从 op 序列推断，须同步引擎 alloc 树真相。 */
+                    bucket_model.state = rebuild_bucket_state(&engine);
                 }
                 CombinedOp::Allocate => {
                     /* allocate 恒成功 iff 模型有 free 桶；返回最小 free
