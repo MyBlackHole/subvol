@@ -509,6 +509,14 @@ pub(crate) unsafe fn bch2_btree_split_leaf(
             new_data,
             (1usize << old_order) / 8,
         );
+        let ww_u64s = (*src).whiteout_u64s as usize;
+        if ww_u64s > 0 {
+            core::ptr::copy(
+                new_data.add((1usize << old_order) / 8 - ww_u64s),
+                new_data.add((1usize << new_order) / 8 - ww_u64s),
+                ww_u64s,
+            );
+        }
         let cache_owned = (*c)
             .btree
             .cache
