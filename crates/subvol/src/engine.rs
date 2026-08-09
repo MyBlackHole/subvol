@@ -5305,6 +5305,62 @@ mod tests {
                 let k = BtreeKey::new(KeyPosition::new(9, 1, 0), vec![9]);
                 engine.put(BtreeId::DEFAULT, k.unwrap()).unwrap();
             }
+            "ac4-split-synced" => {
+                /* T0210b AC-4：多级 split 树 sync 落盘后崩溃。512 键分批
+                 * txn 提交（触发 split 实体化 root，interior.rs allocate_node
+                 * 经 bch2_btree_node_alloc_sectors 携带磁盘 ptr），sync 使
+                 * 全部键与 root/子树节点 durable，随后 abort。重开必须真实
+                 * 读盘 root（非容错 fake 重建），全键与崩溃前一致。 */
+                for offset in 4..=15u64 {
+                    engine.add_free_bucket(offset);
+                }
+                for offset in (0..512u64).collect::<Vec<_>>().chunks(16) {
+                    let mut txn = engine.transaction();
+                    for &o in offset {
+                        txn.put(BtreeId::DEFAULT, key(o, &[o, o + 1]));
+                    }
+                    txn.commit().unwrap();
+                }
+                engine.sync().unwrap();
+            }
+            "ac4-checkpoint-advance" => {
+                /* T0210b AC-4：多级树 sync + journal checkpoint 推进后再
+                 * 写少量键（未 sync）即崩溃。reclaim_journal 使 0..512 全部
+                 * durable（checkpoint 化），追加键 1000..1004 仅可能部分
+                 * 落盘。重开断言 512 全在，追加键为幸存子集（对齐 T0199
+                 * 原则：崩溃点不确定时只断言最终一致性）。 */
+                for offset in 4..=15u64 {
+                    engine.add_free_bucket(offset);
+                }
+                for offset in (0..512u64).collect::<Vec<_>>().chunks(16) {
+                    let mut txn = engine.transaction();
+                    for &o in offset {
+                        txn.put(BtreeId::DEFAULT, key(o, &[o, o + 1]));
+                    }
+                    txn.commit().unwrap();
+                }
+                engine.sync().unwrap();
+                engine.reclaim_journal().unwrap();
+                for &o in &[1000u64, 1001, 1002, 1003] {
+                    engine.put(BtreeId::DEFAULT, key(o, &[o])).unwrap();
+                }
+            }
+            "ac4-mid-build" => {
+                /* T0210b AC-4：建树中途崩溃（256 键已提交、未显式 sync）。
+                 * journal 空间充足时记录可能未 flush，后台 reclaim 可能已
+                 * 落盘任意子集；崩溃点不确定 → 只断言幸存键 ⊆ 已提交集合
+                 * 且最终一致（对齐 cc-mid-write 原则）。 */
+                for offset in 4..=15u64 {
+                    engine.add_free_bucket(offset);
+                }
+                for offset in (0..256u64).collect::<Vec<_>>().chunks(16) {
+                    let mut txn = engine.transaction();
+                    for &o in offset {
+                        txn.put(BtreeId::DEFAULT, key(o, &[o, o + 1]));
+                    }
+                    txn.commit().unwrap();
+                }
+            }
             _ => panic!("unknown crash phase {phase}"),
         }
         let journal_diag = {
@@ -6569,6 +6625,93 @@ mod tests {
         recovered.verify_all().unwrap();
         drop(recovered);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn t0210b_ac4_crash_matrix_multilevel_recovery() {
+        /* T0210b AC-4 崩溃矩阵：多级 split 树（root 内部节点 + 叶子）
+         * 在各崩溃点（sync 后 / journal checkpoint 推进后 / 建树中途）
+         * 经子进程 abort 模拟真实崩溃，重开断言：
+         * - verify_all + open_bucket==0 + 键有序（恢复一致性）；
+         * - ac4-split-synced / ac4-checkpoint-advance：0..512 全部
+         *   durable，root 从磁盘真实读回（btree_ptr_v2 + 磁盘 ptr +
+         *   level>=1，非容错 fake 重建）；
+         * - ac4-mid-build：幸存键 ⊆ 已提交 0..256，只断言最终一致性。 */
+        for phase in [
+            "ac4-split-synced",
+            "ac4-checkpoint-advance",
+            "ac4-mid-build",
+        ] {
+            let path = persistent_test_path(&format!("ac4-{phase}"));
+            run_crash_child(&path, phase);
+            let recovered = StorageEngine::open_persistent(&path).unwrap();
+            recovered.verify_all().unwrap();
+            assert_eq!(recovered.open_bucket_count().unwrap(), 0);
+            let keys = recovered.scan(BtreeId::DEFAULT).unwrap();
+            assert!(
+                keys.windows(2)
+                    .all(|pair| pair[0].position() < pair[1].position()),
+                "{phase}: 恢复后键必须有序"
+            );
+            let offsets: Vec<u64> = keys.iter().map(|k| k.position().offset).collect();
+            match phase {
+                "ac4-split-synced" => {
+                    assert_eq!(
+                        offsets,
+                        (0..512).collect::<Vec<_>>(),
+                        "{phase}: sync 后全部键必须 durable"
+                    );
+                    ac4_assert_root_durable(&recovered);
+                }
+                "ac4-checkpoint-advance" => {
+                    let mut idx = 0usize;
+                    for o in 0..512u64 {
+                        assert_eq!(
+                            offsets.get(idx).copied(),
+                            Some(o),
+                            "{phase}: checkpoint 后键 {o} 必须幸存，偏移 {idx}"
+                        );
+                        idx += 1;
+                    }
+                    for &o in &offsets[idx..] {
+                        assert!(
+                            (1000..1004).contains(&o),
+                            "{phase}: 追加键必须是 1000..1004 的子集，实际 {o}"
+                        );
+                    }
+                    ac4_assert_root_durable(&recovered);
+                }
+                "ac4-mid-build" => {
+                    for &o in &offsets {
+                        assert!(o < 256, "{phase}: 幸存键必须来自已提交的 0..256，实际 {o}");
+                    }
+                }
+                _ => unreachable!("unknown phase {phase}"),
+            }
+            drop(recovered);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    fn ac4_assert_root_durable(recovered: &StorageEngine) {
+        /* root 必须从磁盘真实读回：btree_ptr_v2 + 携带磁盘 ptr +
+         * level>=1（内部节点）。容错 fake 重建则无 ptr 且 level=0。 */
+        unsafe {
+            let mut fs = recovered.lock_fs().unwrap();
+            let c: *mut bch_fs = &mut **fs;
+            let root = crate::btree::types::bch2_btree_id_root_b(c, 0);
+            assert!(!root.is_null(), "DEFAULT root 必须存在");
+            assert_eq!(
+                (*root).key.k.type_,
+                crate::btree::bset::KEY_TYPE_btree_ptr_v2,
+                "崩溃重开后 root 必须从磁盘读回带 ptr 的真实节点，而非容错 fake 重建"
+            );
+            assert!(
+                crate::btree::alloc::btree_node_key_has_ptr(root),
+                "root 节点 key 必须携带磁盘 ptr"
+            );
+            assert!((*root).c.level >= 1, "512 键 split 后 root 应为内部节点");
+        }
     }
 
     #[test]
